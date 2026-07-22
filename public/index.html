@@ -83,6 +83,7 @@
         <div class="settings-sidebar">
           <div class="settings-option" data-option="keywords">关键词管理</div>
           <div class="settings-option active" data-option="export">导出数据</div>
+          <div class="settings-option" data-option="storeexport">店铺导出</div>
           <div class="settings-option" data-option="labels">分类管理</div>
           <div class="settings-option" data-option="refresh">刷新间隔</div>
         </div>
@@ -121,6 +122,23 @@
               <button onclick="loadLabelManager()" style="padding:6px 12px;background:#1a73e8;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
             </div>
             <div id="labelManagerList" style="max-height:300px;overflow-y:auto;border:1px solid #eee;border-radius:6px"></div>
+          </div>
+          <div id="settingsPanelStoreexport" class="settings-panel-item">
+            <p class="settings-desc">导出店铺列表（仅包含店铺名称和链接，不含商品数据），在新环境一键导入。</p>
+            <button id="storeListExportBtn" class="settings-action-btn">导出店铺列表</button>
+            <span id="storeListExportMsg" class="settings-msg"></span>
+            <div class="settings-divider"></div>
+            <p class="settings-desc">导入店铺列表 JSON 文件，批量添加店铺（重复的自动跳过）。</p>
+            <button id="storeListImportBtn" class="settings-action-btn settings-import-btn">导入店铺列表</button>
+            <input type="file" id="storeListImportFile" accept=".json" style="display:none">
+            <span id="storeListImportMsg" class="settings-msg"></span>
+            <div class="settings-divider"></div>
+            <p class="settings-desc">导出单个店铺详细数据（含商品信息和价格历史），用于存档。</p>
+            <div style="display:flex;gap:8px;margin:10px 0">
+              <select id="storeExportSelect" style="flex:1;padding:7px 10px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)"></select>
+              <button id="storeExportBtn" class="settings-action-btn">导出</button>
+            </div>
+            <span id="storeExportMsg" class="settings-msg"></span>
           </div>
           <div id="settingsPanelKeywords" class="settings-panel-item">
             <p class="settings-desc">每行一个关键词，回车分隔。常用关键词会显示在搜索栏下方，点击即添加。</p>

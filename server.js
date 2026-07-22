@@ -32,12 +32,39 @@ app.post('/api/stores/import', (req, res) => {
   }
 });
 
+app.post('/api/stores/import-single', (req, res) => {
+  try {
+    if (!req.body.stores?.length) return res.status(400).json({ error: '数据格式错误，缺少店铺信息' });
+    store.importSingleStore(req.body);
+    res.json({ success: true, storeId: req.body.stores[0].id });
+  } catch (e) {
+    res.status(400).json({ error: '导入失败: ' + e.message });
+  }
+});
+
 app.get('/api/stores', (req, res) => {
   res.json(store.getAllStores());
 });
 
+app.get('/api/stores/export-list', (req, res) => {
+  const all = store.getAllStores();
+  const list = all.map(s => ({ id: s.id, url: s.url, name: s.name || '', addedAt: s.addedAt }));
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="stores-list-${new Date().toISOString().slice(0,10)}.json"`);
+  res.json(list);
+});
+
 app.get('/api/stores/summary', (req, res) => {
   res.json(store.getStoreSummaries());
+});
+
+app.get('/api/stores/:id/export', (req, res) => {
+  const data = store.exportStore(req.params.id);
+  if (!data) return res.status(404).json({ error: '店铺不存在' });
+  const name = data.stores[0]?.name || req.params.id;
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="${name}-${new Date().toISOString().slice(0,10)}.json"`);
+  res.json(data);
 });
 
 app.get('/api/stores/:id', (req, res) => {

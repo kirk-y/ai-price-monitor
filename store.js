@@ -295,12 +295,49 @@ function updateStoreOrder(order) {
   return order;
 }
 
+function exportStore(storeId) {
+  const db = getDb();
+  const store = db.prepare('SELECT * FROM stores WHERE id = ?').get(storeId);
+  if (!store) return null;
+  const s = serializeStore(store);
+  const prefix = `${storeId}:`;
+  const historyRows = db.prepare('SELECT product_key, price, date FROM price_history WHERE product_key LIKE ? ORDER BY date ASC').all(prefix + '%');
+  const priceHistory = {};
+  for (const r of historyRows) {
+    if (!priceHistory[r.product_key]) priceHistory[r.product_key] = [];
+    priceHistory[r.product_key].push({ price: r.price, date: r.date });
+  }
+  return { stores: [s], priceHistory, exportedAt: new Date().toISOString() };
+}
+
+function importSingleStore(data) {
+  const db = getDb();
+  const s = data.stores?.[0];
+  if (!s) return false;
+  const existing = db.prepare('SELECT id FROM stores WHERE id = ?').get(s.id);
+  if (existing) {
+    db.prepare('UPDATE stores SET url=?, name=?, lastUpdated=?, status=?, error=?, products=? WHERE id=?')
+      .run(s.url, s.name || '', s.lastUpdated || null, s.status || 'ok', s.error || '', JSON.stringify(s.products || []), s.id);
+    db.prepare('DELETE FROM price_history WHERE product_key LIKE ?').run(s.id + ':%');
+  } else {
+    db.prepare('INSERT INTO stores (id, url, name, addedAt, lastUpdated, status, error, products) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(s.id, s.url, s.name || '', s.addedAt || new Date().toISOString(), s.lastUpdated || null, s.status || 'ok', s.error || '', JSON.stringify(s.products || []));
+  }
+  const insertHistory = db.prepare('INSERT INTO price_history (product_key, price, date) VALUES (?, ?, ?)');
+  for (const [pk, entries] of Object.entries(data.priceHistory || {})) {
+    for (const e of entries) {
+      insertHistory.run(pk, e.price, e.date);
+    }
+  }
+  return true;
+}
+
 module.exports = {
   getAllStores, getStoreSummaries, getStore, addStore, removeStore, updateStore,
   recordPrices, getPriceHistory,
   getFilterConfig, updateFilterConfig,
   getRefreshConfig, updateRefreshConfig,
-  exportAllData, importAllData,
+  exportAllData, importAllData, exportStore, importSingleStore,
   getProductLabel, upsertProductLabel, getLabeledData,
   getStoreOrder, updateStoreOrder,
 };

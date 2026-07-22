@@ -152,6 +152,10 @@ function initSettings() {
   document.getElementById('settingsImportFile').addEventListener('change', importData);
   document.getElementById('saveRefreshBtn').addEventListener('click', saveRefreshConfig);
   document.getElementById('saveKeywordsBtn').addEventListener('click', saveKeywords);
+  document.getElementById('storeExportBtn').addEventListener('click', exportSingleStore);
+  document.getElementById('storeListExportBtn').addEventListener('click', () => window.open('/api/stores/export-list', '_blank'));
+  document.getElementById('storeListImportBtn').addEventListener('click', () => document.getElementById('storeListImportFile').click());
+  document.getElementById('storeListImportFile').addEventListener('change', importStoreList);
   document.querySelectorAll('.settings-option').forEach(el => {
     el.addEventListener('click', () => switchSettingsOption(el.dataset.option));
   });
@@ -173,6 +177,7 @@ function openSettings() {
   renderCatVisibility();
   renderNextRefresh(cfg.nextRefreshAt);
   startNextRefreshTimer(cfg.nextRefreshAt);
+  renderStoreExportSelect();
   document.getElementById('settingsModal').style.display = 'block';
 }
 
@@ -279,6 +284,87 @@ async function saveRefreshConfig() {
   } catch (e) {
     document.getElementById('refreshSaveMsg').textContent = '保存失败';
     document.getElementById('refreshSaveMsg').style.color = '#e53935';
+  }
+}
+
+function renderStoreExportSelect() {
+  const sel = document.getElementById('storeExportSelect');
+  sel.innerHTML = '<option value="">-- 选择店铺 --</option>' +
+    storeSummaries.filter(s => s.status === 'ok' || s.status === 'error').map(s =>
+      `<option value="${s.id}">${escapeHtml(s.name || s.id)}</option>`
+    ).join('');
+}
+
+function exportSingleStore() {
+  const sel = document.getElementById('storeExportSelect');
+  const id = sel.value;
+  const msg = document.getElementById('storeExportMsg');
+  if (!id) { msg.textContent = '请先选择店铺'; msg.style.color = '#e53935'; return; }
+  window.open(`/api/stores/${id}/export`, '_blank');
+  msg.textContent = '✓ 已开始下载';
+  msg.style.color = '#43a047';
+}
+
+async function importStoreList(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const msg = document.getElementById('storeListImportMsg');
+  msg.textContent = '导入中...';
+  msg.style.color = 'var(--primary)';
+  try {
+    const text = await file.text();
+    const list = JSON.parse(text);
+    if (!Array.isArray(list)) throw new Error('数据格式错误，应为店铺数组');
+    let added = 0, skipped = 0;
+    const existing = storeSummaries.map(s => s.id);
+    for (const item of list) {
+      if (!item.url || !item.url.startsWith('http')) { skipped++; continue; }
+      if (existing.includes(item.id)) { skipped++; continue; }
+      try {
+        await fetch('/api/stores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: item.url }) });
+        added++;
+      } catch { skipped++; }
+    }
+    msg.textContent = `✓ 导入完成: 新增 ${added} 个，跳过 ${skipped} 个`;
+    msg.style.color = '#43a047';
+    e.target.value = '';
+    storeSummaries = await (await fetch('/api/stores/summary')).json();
+    stores = await (await fetch('/api/stores')).json();
+    markDirty();
+    render();
+    renderStoreList();
+  } catch (err) {
+    msg.textContent = '导入失败: ' + err.message;
+    msg.style.color = '#e53935';
+  }
+}
+
+async function importSingleStoreFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const msg = document.getElementById('storeImportMsg');
+  msg.textContent = '导入中...';
+  msg.style.color = 'var(--primary)';
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    const res = await fetch('/api/stores/import-single', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    if (res.ok) {
+      const result = await res.json();
+      msg.textContent = '✓ 导入成功，即将刷新';
+      msg.style.color = '#43a047';
+      storeSummaries = await (await fetch('/api/stores/summary')).json();
+      stores = await (await fetch('/api/stores')).json();
+      e.target.value = '';
+      setTimeout(() => location.reload(), 1500);
+    } else {
+      const err = await res.json();
+      msg.textContent = '导入失败: ' + (err.error || '');
+      msg.style.color = '#e53935';
+    }
+  } catch (err) {
+    msg.textContent = '导入失败: ' + err.message;
+    msg.style.color = '#e53935';
   }
 }
 
@@ -525,6 +611,7 @@ let dragId = null;
 function renderStoreList() {
   const container = document.getElementById('storeList');
   const ok = storeSummaries.filter(s => s.status === 'ok');
+  const error = storeSummaries.filter(s => s.status === 'error');
   const pend = storeSummaries.filter(s => s.status === 'pending');
   const total = storeSummaries.reduce((s, st) => s + (st.productCount || 0), 0);
 
@@ -537,7 +624,16 @@ function renderStoreList() {
       ${isRefreshing ? '<div class="refresh-bar"><div class="refresh-bar-inner"></div></div>' : ''}
     </div>`;
   }).join('')}
-  ${pend.map(s => `<div class="store-row"><button class="store-btn" disabled style="opacity:.5" title="获取中..."><span class="drag-handle" style="visibility:hidden">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span> <span class="badge">...</span></button></div>`).join('')}`;
+  ${error.map(s => {
+    return `<div class="store-row store-row-error" data-id="${s.id}">
+      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="switchStore('${s.id}')" title="${escapeHtml(s.error||'刷新失败')}"><span class="drag-handle" style="color:var(--danger)">⚠</span><span class="sb-name" style="color:var(--danger)">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-error">失败</span></button>
+    </div>`;
+  }).join('')}
+  ${pend.map(s => {
+    return `<div class="store-row store-row-pending" data-id="${s.id}">
+      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="switchStore('${s.id}')" title="获取中..."><span class="drag-handle" style="color:var(--text3);opacity:.5">⠿</span><span class="sb-name" style="opacity:.7">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-pending">获取中</span></button>
+    </div>`;
+  }).join('')}`;
 }
 
 function dragStart(e, id) {
@@ -590,7 +686,12 @@ async function switchStore(storeId) {
   } else {
     const summary = storeSummaries.find(s => s.id === storeId);
     const existing = stores.find(s => s.id === storeId);
-    if (!existing || needsAutoRefresh(summary?.lastUpdated)) {
+    const isError = summary?.status === 'error';
+    const isPending = summary?.status === 'pending';
+    if (isError || isPending || !existing || needsAutoRefresh(summary?.lastUpdated)) {
+      if ((isError || isPending) && existing) {
+        renderStores();
+      }
       await refreshStore(storeId, true);
     }
     if (!stores.find(s => s.id === storeId)) {
@@ -923,23 +1024,28 @@ async function refreshStore(id, silent) {
 }
 
 let _refreshingAll = false;
+let _stopRefreshAll = false;
 let refreshingStores = new Set();
 
 async function refreshAllStores() {
   if (_refreshingAll) return;
   _refreshingAll = true;
+  _stopRefreshAll = false;
   const btn = document.getElementById('refreshAllBtn');
-  btn.textContent = '刷新中...';
-  btn.disabled = true;
+  btn.textContent = '停止刷新';
+  btn.disabled = false;
+  btn.onclick = stopRefreshAll;
   const order = [...storeSummaries].filter(s => s.status === 'ok').sort((a, b) => (a.lastUpdated || '').localeCompare(b.lastUpdated || ''));
   for (const s of order) {
+    if (_stopRefreshAll) break;
     refreshingStores.add(s.id);
     renderStoreList();
     try {
       await fetch(`/api/stores/${s.id}/refresh`, { method: 'POST' });
       let n = 0;
-      while (n < 30) {
+      while (n < 30 && !_stopRefreshAll) {
         await new Promise(r => setTimeout(r, 1500));
+        if (_stopRefreshAll) break;
         const summary = await (await fetch('/api/stores/summary')).json();
         const updated = summary.find(x => x.id === s.id);
         if (updated) {
@@ -967,11 +1073,24 @@ async function refreshAllStores() {
     }
     await new Promise(r => setTimeout(r, 1000));
   }
+  finishRefreshAll();
+}
+
+function stopRefreshAll() {
+  _stopRefreshAll = true;
+  const btn = document.getElementById('refreshAllBtn');
+  btn.textContent = '正在停止...';
+  btn.disabled = true;
+}
+
+function finishRefreshAll() {
   refreshingStores.clear();
   markDirty();
   render();
+  const btn = document.getElementById('refreshAllBtn');
   btn.textContent = '全局刷新';
   btn.disabled = false;
+  btn.onclick = refreshAllStores;
   _refreshingAll = false;
 }
 
