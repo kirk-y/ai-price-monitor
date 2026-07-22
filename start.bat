@@ -1,7 +1,7 @@
 @echo off
 chcp 65001 >nul
-title 链动小铺价格监控
-echo 正在启动链动小铺价格监控...
+title AI价格监控
+echo 正在启动AI价格监控...
 echo.
 echo 首次使用请先运行: npm install
 echo.

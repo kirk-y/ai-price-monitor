@@ -19,7 +19,7 @@ process.on('uncaughtException', (err) => {
 app.get('/api/stores/export', (req, res) => {
   const data = store.exportAllData();
   res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Content-Disposition', `attachment; filename="ldxp-stores-${new Date().toISOString().slice(0,10)}.json"`);
+  res.setHeader('Content-Disposition', `attachment; filename="ai-price-monitor-${new Date().toISOString().slice(0,10)}.json"`);
   res.json(data);
 });
 
@@ -135,7 +135,7 @@ async function scrapeAndUpdate(storeId, url) {
 }
 
 const server = app.listen(PORT, () => {
-  console.log(`链动小铺价格监控服务已启动: http://localhost:${PORT}`);
+  console.log(`AI价格监控服务已启动: http://localhost:${PORT}`);
   startAutoRefresh();
 });
 
