@@ -1,11 +1,13 @@
 const axios = require('axios');
 const { spawn } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 
 const BASE = 'https://pay.ldxp.cn';
 const GOODS_TYPES = ['card', 'article', 'resource', 'equity'];
 const REQ_TIMEOUT = 10000;
 const CLASSIFIER_SCRIPT = path.join(__dirname, 'python', 'classifier.py');
+let classifierAvailable = null;
 
 function extractToken(url) {
   const m = url.match(/\/shop\/([^/?#]+)/);
@@ -13,20 +15,28 @@ function extractToken(url) {
 }
 
 async function getCookies(token) {
-  const res = await axios.get(`${BASE}/shop/${token}`, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-    timeout: REQ_TIMEOUT,
-  });
-  return (res.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+  try {
+    const res = await axios.get(`${BASE}/shop/${encodeURIComponent(token)}`, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      timeout: REQ_TIMEOUT,
+    });
+    return (res.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
+  } catch (err) {
+    console.warn(`获取店铺页面 Cookie 失败，继续尝试 API: ${token} - ${err.message}`);
+    return '';
+  }
 }
 
-function headers(cookies) {
-  return {
+function headers(cookies, token) {
+  const h = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Content-Type': 'application/json',
-    'Cookie': cookies || '',
     'Accept': 'application/json, text/plain, */*',
+    'Origin': BASE,
+    'Referer': `${BASE}/shop/${encodeURIComponent(token || '')}`,
   };
+  if (cookies) h.Cookie = cookies;
+  return h;
 }
 
 async function fetchProducts(token, goodsType, cookies) {
@@ -37,10 +47,12 @@ async function fetchProducts(token, goodsType, cookies) {
   while (true) {
     const res = await axios.post(`${BASE}/shopApi/Shop/goodsList`, {
       token, goods_type: goodsType, current, pageSize,
-    }, { headers: headers(cookies), timeout: REQ_TIMEOUT });
+    }, { headers: headers(cookies, token), timeout: REQ_TIMEOUT });
 
     const data = res.data;
-    if (!data || data.code !== 1 || !data.data?.list) break;
+    if (!data) throw new Error(`${goodsType} 商品列表响应为空`);
+    if (data.code !== 1) throw new Error(`${goodsType} 商品列表错误: ${data.msg || '未知错误'}`);
+    if (!Array.isArray(data.data?.list)) throw new Error(`${goodsType} 商品列表格式异常`);
 
     const list = data.data.list;
     if (list.length === 0) break;
@@ -70,7 +82,7 @@ async function scrapeShop(url) {
   const cookies = await getCookies(token);
 
   const infoRes = await axios.post(`${BASE}/shopApi/Shop/info`, { token }, {
-    headers: headers(cookies), timeout: REQ_TIMEOUT,
+    headers: headers(cookies, token), timeout: REQ_TIMEOUT,
   });
 
   if (!infoRes.data || infoRes.data.code !== 1) {
@@ -79,20 +91,42 @@ async function scrapeShop(url) {
 
   const shopInfo = infoRes.data.data;
   const shopName = shopInfo.nickname || shopInfo.link?.split('/').pop() || token;
-  const goodsTypeSort = shopInfo.goods_type_sort || GOODS_TYPES;
+  const goodsTypeSort = Array.isArray(shopInfo.goods_type_sort) && shopInfo.goods_type_sort.length
+    ? shopInfo.goods_type_sort
+    : GOODS_TYPES;
 
   const allProducts = [];
+  const failures = [];
+  let fetchedTypes = 0;
   for (const gt of goodsTypeSort) {
     try {
       const products = await fetchProducts(token, gt, cookies);
       allProducts.push(...products);
-    } catch (_) { }
+      fetchedTypes++;
+    } catch (err) {
+      failures.push(`${gt}: ${err.message}`);
+    }
   }
 
-  return { shopName, products: allProducts };
+  if (fetchedTypes === 0 && failures.length) {
+    throw new Error(`无法获取商品列表: ${failures.join('; ')}`);
+  }
+
+  return { shopName, products: allProducts, partialFailures: failures };
+}
+
+function hasClassifier() {
+  if (classifierAvailable === null) {
+    classifierAvailable = fs.existsSync(CLASSIFIER_SCRIPT);
+    if (!classifierAvailable) {
+      console.warn(`分类器不存在，已跳过AI分类: ${CLASSIFIER_SCRIPT}`);
+    }
+  }
+  return classifierAvailable;
 }
 
 function classifyProduct(name) {
+  if (!hasClassifier()) return Promise.resolve(null);
   return new Promise((resolve) => {
     const proc = spawn('python', [CLASSIFIER_SCRIPT, 'predict', name], {
       cwd: path.join(__dirname, 'python'),
@@ -114,6 +148,7 @@ function classifyProduct(name) {
 }
 
 async function classifyProducts(products, storeId) {
+  if (!hasClassifier()) return;
   const store = require('./store');
   for (const p of products) {
     const pk = `${storeId}:${p.id}`;

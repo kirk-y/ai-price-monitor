@@ -4,11 +4,18 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>AI价格监控</title>
-  <link rel="stylesheet" href="/style.css">
+  <link rel="stylesheet" href="/style.css?v=gemini-20260723-3">
 </head>
 <body>
   <div class="app">
-    <div class="top-bar" id="topBar"></div>
+    <div class="top-bar" id="topBar">
+      <div class="brand-lockup">
+        <span class="brand-mark"></span>
+        <span class="brand-title">AI价格监控</span>
+      </div>
+      <div class="brand-status">本地运行</div>
+    </div>
+    <div class="dashboard-strip" id="dashboardStrip"></div>
 
     <div class="columns">
       <div class="left-bar" id="leftBar">
@@ -42,7 +49,7 @@
         <div class="rb-divider"></div>
         <div class="rb-price-range" id="rbPriceRange"></div>
         <div class="rb-divider"></div>
-        <h3>最优价格</h3>
+        <h3>价格洞察</h3>
         <div id="bestPriceList"></div>
       </div>
     </div>
@@ -181,6 +188,6 @@
   </div>
 
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-  <script src="/app.js"></script>
+  <script src="/app.js?v=gemini-20260723-3"></script>
 </body>
 </html>

@@ -20,6 +20,10 @@ let productsDirty = true;
 let storeOrder = [];
 let priceRange = { min: 0, max: 0 };
 let _priceTimer = null;
+let queueStatus = null;
+let queueStatusTimer = null;
+const STORE_POLL_INTERVAL_MS = 1500;
+const STORE_POLL_ATTEMPTS = 90;
 
 function initTheme() {
   const saved = localStorage.getItem('theme');
@@ -41,6 +45,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   suggestedKeywords = filterConfig.suggestedKeywords || ['GPT', 'Plus', 'Pro', 'Team', '接码', '直充', '成品', '账号', 'Claude', 'Gemini', 'OpenAI', 'SMS', '谷歌', '微软', '邮箱', 'API', '订阅', '会员', 'Access'];
   keywordUsage = filterConfig.keywordUsage || {};
   refreshConfig = await (await fetch('/api/refresh-config')).json();
+  queueStatus = await fetchRefreshQueueStatus();
   await loadStoreSummaries();
   stores = await (await fetch('/api/stores')).json();
   storeOrder = await (await fetch('/api/store-order')).json();
@@ -49,6 +54,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   for (const l of labels) { productLabels[l.product_key] = l; }
   markDirty();
   render();
+  startQueueStatusPolling();
   document.getElementById('catBar').addEventListener('wheel', e => { e.preventDefault(); document.getElementById('catBar').scrollLeft += e.deltaY; }, { passive: false });
   document.querySelectorAll('.close').forEach(el => el.addEventListener('click', () => {
     document.getElementById('historyModal').style.display = 'none';
@@ -107,7 +113,7 @@ function renderSuggestedKeys() {
   const sorted = [...keys].sort((a, b) => (keywordUsage[b] || 0) - (keywordUsage[a] || 0)).slice(0, 7);
   container.innerHTML = '<span class="sk-label">常用:</span> ' +
     sorted.map(k =>
-      `<span class="sk-item" onclick="addSuggestKey('${escapeHtml(k)}')">${escapeHtml(k)}</span>`
+      `<span class="sk-item" onclick="${jsCall('addSuggestKey', k)}">${escapeHtml(k)}</span>`
     ).join('');
 }
 
@@ -210,15 +216,15 @@ function startNextRefreshTimer(ts) {
 
 function renderCatVisibility() {
   const hidden = filterConfig.hiddenCategories || [];
-  const order = filterConfig.categoryOrder || Object.keys(CAT_LABELS);
+  const order = getCategoryOrder();
   const container = document.getElementById('catVisibility');
   container.innerHTML = order.filter(k => CAT_LABELS[k]).map((k, i) =>
-    `<div class="cat-vis-row" draggable="true" data-cat="${k}"
-      ondragstart="catDragStart(event,'${k}')" ondragover="catDragOver(event)" ondrop="catDrop(event,'${k}')" ondragend="catDragEnd()">
+    `<div class="cat-vis-row" draggable="true" data-cat="${escapeAttr(k)}"
+      ondragstart="${jsCall('catDragStart', { raw: 'event' }, k)}" ondragover="${jsCall('catDragOver', { raw: 'event' })}" ondrop="${jsCall('catDrop', { raw: 'event' }, k)}" ondragend="catDragEnd()">
       <span class="cat-drag-handle">⠿</span>
       <label style="flex:1;font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer">
-        <input type="checkbox" ${hidden.includes(k) ? '' : 'checked'} onchange="toggleCatVisibility('${k}',this.checked)">
-        ${CAT_LABELS[k]}
+        <input type="checkbox" ${hidden.includes(k) ? '' : 'checked'} onchange="${jsCall('toggleCatVisibility', k, { raw: 'this.checked' })}">
+        ${escapeHtml(CAT_LABELS[k])}
       </label>
     </div>`
   ).join('');
@@ -231,7 +237,7 @@ function catDragEnd() { document.querySelectorAll('.cat-vis-row.dragging').forEa
 function catDrop(e, targetKey) {
   e.preventDefault();
   if (!_catDragKey || _catDragKey === targetKey) return;
-  const order = filterConfig.categoryOrder || Object.keys(CAT_LABELS);
+  const order = getCategoryOrder();
   const from = order.indexOf(_catDragKey);
   const to = order.indexOf(targetKey);
   if (from === -1 || to === -1) return;
@@ -293,7 +299,7 @@ function renderStoreExportSelect() {
   const sel = document.getElementById('storeExportSelect');
   sel.innerHTML = '<option value="">-- 选择店铺 --</option>' +
     storeSummaries.filter(s => s.status === 'ok' || s.status === 'error').map(s =>
-      `<option value="${s.id}">${escapeHtml(s.name || s.id)}</option>`
+      `<option value="${escapeAttr(s.id)}">${escapeHtml(s.name || s.id)}</option>`
     ).join('');
 }
 
@@ -302,9 +308,14 @@ function exportSingleStore() {
   const id = sel.value;
   const msg = document.getElementById('storeExportMsg');
   if (!id) { msg.textContent = '请先选择店铺'; msg.style.color = '#e53935'; return; }
-  window.open(`/api/stores/${id}/export`, '_blank');
+  window.open(`/api/stores/${encodeURIComponent(id)}/export`, '_blank');
   msg.textContent = '✓ 已开始下载';
   msg.style.color = '#43a047';
+}
+
+function storeIdFromUrl(url) {
+  const m = String(url || '').match(/\/shop\/([^/?#]+)/);
+  return m ? decodeURIComponent(m[1]) : String(url || '').replace(/\/+$/, '').split('/').pop() || '';
 }
 
 async function importStoreList(e) {
@@ -317,28 +328,64 @@ async function importStoreList(e) {
     const text = await file.text();
     const list = JSON.parse(text);
     if (!Array.isArray(list)) throw new Error('数据格式错误，应为店铺数组');
-    let added = 0, skipped = 0;
-    const existing = storeSummaries.map(s => s.id);
-    for (const item of list) {
-      if (!item.url || !item.url.startsWith('http')) { skipped++; continue; }
-      if (existing.includes(item.id)) { skipped++; continue; }
-      try {
-        await fetch('/api/stores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: item.url }) });
-        added++;
-      } catch { skipped++; }
-    }
-    msg.textContent = `✓ 导入完成: 新增 ${added} 个，跳过 ${skipped} 个`;
-    msg.style.color = '#43a047';
+    const res = await fetch('/api/stores/import-list', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(list),
+    });
+    const result = await res.json();
+    if (!res.ok) throw new Error(result.error || '导入失败');
+
+    msg.textContent = `✓ 导入完成: 新增 ${result.added || 0} 个并排队刷新，跳过 ${result.skipped || 0} 个${result.failed ? `，失败 ${result.failed} 个` : ''}`;
+    msg.style.color = result.failed ? '#e53935' : '#43a047';
     e.target.value = '';
     storeSummaries = await (await fetch('/api/stores/summary')).json();
     stores = await (await fetch('/api/stores')).json();
+    queueStatus = await fetchRefreshQueueStatus();
+    applyStoreOrder();
     markDirty();
     render();
-    renderStoreList();
+    watchPendingStores((result.stores || []).map(s => s.id));
   } catch (err) {
     msg.textContent = '导入失败: ' + err.message;
     msg.style.color = '#e53935';
   }
+}
+
+let pendingWatchIds = new Set();
+let pendingWatchTimer = null;
+
+function watchPendingStores(ids) {
+  for (const id of ids || []) {
+    if (id) pendingWatchIds.add(id);
+  }
+  if (!pendingWatchIds.size || pendingWatchTimer) return;
+  pendingWatchTimer = setTimeout(pollPendingStores, 3000);
+}
+
+async function pollPendingStores() {
+  pendingWatchTimer = null;
+  if (!pendingWatchIds.size) return;
+  try {
+    const summary = await (await fetch('/api/stores/summary')).json();
+    queueStatus = await fetchRefreshQueueStatus();
+    storeSummaries = summary;
+    applyStoreOrder();
+    const watched = [...pendingWatchIds];
+    const finished = watched.filter(id => {
+      const s = summary.find(x => x.id === id);
+      return s && s.status !== 'pending';
+    });
+    for (const id of finished) pendingWatchIds.delete(id);
+    if (finished.some(id => summary.find(s => s.id === id)?.status === 'ok')) {
+      stores = await (await fetch('/api/stores')).json();
+      const newLabels = await (await fetch('/api/product-labels')).json();
+      for (const l of newLabels) { productLabels[l.product_key] = l; }
+      markDirty();
+    }
+    render();
+  } catch (_) {}
+  if (pendingWatchIds.size) pendingWatchTimer = setTimeout(pollPendingStores, 3000);
 }
 
 async function importSingleStoreFile(e) {
@@ -402,6 +449,7 @@ async function importData(e) {
   try {
     const text = await file.text();
     const data = JSON.parse(text);
+    if (Array.isArray(data)) throw new Error('这是店铺列表文件，请在“店铺导出”中使用“导入店铺列表”');
     const res = await fetch('/api/stores/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
     if (res.ok) {
       msg.textContent = '✓ 导入成功，页面即将刷新';
@@ -429,12 +477,12 @@ function removeWord(word, type) {
 function renderChips() {
   const inc = document.getElementById('includeChips');
   inc.innerHTML = includeWords.map(w =>
-    `<span class="chip chip-inc">${escapeHtml(w)}<span class="chip-del" onclick="removeWord('${escapeHtml(w)}','include')">&times;</span></span>`
+    `<span class="chip chip-inc">${escapeHtml(w)}<span class="chip-del" onclick="${jsCall('removeWord', w, 'include')}">&times;</span></span>`
   ).join('');
 
   const exc = document.getElementById('excludeChips');
   exc.innerHTML = excludeWords.map(w =>
-    `<span class="chip chip-exc">${escapeHtml(w)}<span class="chip-del" onclick="removeWord('${escapeHtml(w)}','exclude')">&times;</span></span>`
+    `<span class="chip chip-exc">${escapeHtml(w)}<span class="chip-del" onclick="${jsCall('removeWord', w, 'exclude')}">&times;</span></span>`
   ).join('');
 }
 
@@ -455,9 +503,92 @@ async function loadStoreSummaries() {
   renderStoreList();
   renderBestPrices();
   renderPriceRange();
+  renderDashboardStrip();
   if (!stores.length) {
     document.getElementById('storesContainer').innerHTML = '<div class="empty-state">请添加店铺开始监控</div>';
   }
+}
+
+async function fetchRefreshQueueStatus() {
+  try {
+    const res = await fetch('/api/refresh-queue');
+    if (!res.ok) return queueStatus;
+    return await res.json();
+  } catch (_) {
+    return queueStatus;
+  }
+}
+
+function startQueueStatusPolling() {
+  clearInterval(queueStatusTimer);
+  queueStatusTimer = setInterval(async () => {
+    queueStatus = await fetchRefreshQueueStatus();
+    renderDashboardStrip();
+    renderStoreList();
+  }, 3000);
+}
+
+function queueReasonLabel(reason) {
+  const map = {
+    'import-list': '批量导入',
+    'add-store': '新增店铺',
+    'manual-refresh': '手动刷新',
+    'auto-refresh': '自动刷新',
+  };
+  return map[reason] || '刷新任务';
+}
+
+function formatCountdown(ts) {
+  if (!ts) return '未安排';
+  const diff = ts - Date.now();
+  if (diff <= 0) return '即将刷新';
+  const min = Math.floor(diff / 60000);
+  const sec = Math.floor((diff % 60000) / 1000);
+  if (min >= 60) return `${Math.floor(min / 60)}小时${min % 60}分`;
+  return `${min}分${sec}秒`;
+}
+
+function renderDashboardStrip() {
+  const el = document.getElementById('dashboardStrip');
+  if (!el) return;
+  const totalStores = storeSummaries.length;
+  const totalProducts = storeSummaries.reduce((n, s) => n + (s.productCount || 0), 0);
+  const failed = storeSummaries.filter(s => s.status === 'error').length;
+  const pending = storeSummaries.filter(s => s.status === 'pending').length;
+  const active = queueStatus?.active;
+  const queuedCount = queueStatus?.queuedCount || 0;
+  const queueText = active
+    ? `${queueReasonLabel(active.reason)}：${active.name}`
+    : queuedCount
+      ? `排队 ${queuedCount} 个任务`
+      : '队列空闲';
+  const queueClass = active || queuedCount || pending ? 'is-active' : '';
+  document.querySelector('.brand-status').textContent = active ? '刷新中' : '本地运行';
+  el.innerHTML = `
+    <div class="metric-card">
+      <span class="metric-label">店铺</span>
+      <strong>${totalStores}</strong>
+    </div>
+    <div class="metric-card">
+      <span class="metric-label">商品</span>
+      <strong>${totalProducts}</strong>
+    </div>
+    <div class="metric-card ${failed ? 'metric-danger' : ''}">
+      <span class="metric-label">失败</span>
+      <strong>${failed}</strong>
+    </div>
+    <div class="metric-card ${pending ? 'metric-warn' : ''}">
+      <span class="metric-label">Pending</span>
+      <strong>${pending}</strong>
+    </div>
+    <div class="queue-card ${queueClass}">
+      <div class="queue-main">
+        <span class="queue-dot"></span>
+        <span>${escapeHtml(queueText)}</span>
+      </div>
+      <span class="queue-sub">下次 ${escapeHtml(formatCountdown(refreshConfig.nextRefreshAt))}</span>
+    </div>
+  `;
 }
 
 async function loadStoreWithProducts(storeId) {
@@ -466,7 +597,7 @@ async function loadStoreWithProducts(storeId) {
     markDirty();
     return;
   }
-  const full = await (await fetch(`/api/stores/${storeId}`)).json();
+  const full = await (await fetch(`/api/stores/${encodeURIComponent(storeId)}`)).json();
   const idx = stores.findIndex(s => s.id === storeId);
   if (idx >= 0) stores[idx] = full;
   else stores.push(full);
@@ -484,13 +615,24 @@ function categorize(name) {
       try { if (new RegExp(p, 'i').test(name)) return cat; } catch (_) { }
     }
   }
-  return 'other';
+  return '其他';
+}
+
+function normalizeCategory(category) {
+  return category === 'other' ? '其他' : category;
 }
 
 function matchesSearch(name) {
   const lower = name.toLowerCase();
   if (includeWords.length && !includeWords.every(w => lower.includes(w.toLowerCase()))) return false;
   if (excludeWords.length && excludeWords.some(w => lower.includes(w.toLowerCase()))) return false;
+  return true;
+}
+
+function priceMatches(price) {
+  const p = Number(price) || 0;
+  if (priceRange.min && p < priceRange.min) return false;
+  if (priceRange.max && p > priceRange.max) return false;
   return true;
 }
 
@@ -501,8 +643,8 @@ function getAllProducts() {
     for (const p of (s.products || [])) {
       const pk = `${s.id}:${p.id}`;
       const label = productLabels[pk];
-      const cat = label ? label.category : categorize(p.name);
-      const conf = label ? label.confidence : 0;
+      const cat = normalizeCategory(label ? label.category : categorize(p.name));
+      const conf = label ? Number(label.confidence) || 0 : 0;
       all.push({ ...p, category: cat, confidence: conf, productKey: pk, storeName: s.name, storeId: s.id });
     }
   }
@@ -515,9 +657,10 @@ function markDirty() { productsDirty = true; }
 
 function applyStoreOrder() {
   if (!storeOrder.length) return;
+  const orderIndex = new Map(storeOrder.map((id, index) => [id, index]));
   const sortByOrder = (a, b) => {
-    const ai = storeOrder.indexOf(a.id);
-    const bi = storeOrder.indexOf(b.id);
+    const ai = orderIndex.has(a.id) ? orderIndex.get(a.id) : -1;
+    const bi = orderIndex.has(b.id) ? orderIndex.get(b.id) : -1;
     if (ai === -1 && bi === -1) return 0;
     if (ai === -1) return 1;
     if (bi === -1) return -1;
@@ -536,6 +679,7 @@ function getFilteredProducts() {
     all = all.filter(p => catL1FromFull(p.category) === activeCatL1);
   }
   if (includeWords.length || excludeWords.length) all = all.filter(p => matchesSearch(p.name));
+  if (priceRange.min || priceRange.max) all = all.filter(p => priceMatches(p.price));
   all.sort((a, b) => {
     if ((a.stock > 0) !== (b.stock > 0)) return a.stock > 0 ? -1 : 1;
     return a.price - b.price;
@@ -583,13 +727,21 @@ const CAT_LABELS = {
   电商工具_闲鱼助手: '闲鱼助手',
   反重力_Antigravity: '反重力',
   Adobe_Firefly: 'Adobe Firefly',
+  codex: 'Codex',
   其他: '其他',
 };
 
 function visibleCatEntries() {
   const hidden = filterConfig.hiddenCategories || [];
-  const order = filterConfig.categoryOrder || Object.keys(CAT_LABELS);
+  const order = getCategoryOrder();
   return order.filter(k => !hidden.includes(k) && CAT_LABELS[k]).map(k => [k, CAT_LABELS[k]]);
+}
+
+function getCategoryOrder() {
+  const configured = filterConfig.categoryOrder || [];
+  return configured.length
+    ? [...configured, ...Object.keys(CAT_LABELS).filter(k => !configured.includes(k))]
+    : Object.keys(CAT_LABELS);
 }
 
 const CAT_L1_LABELS = {
@@ -657,12 +809,10 @@ function renderCatBar() {
 
   const bar = document.getElementById('catBar');
 
-  // Row 1: Level 1 categories
   const l1Buttons = CAT_L1.map(l1 =>
-    l1Counts[l1] ? `<button class="cat-btn ${activeCatL1 === l1 && !activeCatL2 ? 'active' : ''}" onclick="setCatL1('${l1}')">${CAT_L1_LABELS[l1]||l1} <span class="cat-cnt">${l1Counts[l1]}</span></button>` : ''
+    l1Counts[l1] ? `<button class="cat-btn ${activeCatL1 === l1 && !activeCatL2 ? 'active' : ''}" onclick="${jsCall('setCatL1', l1)}">${escapeHtml(CAT_L1_LABELS[l1] || l1)} <span class="cat-cnt">${l1Counts[l1]}</span></button>` : ''
   ).filter(Boolean).join('');
 
-  // Row 2: Level 2 subcategories (visible only when L1 is selected)
   let l2Buttons = '';
   if (activeCatL1) {
     const subs = new Set();
@@ -672,7 +822,7 @@ function renderCatBar() {
     const sorted = [...subs].sort((a, b) => (counts[b]||0) - (counts[a]||0));
     l2Buttons = sorted.map(full => {
       const l2 = catL2FromFull(full);
-      return `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" onclick="setCatL2('${full}')">${catL2Label(activeCatL1, l2)} <span class="cat-cnt">${counts[full]||0}</span></button>`;
+      return `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" onclick="${jsCall('setCatL2', full)}">${escapeHtml(catL2Label(activeCatL1, l2))} <span class="cat-cnt">${counts[full]||0}</span></button>`;
     }).join('');
   }
 
@@ -716,13 +866,14 @@ function render() {
     }
   }
   renderStoreList();
+  renderDashboardStrip();
   renderBestPrices();
   renderPriceRange();
   renderCatBar();
   renderStores();
   if (anchor) {
     requestAnimationFrame(() => {
-      const el = document.querySelector(`.store-card[data-store-id="${anchor.id}"]`);
+      const el = [...document.querySelectorAll('.store-card')].find(card => card.dataset.storeId === anchor.id);
       if (el) window.scrollBy(0, el.getBoundingClientRect().top - anchor.offset);
     });
   }
@@ -737,23 +888,27 @@ function renderStoreList() {
   const pend = storeSummaries.filter(s => s.status === 'pending');
   const total = storeSummaries.reduce((s, st) => s + (st.productCount || 0), 0);
 
-  container.innerHTML = `<button class="store-btn ${activeStoreId === 'all' ? 'active' : ''}" onclick="switchStore('all')"><span class="sb-name">全部</span> <span class="badge">${total}</span></button>
+  container.innerHTML = `<button class="store-btn ${activeStoreId === 'all' ? 'active' : ''}" onclick="${jsCall('switchStore', 'all')}"><span class="sb-name">全部</span> <span class="badge">${total}</span></button>
   ${ok.map(s => {
     const isRefreshing = refreshingStores.has(s.id);
-    return `<div class="store-row${isRefreshing ? ' is-refreshing' : ''}" draggable="true" data-id="${s.id}"
-      ondragstart="dragStart(event,'${s.id}')" ondragover="dragOver(event)" ondrop="dropStore(event,'${s.id}')" ondragend="dragEnd()">
-      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="switchStore('${s.id}')" title="${formatTime(s.lastUpdated)}"><span class="drag-handle">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span> <span class="badge">${s.productCount||0}</span></button>
+    return `<div class="store-row${isRefreshing ? ' is-refreshing' : ''}" draggable="true" data-id="${escapeAttr(s.id)}"
+      ondragstart="${jsCall('dragStart', { raw: 'event' }, s.id)}" ondragover="${jsCall('dragOver', { raw: 'event' })}" ondrop="${jsCall('dropStore', { raw: 'event' }, s.id)}" ondragend="dragEnd()">
+      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="${jsCall('switchStore', s.id)}" title="${escapeAttr(formatTime(s.lastUpdated))}"><span class="drag-handle">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span> <span class="badge">${s.productCount||0}</span></button>
       ${isRefreshing ? '<div class="refresh-bar"><div class="refresh-bar-inner"></div></div>' : ''}
     </div>`;
   }).join('')}
   ${error.map(s => {
-    return `<div class="store-row store-row-error" data-id="${s.id}">
-      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="switchStore('${s.id}')" title="${escapeHtml(s.error||'刷新失败')}"><span class="drag-handle" style="color:var(--danger)">⚠</span><span class="sb-name" style="color:var(--danger)">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-error">失败</span></button>
+    const isRefreshing = refreshingStores.has(s.id);
+    return `<div class="store-row store-row-error${isRefreshing ? ' is-refreshing' : ''}" data-id="${escapeAttr(s.id)}">
+      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="${jsCall('switchStore', s.id)}" title="${escapeAttr(s.error||'刷新失败')}"><span class="drag-handle" style="color:var(--danger)">⚠</span><span class="sb-name" style="color:var(--danger)">${escapeHtml((s.name||s.id))}</span> <span class="badge">${s.productCount||0}</span><span class="badge-error">失败</span></button>
+      ${isRefreshing ? '<div class="refresh-bar"><div class="refresh-bar-inner"></div></div>' : ''}
     </div>`;
   }).join('')}
   ${pend.map(s => {
-    return `<div class="store-row store-row-pending" data-id="${s.id}">
-      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="switchStore('${s.id}')" title="获取中..."><span class="drag-handle" style="color:var(--text3);opacity:.5">⠿</span><span class="sb-name" style="opacity:.7">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-pending">获取中</span></button>
+    const isRefreshing = refreshingStores.has(s.id);
+    return `<div class="store-row store-row-pending${isRefreshing ? ' is-refreshing' : ''}" data-id="${escapeAttr(s.id)}">
+      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="${jsCall('switchStore', s.id)}" title="获取中..."><span class="drag-handle" style="color:var(--text3);opacity:.5">⠿</span><span class="sb-name" style="opacity:.7">${escapeHtml((s.name||s.id))}</span> <span class="badge">${s.productCount||0}</span><span class="badge-pending">获取中</span></button>
+      ${isRefreshing ? '<div class="refresh-bar"><div class="refresh-bar-inner"></div></div>' : ''}
     </div>`;
   }).join('')}`;
 }
@@ -770,17 +925,36 @@ function dragOver(e) {
   e.dataTransfer.dropEffect = 'move';
 }
 
+function reorderByIds(items, ids) {
+  const byId = new Map(items.map(item => [item.id, item]));
+  const seen = new Set();
+  const ordered = [];
+  for (const id of ids) {
+    const item = byId.get(id);
+    if (item) {
+      ordered.push(item);
+      seen.add(id);
+    }
+  }
+  return ordered.concat(items.filter(item => !seen.has(item.id)));
+}
+
+function moveIdBefore(ids, id, targetId) {
+  const next = ids.filter(x => x !== id);
+  const to = next.indexOf(targetId);
+  if (to === -1) return ids;
+  next.splice(to, 0, id);
+  return next;
+}
+
 function dropStore(e, targetId) {
   e.preventDefault();
   if (!dragId || dragId === targetId) return;
-  const from = storeSummaries.findIndex(s => s.id === dragId);
-  const to = storeSummaries.findIndex(s => s.id === targetId);
-  if (from === -1 || to === -1) return;
-  const [moved] = storeSummaries.splice(from, 1);
-  storeSummaries.splice(to, 0, moved);
-  const [movedStore] = stores.splice(from, 1);
-  stores.splice(to, 0, movedStore);
-  storeOrder = storeSummaries.filter(s => s.status === 'ok').map(s => s.id);
+  const ids = storeSummaries.map(s => s.id);
+  if (!ids.includes(dragId) || !ids.includes(targetId)) return;
+  storeOrder = moveIdBefore(ids, dragId, targetId);
+  storeSummaries = reorderByIds(storeSummaries, storeOrder);
+  stores = reorderByIds(stores, storeOrder);
   fetch('/api/store-order', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(storeOrder) });
   markDirty();
   render();
@@ -830,19 +1004,45 @@ function renderBestPrices() {
   let pool = getAllProducts();
   if (activeStoreId !== 'all') pool = pool.filter(p => p.storeId === activeStoreId);
   if (includeWords.length || excludeWords.length) pool = pool.filter(p => matchesSearch(p.name));
+  if (priceRange.min || priceRange.max) pool = pool.filter(p => priceMatches(p.price));
   document.getElementById('bestPriceList').innerHTML = visibleCatEntries().map(([k, label]) => {
     const items = pool.filter(p => p.category === k && p.price > 0 && p.stock > 0).sort((a, b) => a.price - b.price);
-    if (!items.length) return `<div class="bp-item"><div class="bp-cat">${label}</div><div class="bp-na">暂无</div></div>`;
+    if (!items.length) {
+      return `<div class="bp-item bp-empty">
+        <div class="bp-head"><span class="bp-cat">${escapeHtml(label)}</span><span class="bp-state">暂无</span></div>
+        <div class="bp-na">无可用库存</div>
+      </div>`;
+    }
     const item = items[0];
-    return `<div class="bp-item"><div class="bp-cat">${label}</div><div class="bp-price">¥${item.price.toFixed(2)}</div><div class="bp-store">${escapeHtml(item.storeName)}</div></div>`;
+    const stockText = Number(item.stock) > 0 ? `有货 ${item.stock}` : '库存未知';
+    return `<div class="bp-item">
+      <div class="bp-head"><span class="bp-cat">${escapeHtml(label)}</span><span class="bp-state is-ok">${escapeHtml(stockText)}</span></div>
+      <div class="bp-price">¥${item.price.toFixed(2)}</div>
+      <div class="bp-store">${escapeHtml(item.storeName)}</div>
+    </div>`;
   }).join('');
 }
 
 function renderStores() {
   const container = document.getElementById('storesContainer');
   const filtered = getFilteredProducts();
-  const ids = activeStoreId === 'all' ? storeSummaries.filter(s => s.status === 'ok').map(s => s.id) : [activeStoreId];
-  if (storeOrder.length && activeStoreId === 'all') ids.sort((a, b) => { const ai = storeOrder.indexOf(a); const bi = storeOrder.indexOf(b); if (ai === -1 && bi === -1) return 0; if (ai === -1) return 1; if (bi === -1) return -1; return ai - bi; });
+  const idsWithProducts = new Set(filtered.map(p => p.storeId));
+  const ids = activeStoreId === 'all'
+    ? storeSummaries
+      .filter(s => s.status === 'ok' || s.status === 'pending' || idsWithProducts.has(s.id))
+      .map(s => s.id)
+    : [activeStoreId];
+  if (storeOrder.length && activeStoreId === 'all') {
+    const orderIndex = new Map(storeOrder.map((id, index) => [id, index]));
+    ids.sort((a, b) => {
+      const ai = orderIndex.has(a) ? orderIndex.get(a) : -1;
+      const bi = orderIndex.has(b) ? orderIndex.get(b) : -1;
+      if (ai === -1 && bi === -1) return 0;
+      if (ai === -1) return 1;
+      if (bi === -1) return -1;
+      return ai - bi;
+    });
+  }
 
   if (!stores.length && !storeSummaries.length) { container.innerHTML = '<div class="empty-state">请添加店铺开始监控</div>'; return; }
   if (!stores.length && storeSummaries.length) { container.innerHTML = '<div class="empty-state">请选择店铺查看商品</div>'; return; }
@@ -854,13 +1054,23 @@ function renderStores() {
     if (reachedLimit) return '';
     const s = stores.find(st => st.id === id);
     if (!s) return '';
-    if (s.status === 'pending') return `<div class="store-card"><div class="sc-name">${escapeHtml(s.name||s.id)}</div><div class="store-loading">正在获取商品数据...</div></div>`;
-    if (s.status === 'error') return `<div class="store-card"><div class="sc-name">${escapeHtml(s.name||s.id)}</div><div class="store-error">${escapeHtml(s.error||'获取失败')}</div><button class="del-btn" onclick="deleteStore('${s.id}')">删除</button></div>`;
-
+    const summary = storeSummaries.find(st => st.id === id);
+    const status = summary?.status || s.status;
+    const error = summary?.error || s.error;
+    const isRefreshing = refreshingStores.has(id) || status === 'pending';
     let products = filtered.filter(p => p.storeId === id);
-    const storePrices = products.map(p => p.price).filter(v => v > 0);
-    const storePriceMin = storePrices.length ? Math.min(...storePrices) : 0;
-    const storePriceMax = storePrices.length ? Math.max(...storePrices) : 100;
+    const hasCachedProducts = (s.products || []).length > 0;
+    if (status === 'pending' && !hasCachedProducts) {
+      return `<div class="store-card" data-store-id="${escapeAttr(s.id)}"><div class="sc-name">${escapeHtml(s.name||s.id)}</div><div class="store-loading">正在获取商品数据...</div></div>`;
+    }
+    if (status === 'error' && !hasCachedProducts) {
+      return `<div class="store-card" data-store-id="${escapeAttr(s.id)}"><div class="sc-name">${escapeHtml(s.name||s.id)}</div><div class="store-error">${escapeHtml(error||'获取失败')}</div><button class="del-btn" onclick="${jsCall('deleteStore', s.id)}">删除</button></div>`;
+    }
+    const statusNotice = status === 'error'
+      ? `<div class="store-cache-warning">刷新失败，正在显示缓存商品：${escapeHtml(error || '未知错误')}</div>`
+      : isRefreshing
+        ? '<div class="store-cache-warning store-cache-pending">正在刷新，当前显示上次缓存商品</div>'
+        : '';
     let gridItems = [];
     if (!products.length) {
       gridItems.push('<div class="empty-grid">该分类下无商品</div>');
@@ -877,21 +1087,22 @@ function renderStores() {
         cardCount++;
       }
       if (!reachedLimit) {
-        if (hidden > 0) gridItems.push(`<div class="ns-toggle" onclick="toggleNoStock('${id}')">展开 ${noStock.length} 个无货商品...</div>`);
-        if (expanded && noStock.length > 0) gridItems.push(`<div class="ns-toggle" onclick="toggleNoStock('${id}')">收起无货商品</div>`);
+        if (hidden > 0) gridItems.push(`<div class="ns-toggle" onclick="${jsCall('toggleNoStock', id)}">展开 ${noStock.length} 个无货商品...</div>`);
+        if (expanded && noStock.length > 0) gridItems.push(`<div class="ns-toggle" onclick="${jsCall('toggleNoStock', id)}">收起无货商品</div>`);
       }
     }
     if (reachedLimit && !gridItems.length) return '';
-    return `<div class="store-card" data-store-id="${s.id}">
+    return `<div class="store-card ${isRefreshing ? 'is-card-refreshing' : ''}" data-store-id="${escapeAttr(s.id)}">
       <div class="sc-header">
         <span class="sc-name">${escapeHtml(s.name||s.id)}</span>
         <span class="sc-time">${formatTime(s.lastUpdated)}</span>
         <span class="sc-meta">${products.length} 个商品</span>
         <div class="sc-actions">
-          <button class="ref-btn" onclick="refreshStore('${s.id}')">更新</button>
-          <button class="del-btn" onclick="deleteStore('${s.id}')">删除</button>
+          <button class="ref-btn ${isRefreshing ? 'loading' : ''}" ${isRefreshing ? 'disabled' : ''} onclick="${jsCall('refreshStore', s.id)}">${isRefreshing ? '刷新中' : '更新'}</button>
+          <button class="del-btn" onclick="${jsCall('deleteStore', s.id)}">删除</button>
         </div>
       </div>
+      ${statusNotice}
       <div class="product-grid">${gridItems.join('')}</div>
     </div>`;
   }).join('');
@@ -920,52 +1131,75 @@ function observeSentinel() {
   window._scrollObs.observe(el);
 }
 
-function q(s) { return (s||'').replace(/'/g, "\\'").replace(/"/g, '&quot;'); }
+function safeTagClass(category) {
+  return String(category || 'other').replace(/[^\w\u4e00-\u9fff-]/g, '_');
+}
+
+function safeHref(url) {
+  try {
+    const parsed = new URL(String(url || ''), window.location.origin);
+    if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return parsed.href;
+  } catch (_) {}
+  return '';
+}
+
+function isOtherCategory(category) {
+  return category === 'other' || category === '其他';
+}
 
 function renderProductCard(p) {
-  const inStock = p.stock > 0;
-  const stockText = p.stock < 0 ? '未知' : inStock ? `有货 ${p.stock}` : `无货`;
-  const confPct = p.confidence > 0 ? Math.round(p.confidence * 100) : 0;
+  const stock = Number(p.stock);
+  const inStock = stock > 0;
+  const stockText = !Number.isFinite(stock) || stock < 0 ? '未知' : inStock ? `有货 ${stock}` : `无货`;
+  const confidence = Number(p.confidence) || 0;
+  const confPct = confidence > 0 ? Math.round(confidence * 100) : 0;
+  const category = normalizeCategory(p.category);
+  const price = Number(p.price) || 0;
+  const href = safeHref(p.purchaseUrl);
+  const tagHtml = isOtherCategory(category)
+    ? `<span class="tag tag-other" onclick="${jsCall('editLabel', p.productKey, p.name, '其他', 0)}" title="点击添加分类">其他</span>`
+    : `<span class="tag tag-${escapeAttr(safeTagClass(category))}" onclick="${jsCall('editLabel', p.productKey, p.name, category, confidence)}" title="${escapeAttr(`点击修改分类 (置信度: ${confPct}%)`)}">${escapeHtml(category)}${confPct > 0 ? `<small> ${confPct}%</small>` : ''}</span>`;
 
-  return `<div class="product-card ${inStock ? 'has-stock' : 'no-stock'}" data-price="${p.price}">
-    <div class="pc-top">
-      ${p.category !== 'other' ? `<span class="tag tag-${p.category}" onclick="editLabel('${q(p.productKey)}','${q(p.name)}','${q(p.category)}',${p.confidence})" title="点击修改分类 (置信度: ${confPct}%)">${p.category}${confPct > 0 ? `<small> ${confPct}%</small>` : ''}</span>` : `<span class="tag tag-other" onclick="editLabel('${q(p.productKey)}','${q(p.name)}','其他',0)" title="点击添加分类">其他</span>`}
-      <span class="pc-name" title="${q(p.name)}">${escapeHtml(p.name)}</span>
+  return `<div class="product-card ${inStock ? 'has-stock' : 'no-stock'}" data-price="${price}">
+    <div class="pc-head">
+      ${tagHtml}
+      <span class="pc-stock ${inStock ? 'is-stocked' : 'is-empty'}">${stockText}</span>
     </div>
-    <div class="pc-mid">
-      <span class="pc-price">¥${p.price.toFixed(2)}</span>
-      <span class="pc-stock">${stockText}</span>
-    </div>
-    <div class="pc-bot">
-      ${p.purchaseUrl ? `<a href="${q(p.purchaseUrl)}" target="_blank" class="buy-btn">购买</a>` : ''}
-      <button class="hist-btn" onclick="showHistory('${q(p.storeId)}','${q(p.id)}','${q(p.name)}')">走势</button>
+    <div class="pc-name" title="${escapeAttr(p.name)}">${escapeHtml(p.name)}</div>
+    <div class="pc-foot">
+      <span class="pc-price">¥${price.toFixed(2)}</span>
+      <div class="pc-actions">
+        ${href ? `<a href="${escapeAttr(href)}" target="_blank" rel="noopener noreferrer" class="buy-btn">购买</a>` : ''}
+        <button class="hist-btn" onclick="${jsCall('showHistory', p.storeId, p.id, p.name)}">走势</button>
+      </div>
     </div>
   </div>`;
 }
 
 function editLabel(productKey, name, currentCat, confidence) {
-  const l1 = catL1FromFull(currentCat);
-  const l2 = catL2FromFull(currentCat);
-  const l1Opts = CAT_L1.map(c => `<option value="${c}" ${c === l1 ? 'selected' : ''}>${c}</option>`).join('');
+  const current = normalizeCategory(currentCat);
+  const l1 = catL1FromFull(current);
+  const l2 = catL2FromFull(current);
+  const l1Opts = CAT_L1.map(c => `<option value="${escapeAttr(c)}" ${c === l1 ? 'selected' : ''}>${escapeHtml(CAT_L1_LABELS[c] || c)}</option>`).join('');
   const l2List = CAT_L2_MAP[l1] || ['其他'];
   const l2Opts = l2List.map(c => {
-    const full = l1 + '_' + c;
-    return `<option value="${full}" ${full === currentCat || c === l2 ? 'selected' : ''}>${c}</option>`;
+    const full = fullCategoryFromParts(l1, c);
+    return `<option value="${escapeAttr(full)}" ${full === current || c === l2 ? 'selected' : ''}>${escapeHtml(catL2Label(l1, c))}</option>`;
   }).join('');
   const div = document.createElement('div');
   div.id = 'labelOverlay';
-  div.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:9999;display:flex;align-items:center;justify-content:center';
+  div.className = 'label-overlay';
   div.onclick = function(e) { if (e.target === this) this.remove(); };
-  div.innerHTML = `<div style="background:var(--card-bg);border-radius:8px;padding:24px;min-width:340px;position:relative;box-shadow:0 4px 20px var(--shadow)">
-    <div style="margin-bottom:12px;font-weight:600;font-size:15px;color:var(--text)">修改商品分类</div>
-    <div style="margin-bottom:14px;font-size:13px;color:var(--text2);word-break:break-all">${escapeHtml(name)}</div>
-    <div style="display:flex;gap:6px;margin-bottom:16px">
-      <select id="labelSelectL1" onchange="onEditL1Change()" style="flex:1;padding:8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
-      <select id="labelSelect" style="flex:1;padding:8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)">${l2Opts}</select>
+  div.innerHTML = `<div class="label-editor-card">
+    <div class="label-editor-title">修改商品分类</div>
+    <div class="label-editor-name">${escapeHtml(name)}</div>
+    <div class="label-editor-select-row">
+      <select id="labelSelectL1" class="label-editor-select" onchange="onEditL1Change()">${l1Opts}</select>
+      <select id="labelSelect" class="label-editor-select">${l2Opts}</select>
     </div>
-    <div style="display:flex;gap:8px;justify-content:flex-end">
-      <button onclick="document.getElementById('labelOverlay').remove()" style="padding:8px 16px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:13px">取消</button>
-      <button onclick="saveLabel('${productKey}','${escapeHtml(name)}')" style="padding:8px 16px;background:var(--primary);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">保存</button>
+    <div class="label-editor-actions">
+      <button class="label-editor-secondary" onclick="document.getElementById('labelOverlay').remove()">取消</button>
+      <button class="label-editor-primary" onclick="${jsCall('saveLabel', productKey, name)}">保存</button>
     </div>
   </div>`;
   document.body.appendChild(div);
@@ -975,7 +1209,7 @@ function onEditL1Change() {
   const l1 = document.getElementById('labelSelectL1').value;
   const l2sel = document.getElementById('labelSelect');
   const subs = CAT_L2_MAP[l1] || ['其他'];
-  l2sel.innerHTML = subs.map(c => `<option value="${l1 + '_' + c}">${c}</option>`).join('');
+  l2sel.innerHTML = subs.map(c => `<option value="${escapeAttr(fullCategoryFromParts(l1, c))}">${escapeHtml(catL2Label(l1, c))}</option>`).join('');
 }
 
 const CAT_L1 = ['gpt','claude','gemini','grok','ai_platform','邮箱','号码','社交账号','视频会员','音乐会员','生活券','网盘','阅读会员','QQ会员','云服务','中转额度','教程服务','IP代理','卡密兑换','虚拟卡','开发工具','电商工具','企业服务','反重力','Adobe','修图剪辑','AI平台','sms','其他'];
@@ -1035,18 +1269,30 @@ function catL2FromFull(full) {
   return full;
 }
 
+function fullCategoryFromParts(l1, l2) {
+  if (!l1 || !l2 || l1 === '其他' || l2 === '其他') return '其他';
+  if (l1 === 'gpt') {
+    if (l2.startsWith('plus_')) return l2;
+    if (l2 === 'pro') return 'gpt_pro';
+    if (l2 === 'team') return 'gpt_team';
+    if (l2 === 'k12') return 'gptk12';
+    return `gpt_${l2}`;
+  }
+  if (l1 === 'sms' && l2 === '接码') return 'sms';
+  return `${l1}_${l2}`;
+}
+
 function renderCatSelect(pk, name, currentCat) {
   const l1 = catL1FromFull(currentCat);
   const l2 = catL2FromFull(currentCat);
-  const l1Opts = CAT_L1.map(c => `<option value="${c}" ${c === l1 ? 'selected' : ''}>${c}</option>`).join('');
+  const current = normalizeCategory(currentCat);
+  const l1Opts = CAT_L1.map(c => `<option value="${escapeAttr(c)}" ${c === l1 ? 'selected' : ''}>${escapeHtml(CAT_L1_LABELS[c] || c)}</option>`).join('');
   const l2Opts = (CAT_L2_MAP[l1] || ['其他']).map(c => {
-    const full = l1 + '_' + c;
-    return `<option value="${full}" ${full === currentCat || c === l2 ? 'selected' : ''}>${c}</option>`;
+    const full = fullCategoryFromParts(l1, c);
+    return `<option value="${escapeAttr(full)}" ${full === current || c === l2 ? 'selected' : ''}>${escapeHtml(catL2Label(l1, c))}</option>`;
   }).join('');
-  const escapedPk = pk.replace(/['"\\]/g, '');
-  const escapedName = name.replace(/['"\\]/g, '');
-  return `<select class="cl2-l1" onchange="onCatL1Change(this,'${escapedPk}','${escapedName}')" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
-    <select class="cl2-l2" onchange="saveLabelFromSettings('${escapedPk}','${escapedName}',this.value)" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l2Opts}</select>`;
+  return `<select class="cl2-l1" onchange="${jsCall('onCatL1Change', { raw: 'this' }, pk, name)}" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
+    <select class="cl2-l2" onchange="${jsCall('saveLabelFromSettings', pk, name, { raw: 'this.value' })}" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l2Opts}</select>`;
 }
 
 function onCatL1Change(l1sel, pk, name) {
@@ -1054,10 +1300,10 @@ function onCatL1Change(l1sel, pk, name) {
   const l1 = l1sel.value;
   const subs = CAT_L2_MAP[l1] || ['其他'];
   const currentFull = l2sel.value;
-  const currentL2 = currentFull.startsWith(l1 + '_') ? currentFull.slice(l1.length + 1) : '';
+  const currentL2 = catL2FromFull(currentFull);
   l2sel.innerHTML = subs.map(c => {
-    const full = l1 + '_' + c;
-    return `<option value="${full}" ${c === currentL2 ? 'selected' : ''}>${c}</option>`;
+    const full = fullCategoryFromParts(l1, c);
+    return `<option value="${escapeAttr(full)}" ${c === currentL2 ? 'selected' : ''}>${escapeHtml(catL2Label(l1, c))}</option>`;
   }).join('');
   saveLabelFromSettings(pk, name, l2sel.value);
 }
@@ -1074,7 +1320,7 @@ function loadLabelManager() {
   }
 
   const labels = Object.values(productLabels);
-  let filtered = labels.filter(l => l.category !== '其他');
+  let filtered = labels.filter(l => !isOtherCategory(l.category));
   if (search) filtered = filtered.filter(l => l.name.toLowerCase().includes(search));
   if (catFilter) filtered = filtered.filter(l => l.category === catFilter);
   filtered.sort((a, b) => a.name.localeCompare(b.name));
@@ -1091,14 +1337,13 @@ function loadLabelManager() {
 
   container.innerHTML = (filtered.length > maxShow ? `<div style="padding:4px 6px;font-size:11px;color:var(--text3)">共 ${filtered.length} 条，显示前 ${maxShow} 条</div>` : '') +
     showing.map(l => {
-    const pk = l.product_key.replace(/['"\\]/g, '');
-    const name = l.name.replace(/['"\\]/g, '');
-    return `<div style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-bottom:1px solid var(--border);font-size:12px">
-      <span style="flex:1;word-break:break-all;color:var(--text2);font-size:11px">${escapeHtml(l.name)}</span>
-      <span style="display:flex;gap:2px;flex-shrink:0">${renderCatSelect(pk, name, l.category)}</span>
-      ${l.confidence < 1 ? `<span style="font-size:10px;color:var(--text3);white-space:nowrap">${Math.round(l.confidence*100)}%</span>` : '<span style="font-size:10px;color:var(--success);flex-shrink:0">手动</span>'}
-    </div>`;
-  }).join('') + (more > 0 ? `<div style="padding:6px;text-align:center;font-size:11px;color:var(--text3)">还有 ${more} 条，请精确搜索</div>` : '');
+      const confidence = Number(l.confidence) || 0;
+      return `<div style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-bottom:1px solid var(--border);font-size:12px">
+        <span style="flex:1;word-break:break-all;color:var(--text2);font-size:11px">${escapeHtml(l.name)}</span>
+        <span style="display:flex;gap:2px;flex-shrink:0">${renderCatSelect(l.product_key, l.name, l.category)}</span>
+        ${confidence < 1 ? `<span style="font-size:10px;color:var(--text3);white-space:nowrap">${Math.round(confidence*100)}%</span>` : '<span style="font-size:10px;color:var(--success);flex-shrink:0">手动</span>'}
+      </div>`;
+    }).join('') + (more > 0 ? `<div style="padding:6px;text-align:center;font-size:11px;color:var(--text3)">还有 ${more} 条，请精确搜索</div>` : '');
 
   loadLabelChanges();
 }
@@ -1121,7 +1366,7 @@ async function saveLabelFromSettings(productKey, name, category) {
     body: JSON.stringify({ category, name }),
   });
   if (res.ok) {
-    productLabels[productKey] = { product_key: productKey, name, category, confidence: 1.0 };
+    productLabels[productKey] = { product_key: productKey, name, category, confidence: 1.0, manual: 1 };
     markDirty();
   }
 }
@@ -1135,7 +1380,7 @@ async function saveLabel(productKey, name) {
     body: JSON.stringify({ category, name }),
   });
   if (res.ok) {
-    productLabels[productKey] = { product_key: productKey, name, category, confidence: 1.0 };
+    productLabels[productKey] = { product_key: productKey, name, category, confidence: 1.0, manual: 1 };
     markDirty();
     document.getElementById('labelOverlay')?.remove();
     render();
@@ -1143,10 +1388,31 @@ async function saveLabel(productKey, name) {
 }
 
 function escapeHtml(s) {
-  if (!s) return '';
+  if (s === undefined || s === null) return '';
   const d = document.createElement('div');
-  d.textContent = s;
+  d.textContent = String(s);
   return d.innerHTML;
+}
+
+function escapeAttr(s) {
+  return escapeHtml(s).replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function jsValue(value) {
+  if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'raw')) {
+    return value.raw;
+  }
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : '0';
+  return JSON.stringify(String(value ?? ''))
+    .replace(/</g, '\\u003C')
+    .replace(/>/g, '\\u003E')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
+function jsCall(name, ...args) {
+  return escapeAttr(`${name}(${args.map(jsValue).join(',')})`);
 }
 
 function formatTime(iso) {
@@ -1188,11 +1454,13 @@ async function submitAddStore() {
       return;
     }
     const storeData = await res.json();
+    queueStatus = await fetchRefreshQueueStatus();
+    renderDashboardStrip();
     msg.textContent = '正在获取商品数据...';
     msg.style.color = '#1a73e8';
     let n = 0;
-    while (n < 30) {
-      await new Promise(r => setTimeout(r, 1500));
+    while (n < STORE_POLL_ATTEMPTS) {
+      await new Promise(r => setTimeout(r, STORE_POLL_INTERVAL_MS));
       const check = await (await fetch('/api/stores/summary')).json();
       const updated = check.find(s => s.id === storeData.id);
       if (updated && updated.status === 'ok') {
@@ -1225,6 +1493,7 @@ async function submitAddStore() {
     btn.disabled = false; btn.textContent = '重试';
     storeSummaries = await (await fetch('/api/stores/summary')).json();
     renderStoreList();
+    watchPendingStores([storeData.id]);
   } catch (e) {
     msg.textContent = '添加失败: ' + e.message;
     msg.style.color = '#e53935';
@@ -1235,11 +1504,15 @@ async function submitAddStore() {
 async function refreshStore(id, silent) {
   refreshingStores.add(id);
   renderStoreList();
+  renderStores();
   try {
-    await fetch(`/api/stores/${id}/refresh`, { method: 'POST' });
+    const startRes = await fetch(`/api/stores/${encodeURIComponent(id)}/refresh`, { method: 'POST' });
+    if (!startRes.ok) throw new Error('刷新请求失败');
+    queueStatus = await fetchRefreshQueueStatus();
+    renderDashboardStrip();
     let n = 0;
-    while (n < 30) {
-      await new Promise(r => setTimeout(r, 1500));
+    while (n < STORE_POLL_ATTEMPTS) {
+      await new Promise(r => setTimeout(r, STORE_POLL_INTERVAL_MS));
       const summary = await (await fetch('/api/stores/summary')).json();
       const updated = summary.find(s => s.id === id);
       if (updated) {
@@ -1250,21 +1523,36 @@ async function refreshStore(id, silent) {
           const newLabels = await (await fetch('/api/product-labels')).json();
           for (const l of newLabels) { productLabels[l.product_key] = l; }
           markDirty();
+          queueStatus = await fetchRefreshQueueStatus();
+          renderDashboardStrip();
           flashSuccess(id);
           if (!silent) renderStores();
           return;
         }
         if (updated.status === 'error') {
           refreshingStores.delete(id);
+          queueStatus = await fetchRefreshQueueStatus();
           renderStoreList();
-          break;
+          renderDashboardStrip();
+          renderStores();
+          if (!silent) alert('更新失败: ' + (updated.error || '未知错误'));
+          return;
         }
       }
       n++;
     }
+    refreshingStores.delete(id);
+    queueStatus = await fetchRefreshQueueStatus();
+    renderStoreList();
+    renderDashboardStrip();
+    watchPendingStores([id]);
+    if (!silent) alert('更新超时，请稍后重试');
   } catch (e) {
     refreshingStores.delete(id);
+    queueStatus = await fetchRefreshQueueStatus();
     renderStoreList();
+    renderDashboardStrip();
+    renderStores();
     if (!silent) alert('更新失败: ' + e.message);
   }
 }
@@ -1281,16 +1569,21 @@ async function refreshAllStores() {
   btn.textContent = '停止刷新';
   btn.disabled = false;
   btn.onclick = stopRefreshAll;
-  const order = [...storeSummaries].filter(s => s.status === 'ok').sort((a, b) => (a.lastUpdated || '').localeCompare(b.lastUpdated || ''));
+  const order = [...storeSummaries].filter(s => s.status !== 'pending').sort((a, b) => (a.lastUpdated || '').localeCompare(b.lastUpdated || ''));
   for (const s of order) {
     if (_stopRefreshAll) break;
     refreshingStores.add(s.id);
     renderStoreList();
+    renderStores();
     try {
-      await fetch(`/api/stores/${s.id}/refresh`, { method: 'POST' });
+      const startRes = await fetch(`/api/stores/${encodeURIComponent(s.id)}/refresh`, { method: 'POST' });
+      if (!startRes.ok) throw new Error('刷新请求失败');
+      queueStatus = await fetchRefreshQueueStatus();
+      renderDashboardStrip();
       let n = 0;
-      while (n < 30 && !_stopRefreshAll) {
-        await new Promise(r => setTimeout(r, 1500));
+      let done = false;
+      while (n < STORE_POLL_ATTEMPTS && !_stopRefreshAll) {
+        await new Promise(r => setTimeout(r, STORE_POLL_INTERVAL_MS));
         if (_stopRefreshAll) break;
         const summary = await (await fetch('/api/stores/summary')).json();
         const updated = summary.find(x => x.id === s.id);
@@ -1302,20 +1595,34 @@ async function refreshAllStores() {
             const newLabels = await (await fetch('/api/product-labels')).json();
             for (const l of newLabels) { productLabels[l.product_key] = l; }
             markDirty();
+            queueStatus = await fetchRefreshQueueStatus();
+            renderDashboardStrip();
             flashSuccess(s.id);
+            done = true;
             break;
           }
           if (updated.status === 'error') {
             refreshingStores.delete(s.id);
+            queueStatus = await fetchRefreshQueueStatus();
             renderStoreList();
+            renderDashboardStrip();
+            done = true;
             break;
           }
         }
         n++;
       }
+      if (!done) {
+        refreshingStores.delete(s.id);
+        queueStatus = await fetchRefreshQueueStatus();
+        renderStoreList();
+        renderDashboardStrip();
+      }
     } catch (_) {
       refreshingStores.delete(s.id);
+      queueStatus = await fetchRefreshQueueStatus();
       renderStoreList();
+      renderDashboardStrip();
     }
     await new Promise(r => setTimeout(r, 1000));
   }
@@ -1341,7 +1648,7 @@ function finishRefreshAll() {
 }
 
 function flashSuccess(id) {
-  const row = document.querySelector(`.store-row[data-id="${id}"]`);
+  const row = [...document.querySelectorAll('.store-row')].find(el => el.dataset.id === id);
   if (row) { row.classList.add('flash-ok'); setTimeout(() => row.classList.remove('flash-ok'), 1200); }
   refreshingStores.delete(id);
   renderStoreList();
@@ -1406,11 +1713,8 @@ function onPriceInputNum(input, which) {
 }
 
 function applyPriceFilter() {
-  document.querySelectorAll('.product-card').forEach(el => {
-    const p = parseFloat(el.dataset.price);
-    const show = (!priceRange.min || p >= priceRange.min) && (!priceRange.max || p <= priceRange.max) || p > 200;
-    el.style.display = show ? '' : 'none';
-  });
+  renderBestPrices();
+  renderStores();
 }
 
 function toggleNoStock(id) {
@@ -1420,7 +1724,7 @@ function toggleNoStock(id) {
 
 async function deleteStore(id) {
   if (!confirm('确定删除?')) return;
-  await fetch(`/api/stores/${id}`, { method: 'DELETE' });
+  await fetch(`/api/stores/${encodeURIComponent(id)}`, { method: 'DELETE' });
   storeSummaries = storeSummaries.filter(s => s.id !== id);
   stores = stores.filter(s => s.id !== id);
   markDirty();
@@ -1437,7 +1741,7 @@ async function showHistory(storeId, productId, name, isNav) {
     navProducts = all;
     navIndex = all.findIndex(p => p.storeId === storeId && p.id === productId);
   }
-  const data = await (await fetch(`/api/products/${storeId}/${productId}/history`)).json();
+  const data = await (await fetch(`/api/products/${encodeURIComponent(storeId)}/${encodeURIComponent(productId)}/history`)).json();
   document.getElementById('modalTitle').textContent = name || '价格历史';
   document.getElementById('modalProductMeta').textContent = navIndex >= 0 ? `${navIndex+1}/${navProducts.length}` : '';
   document.getElementById('prevProductBtn').style.visibility = navIndex > 0 ? 'visible' : 'hidden';
@@ -1445,6 +1749,11 @@ async function showHistory(storeId, productId, name, isNav) {
   document.getElementById('historyModal').style.display = 'block';
   if (priceChart) priceChart.destroy();
   if (!data.length) { document.getElementById('priceChart').style.display = 'none'; return; }
+  if (typeof Chart === 'undefined') {
+    document.getElementById('priceChart').style.display = 'none';
+    document.getElementById('modalProductMeta').textContent = '图表库加载失败';
+    return;
+  }
   document.getElementById('priceChart').style.display = 'block';
   priceChart = new Chart(document.getElementById('priceChart').getContext('2d'), {
     type: 'line',
