@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>链动小铺价格监控</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app">
+    <div class="top-bar" id="topBar"></div>
+
+    <div class="columns">
+      <div class="left-bar" id="leftBar">
+        <div class="add-store">
+          <button id="addStoreBtn">+ 添加店铺</button>
+          <button id="settingsBtn">设置</button>
+        </div>
+        <button id="refreshAllBtn">全局刷新</button>
+        <div class="store-list" id="storeList"></div>
+      </div>
+      <div class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</div>
+
+      <div class="main-area">
+        <div class="cat-bar" id="catBar"></div>
+        <div id="storesContainer"></div>
+      </div>
+
+      <div class="right-bar" id="rightBar">
+        <div class="rb-search">
+          <div class="search-inc">
+            <div class="search-chips" id="includeChips"></div>
+            <input type="text" id="includeInput" placeholder="包含..." autocomplete="off">
+          </div>
+          <div class="search-sep-rb"></div>
+          <div class="search-exc">
+            <div class="search-chips" id="excludeChips"></div>
+            <input type="text" id="excludeInput" placeholder="排除..." autocomplete="off">
+          </div>
+          <div class="suggested-keys" id="suggestedKeys"></div>
+        </div>
+        <div class="rb-divider"></div>
+        <div class="rb-price-range" id="rbPriceRange"></div>
+        <div class="rb-divider"></div>
+        <h3>最优价格</h3>
+        <div id="bestPriceList"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="historyModal" class="modal">
+    <div class="modal-content">
+      <span class="close">&times;</span>
+      <div class="modal-nav">
+        <button id="prevProductBtn" class="nav-btn">&lt; 上一个</button>
+        <div>
+          <h3 id="modalTitle">价格历史</h3>
+          <div id="modalProductMeta" class="modal-meta"></div>
+        </div>
+        <button id="nextProductBtn" class="nav-btn">下一个 &gt;</button>
+      </div>
+      <canvas id="priceChart"></canvas>
+    </div>
+  </div>
+
+  <div id="addStoreModal" class="modal">
+    <div class="modal-content add-modal-content">
+      <span class="close close-add">&times;</span>
+      <h3>添加店铺</h3>
+      <input type="text" id="addStoreUrl" placeholder="输入店铺URL，如 https://pay.ldxp.cn/shop/xxx" autocomplete="off">
+      <div class="add-modal-actions">
+        <button id="addStoreSubmit" class="settings-action-btn">添加</button>
+        <span id="addStoreMsg" class="add-store-msg"></span>
+      </div>
+    </div>
+  </div>
+
+  <div id="settingsModal" class="modal">
+    <div class="modal-content settings-content">
+      <span class="close close-settings">&times;</span>
+      <h2 class="settings-h2">设置</h2>
+      <div class="settings-body">
+        <div class="settings-sidebar">
+          <div class="settings-option" data-option="keywords">关键词管理</div>
+          <div class="settings-option active" data-option="export">导出数据</div>
+          <div class="settings-option" data-option="labels">分类管理</div>
+          <div class="settings-option" data-option="refresh">刷新间隔</div>
+        </div>
+        <div class="settings-panel">
+          <div id="settingsPanelExport" class="settings-panel-item active">
+            <button id="settingsExportBtn" class="settings-action-btn">导出 JSON 数据</button>
+            <p class="settings-desc">将所有店铺数据、价格历史、配置导出为 JSON 文件，便于迁移备份。</p>
+            <div class="settings-divider"></div>
+            <button id="settingsImportBtn" class="settings-action-btn settings-import-btn">导入 JSON 数据</button>
+            <input type="file" id="settingsImportFile" accept=".json" style="display:none">
+            <span id="importMsg" class="settings-msg"></span>
+            <p class="settings-desc">选择之前导出的 JSON 文件导入，将<strong>替换</strong>当前所有数据。</p>
+          </div>
+          <div id="settingsPanelLabels" class="settings-panel-item">
+            <p class="settings-desc">管理商品分类标签。点击分类名可修改，AI预测结果显示置信度。</p>
+            <div class="settings-divider"></div>
+            <div style="font-size:13px;font-weight:600;margin-bottom:6px">分类显示控制</div>
+            <div id="catVisibility" style="margin-bottom:8px"></div>
+            <div class="settings-divider"></div>
+            <div style="margin:8px 0;display:flex;gap:6px;flex-wrap:wrap">
+              <input type="text" id="labelSearchInput" placeholder="搜索商品名..." style="padding:6px 10px;border:1px solid #ddd;border-radius:4px;font-size:12px;flex:1;min-width:120px">
+              <select id="labelCatFilter" style="padding:6px 8px;border:1px solid #ddd;border-radius:4px;font-size:12px">
+                <option value="">全部分类</option>
+                <option value="plus_已接码">plus_已接码</option>
+                <option value="plus_未接码">plus_未接码</option>
+                <option value="plus_质保">plus_质保</option>
+                <option value="gpt_pro">gpt_pro</option>
+                <option value="gpt_team">gpt_team</option>
+                <option value="gemini">gemini</option>
+                <option value="claude">claude</option>
+                <option value="grok">grok</option>
+                <option value="sms">sms</option>
+                <option value="codex">codex</option>
+                <option value="其他">其他</option>
+              </select>
+              <button onclick="loadLabelManager()" style="padding:6px 12px;background:#1a73e8;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
+            </div>
+            <div id="labelManagerList" style="max-height:300px;overflow-y:auto;border:1px solid #eee;border-radius:6px"></div>
+          </div>
+          <div id="settingsPanelKeywords" class="settings-panel-item">
+            <p class="settings-desc">每行一个关键词，回车分隔。常用关键词会显示在搜索栏下方，点击即添加。</p>
+            <textarea id="keywordsTextarea" class="settings-textarea" rows="8" spellcheck="false"></textarea>
+            <div class="settings-divider"></div>
+            <button id="saveKeywordsBtn" class="settings-action-btn">保存关键词</button>
+            <span id="keywordsSaveMsg" class="settings-msg"></span>
+          </div>
+          <div id="settingsPanelRefresh" class="settings-panel-item">
+            <div class="settings-section">
+              <label class="settings-radio"><input type="radio" name="refreshMode" value="random"><span>随机区间</span></label>
+              <div class="settings-inline">最小 <input type="number" id="refreshMin" class="settings-num" min="1"> 分钟 &nbsp; 最大 <input type="number" id="refreshMax" class="settings-num" min="1"> 分钟</div>
+            </div>
+            <div class="settings-divider"></div>
+            <div class="settings-section">
+              <label class="settings-radio"><input type="radio" name="refreshMode" value="fixed"><span>固定间隔</span></label>
+              <div class="settings-inline">每 <input type="number" id="refreshFixed" class="settings-num" min="1"> 分钟刷新一次</div>
+            </div>
+            <div class="settings-divider"></div>
+            <div id="nextRefreshInfo" class="settings-next-refresh"></div>
+            <div class="settings-divider"></div>
+            <button id="saveRefreshBtn" class="settings-action-btn">保存设置</button>
+            <span id="refreshSaveMsg" class="settings-msg"></span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>

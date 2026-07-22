@@ -1,0 +1,5 @@
+node_modules/
+data/stores.db
+data/stores.db-shm
+data/stores.db-wal
+data/model.pkl
