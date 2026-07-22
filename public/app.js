@@ -822,22 +822,38 @@ function renderProductCard(p) {
 }
 
 function editLabel(productKey, name, currentCat, confidence) {
-  const cats = ['plus_已接码','plus_未接码','plus_质保','gpt_pro','gpt_team','gptk12','gemini','claude','grok','sms','其他'];
-  const opt = cats.map(c => `<option value="${c}" ${c === currentCat ? 'selected' : ''}>${c}</option>`).join('');
+  const l1 = catL1FromFull(currentCat);
+  const l2 = catL2FromFull(currentCat);
+  const l1Opts = CAT_L1.map(c => `<option value="${c}" ${c === l1 ? 'selected' : ''}>${c}</option>`).join('');
+  const l2List = CAT_L2_MAP[l1] || ['其他'];
+  const l2Opts = l2List.map(c => {
+    const full = l1 + '_' + c;
+    return `<option value="${full}" ${full === currentCat || c === l2 ? 'selected' : ''}>${c}</option>`;
+  }).join('');
   const div = document.createElement('div');
   div.id = 'labelOverlay';
   div.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:9999;display:flex;align-items:center;justify-content:center';
   div.onclick = function(e) { if (e.target === this) this.remove(); };
-  div.innerHTML = `<div style="background:#fff;border-radius:8px;padding:24px;min-width:320px;position:relative">
-    <div style="margin-bottom:12px;font-weight:600">修改商品分类</div>
-    <div style="margin-bottom:12px;font-size:13px;color:#666;word-break:break-all">${escapeHtml(name)}</div>
-    <select id="labelSelect" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;font-size:14px">${opt}</select>
-    <div style="margin-top:16px;display:flex;gap:8px;justify-content:flex-end">
-      <button onclick="document.getElementById('labelOverlay').remove()" style="padding:8px 16px;background:#f5f5f5;border:none;border-radius:4px;cursor:pointer">取消</button>
-      <button onclick="saveLabel('${productKey}','${escapeHtml(name)}')" style="padding:8px 16px;background:#1a73e8;color:#fff;border:none;border-radius:4px;cursor:pointer">保存</button>
+  div.innerHTML = `<div style="background:var(--card-bg);border-radius:8px;padding:24px;min-width:340px;position:relative;box-shadow:0 4px 20px var(--shadow)">
+    <div style="margin-bottom:12px;font-weight:600;font-size:15px;color:var(--text)">修改商品分类</div>
+    <div style="margin-bottom:14px;font-size:13px;color:var(--text2);word-break:break-all">${escapeHtml(name)}</div>
+    <div style="display:flex;gap:6px;margin-bottom:16px">
+      <select id="labelSelectL1" onchange="onEditL1Change()" style="flex:1;padding:8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
+      <select id="labelSelect" style="flex:1;padding:8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)">${l2Opts}</select>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button onclick="document.getElementById('labelOverlay').remove()" style="padding:8px 16px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:13px">取消</button>
+      <button onclick="saveLabel('${productKey}','${escapeHtml(name)}')" style="padding:8px 16px;background:var(--primary);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">保存</button>
     </div>
   </div>`;
   document.body.appendChild(div);
+}
+
+function onEditL1Change() {
+  const l1 = document.getElementById('labelSelectL1').value;
+  const l2sel = document.getElementById('labelSelect');
+  const subs = CAT_L2_MAP[l1] || ['其他'];
+  l2sel.innerHTML = subs.map(c => `<option value="${l1 + '_' + c}">${c}</option>`).join('');
 }
 
 const CAT_L1 = ['gpt','claude','gemini','grok','ai_platform','邮箱','号码','社交账号','视频会员','音乐会员','生活券','网盘','阅读会员','QQ会员','云服务','中转额度','教程服务','IP代理','卡密兑换','虚拟卡','开发工具','电商工具','企业服务','反重力','Adobe','修图剪辑','AI平台','sms','其他'];
@@ -928,6 +944,13 @@ function loadLabelManager() {
   const container = document.getElementById('labelManagerList');
   const search = document.getElementById('labelSearchInput')?.value?.toLowerCase() || '';
   const catFilter = document.getElementById('labelCatFilter')?.value || '';
+
+  if (!search && !catFilter) {
+    container.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text3);font-size:13px">请输入关键词或选择分类后点击刷新</div>';
+    loadLabelChanges();
+    return;
+  }
+
   const labels = Object.values(productLabels);
   let filtered = labels.filter(l => l.category !== '其他');
   if (search) filtered = filtered.filter(l => l.name.toLowerCase().includes(search));
@@ -935,11 +958,17 @@ function loadLabelManager() {
   filtered.sort((a, b) => a.name.localeCompare(b.name));
 
   if (!filtered.length) {
-    container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3);font-size:13px">暂无已分类商品</div>';
+    container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3);font-size:13px">无匹配商品</div>';
+    loadLabelChanges();
     return;
   }
 
-  container.innerHTML = filtered.map(l => {
+  const maxShow = 100;
+  const showing = filtered.slice(0, maxShow);
+  const more = filtered.length - maxShow;
+
+  container.innerHTML = (filtered.length > maxShow ? `<div style="padding:4px 6px;font-size:11px;color:var(--text3)">共 ${filtered.length} 条，显示前 ${maxShow} 条</div>` : '') +
+    showing.map(l => {
     const pk = l.product_key.replace(/['"\\]/g, '');
     const name = l.name.replace(/['"\\]/g, '');
     return `<div style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-bottom:1px solid var(--border);font-size:12px">
@@ -947,7 +976,7 @@ function loadLabelManager() {
       <span style="display:flex;gap:2px;flex-shrink:0">${renderCatSelect(pk, name, l.category)}</span>
       ${l.confidence < 1 ? `<span style="font-size:10px;color:var(--text3);white-space:nowrap">${Math.round(l.confidence*100)}%</span>` : '<span style="font-size:10px;color:var(--success);flex-shrink:0">手动</span>'}
     </div>`;
-  }).join('');
+  }).join('') + (more > 0 ? `<div style="padding:6px;text-align:center;font-size:11px;color:var(--text3)">还有 ${more} 条，请精确搜索</div>` : '');
 
   loadLabelChanges();
 }
