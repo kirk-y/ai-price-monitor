@@ -840,6 +840,90 @@ function editLabel(productKey, name, currentCat, confidence) {
   document.body.appendChild(div);
 }
 
+const CAT_L1 = ['gpt','claude','gemini','grok','ai_platform','邮箱','号码','社交账号','视频会员','音乐会员','生活券','网盘','阅读会员','QQ会员','云服务','中转额度','教程服务','IP代理','卡密兑换','虚拟卡','开发工具','电商工具','企业服务','反重力','Adobe','修图剪辑','AI平台','sms','其他'];
+
+const CAT_L2_MAP = {
+  'gpt': ['plus_已接码','plus_未接码','plus_质保','pro','team','k12','free','go','max','image2','cyber','其他'],
+  'claude': ['pro','max','其他'],
+  'gemini': ['pro年卡','优惠链接','成品号','其他'],
+  'grok': ['super_grok','普号','其他'],
+  'ai_platform': ['cursor','perplexity','kiro','koro','其他AI平台','其他'],
+  '邮箱': ['gmail','outlook','icloud','hotmail','教育邮箱','企业邮箱','其他邮箱','其他'],
+  '号码': ['美国','印度','英国','巴西','印尼','随机国家','香港','其他号码','其他'],
+  '社交账号': ['twitter','telegram','discord','tiktok','instagram','facebook','YouTube','其他社交','其他'],
+  '视频会员': ['腾讯视频','bilibili','芒果TV','华为视频','咪咕视频','埋堆堆','剪映','醒图','其他视频','其他'],
+  '音乐会员': ['酷狗音乐','网易云','QQ音乐','其他音乐','其他'],
+  '生活券': ['美团','瑞幸','古茗','星巴克','霸王茶姬','其他券','其他'],
+  '网盘': ['百度网盘','夸克网盘','其他网盘','其他'],
+  '阅读会员': ['百度文库','咪咕阅读','其他阅读','其他'],
+  'QQ会员': ['黄钻','其他'],
+  '云服务': ['云手机','星辰之恋','其他'],
+  '中转额度': ['中转券','额度充值','其他'],
+  '教程服务': ['教程','其他'],
+  'IP代理': ['住宅IP','机房IP','vpn','其他网络','其他'],
+  '卡密兑换': ['有效期卡密','兑换码','充值码','其他'],
+  '虚拟卡': ['visa虚拟卡','其他虚拟卡','其他'],
+  '开发工具': ['cursor','codex','api','其他'],
+  '电商工具': ['闲鱼助手','其他电商','其他'],
+  '企业服务': ['公司注册','营业执照','其他企业','其他'],
+  '反重力': ['Antigravity','其他'],
+  'Adobe': ['Firefly','其他'],
+  '修图剪辑': ['剪映','醒图','其他'],
+  'AI平台': ['云梦AI','咕噜咕噜AI','其他'],
+  'sms': ['接码','其他'],
+  '其他': ['其他'],
+};
+
+function catL1FromFull(full) {
+  if (!full) return '其他';
+  for (const l1 of CAT_L1) {
+    if (full.startsWith(l1 + '_') || full === l1) return l1;
+  }
+  if (full.startsWith('plus_') || full.startsWith('gpt_') || full === 'gptk12') return 'gpt';
+  return '其他';
+}
+
+function catL2FromFull(full) {
+  if (!full) return '其他';
+  const l1 = catL1FromFull(full);
+  const prefix = l1 + '_';
+  if (full.startsWith(prefix)) return full.slice(prefix.length);
+  if (l1 === 'gpt') {
+    if (full === 'gptk12') return 'k12';
+    if (full.startsWith('plus_')) return full.replace('plus_', 'plus_');
+    if (full.startsWith('gpt_')) return full.slice(4);
+    return full;
+  }
+  return full;
+}
+
+function renderCatSelect(pk, name, currentCat) {
+  const l1 = catL1FromFull(currentCat);
+  const l2 = catL2FromFull(currentCat);
+  const l1Opts = CAT_L1.map(c => `<option value="${c}" ${c === l1 ? 'selected' : ''}>${c}</option>`).join('');
+  const l2Opts = (CAT_L2_MAP[l1] || ['其他']).map(c => {
+    const full = l1 + '_' + c;
+    return `<option value="${full}" ${full === currentCat || c === l2 ? 'selected' : ''}>${c}</option>`;
+  }).join('');
+  const escapedPk = pk.replace(/['"\\]/g, '');
+  const escapedName = name.replace(/['"\\]/g, '');
+  return `<select class="cl2-l1" onchange="onCatL1Change(this,'${escapedPk}','${escapedName}')" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
+    <select class="cl2-l2" onchange="saveLabelFromSettings('${escapedPk}','${escapedName}',this.value)" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l2Opts}</select>`;
+}
+
+function onCatL1Change(l1sel, pk, name) {
+  const l2sel = l1sel.nextElementSibling;
+  const l1 = l1sel.value;
+  const subs = CAT_L2_MAP[l1] || ['其他'];
+  const currentFull = l2sel.value;
+  const currentL2 = currentFull.startsWith(l1 + '_') ? currentFull.slice(l1.length + 1) : '';
+  l2sel.innerHTML = subs.map(c => {
+    const full = l1 + '_' + c;
+    return `<option value="${full}" ${c === currentL2 ? 'selected' : ''}>${c}</option>`;
+  }).join('');
+  saveLabelFromSettings(pk, name, l2sel.value);
+}
+
 function loadLabelManager() {
   const container = document.getElementById('labelManagerList');
   const search = document.getElementById('labelSearchInput')?.value?.toLowerCase() || '';
@@ -855,19 +939,13 @@ function loadLabelManager() {
     return;
   }
 
-  const cats = ['plus_已接码','plus_未接码','plus_质保','gpt_free','gpt_pro','gpt_team','gptk12','gemini','claude','grok','claude_pro','claude_max','sms','codex','其他'];
   container.innerHTML = filtered.map(l => {
     const pk = l.product_key.replace(/['"\\]/g, '');
     const name = l.name.replace(/['"\\]/g, '');
-    const inList = cats.includes(l.category);
-    const opts = cats.map(c => `<option value="${c}" ${c === l.category ? 'selected' : ''}>${c}</option>`).join('');
-    const selectHtml = inList
-      ? `<select onchange="saveLabelFromSettings('${pk}','${name}',this.value)" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${opts}</select>`
-      : `<input type="text" value="${l.category}" onchange="saveLabelFromSettings('${pk}','${name}',this.value)" style="width:110px;padding:2px 4px;border:1px solid var(--primary);border-radius:4px;font-size:11px;background:var(--primary-light);color:var(--primary)" placeholder="一级_二级">`;
-    return `<div style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-bottom:1px solid var(--border);font-size:12px">
-      <span style="flex:1;word-break:break-all;color:var(--text2)">${escapeHtml(l.name)}</span>
-      ${selectHtml}
-      ${l.confidence < 1 ? `<span style="font-size:10px;color:var(--text3);white-space:nowrap">${Math.round(l.confidence*100)}%</span>` : '<span style="font-size:10px;color:var(--success)">手动</span>'}
+    return `<div style="display:flex;align-items:center;gap:4px;padding:4px 6px;border-bottom:1px solid var(--border);font-size:12px">
+      <span style="flex:1;word-break:break-all;color:var(--text2);font-size:11px">${escapeHtml(l.name)}</span>
+      <span style="display:flex;gap:2px;flex-shrink:0">${renderCatSelect(pk, name, l.category)}</span>
+      ${l.confidence < 1 ? `<span style="font-size:10px;color:var(--text3);white-space:nowrap">${Math.round(l.confidence*100)}%</span>` : '<span style="font-size:10px;color:var(--success);flex-shrink:0">手动</span>'}
     </div>`;
   }).join('');
 
