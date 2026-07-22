@@ -110,8 +110,10 @@
                 <option value="plus_已接码">plus_已接码</option>
                 <option value="plus_未接码">plus_未接码</option>
                 <option value="plus_质保">plus_质保</option>
+                <option value="gpt_free">gpt_free</option>
                 <option value="gpt_pro">gpt_pro</option>
                 <option value="gpt_team">gpt_team</option>
+                <option value="gptk12">gptk12</option>
                 <option value="gemini">gemini</option>
                 <option value="claude">claude</option>
                 <option value="grok">grok</option>
@@ -122,6 +124,9 @@
               <button onclick="loadLabelManager()" style="padding:6px 12px;background:#1a73e8;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
             </div>
             <div id="labelManagerList" style="max-height:300px;overflow-y:auto;border:1px solid #eee;border-radius:6px"></div>
+            <div class="settings-divider"></div>
+            <div style="font-size:13px;font-weight:600;margin-bottom:6px">最近分类调整记录</div>
+            <div id="labelChangeLog" style="max-height:160px;overflow-y:auto;font-size:11px;color:var(--text2)"></div>
           </div>
           <div id="settingsPanelStoreexport" class="settings-panel-item">
             <p class="settings-desc">导出店铺列表（仅包含店铺名称和链接，不含商品数据），在新环境一键导入。</p>

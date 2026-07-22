@@ -99,6 +99,14 @@ function initSchema() {
       manual INTEGER DEFAULT 0,
       created_at TEXT DEFAULT (datetime('now','localtime'))
     );
+    CREATE TABLE IF NOT EXISTS label_changes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      old_category TEXT,
+      new_category TEXT NOT NULL,
+      changed_at TEXT DEFAULT (datetime('now','localtime'))
+    );
   `);
 }
 
@@ -243,6 +251,15 @@ function upsertProductLabel(productKey, name, category, confidence, manual) {
   `).run(productKey, name, category, confidence || 1.0, manual ? 1 : 0);
 }
 
+function recordLabelChange(productKey, name, oldCategory, newCategory) {
+  getDb().prepare('INSERT INTO label_changes (product_key, name, old_category, new_category) VALUES (?, ?, ?, ?)')
+    .run(productKey, name, oldCategory, newCategory);
+}
+
+function getLabelChanges(limit = 100) {
+  return getDb().prepare('SELECT * FROM label_changes ORDER BY changed_at DESC LIMIT ?').all(limit);
+}
+
 function getLabeledData() {
   return getDb().prepare('SELECT product_key, name, category FROM product_labels WHERE manual=1 OR confidence>0.3 ORDER BY manual DESC').all();
 }
@@ -338,6 +355,6 @@ module.exports = {
   getFilterConfig, updateFilterConfig,
   getRefreshConfig, updateRefreshConfig,
   exportAllData, importAllData, exportStore, importSingleStore,
-  getProductLabel, upsertProductLabel, getLabeledData,
+  getProductLabel, upsertProductLabel, getLabeledData, recordLabelChange, getLabelChanges,
   getStoreOrder, updateStoreOrder,
 };

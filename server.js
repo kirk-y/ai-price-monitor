@@ -112,10 +112,18 @@ app.get('/api/product-labels', (req, res) => {
   res.json(store.getLabeledData());
 });
 
+app.get('/api/label-changes', (req, res) => {
+  res.json(store.getLabelChanges());
+});
+
 app.put('/api/product-labels/:productKey', (req, res) => {
   const { category } = req.body;
   if (!category) return res.status(400).json({ error: '缺少category' });
+  const old = store.getProductLabel(req.params.productKey);
   store.upsertProductLabel(req.params.productKey, req.body.name || '', category, 1.0, 1);
+  if (old && old.category !== category) {
+    store.recordLabelChange(req.params.productKey, req.body.name || '', old.category, category);
+  }
   res.json({ success: true });
 });
 

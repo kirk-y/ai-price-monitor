@@ -851,21 +851,38 @@ function loadLabelManager() {
   filtered.sort((a, b) => a.name.localeCompare(b.name));
 
   if (!filtered.length) {
-    container.innerHTML = '<div style="padding:20px;text-align:center;color:#bbb;font-size:13px">暂无已分类商品</div>';
+    container.innerHTML = '<div style="padding:20px;text-align:center;color:var(--text3);font-size:13px">暂无已分类商品</div>';
     return;
   }
 
-  const cats = ['plus_已接码','plus_未接码','plus_质保','gpt_pro','gpt_team','gptk12','gemini','claude','grok','sms','其他'];
+  const cats = ['plus_已接码','plus_未接码','plus_质保','gpt_free','gpt_pro','gpt_team','gptk12','gemini','claude','grok','claude_pro','claude_max','sms','codex','其他'];
   container.innerHTML = filtered.map(l => {
     const pk = l.product_key.replace(/['"\\]/g, '');
     const name = l.name.replace(/['"\\]/g, '');
+    const inList = cats.includes(l.category);
     const opts = cats.map(c => `<option value="${c}" ${c === l.category ? 'selected' : ''}>${c}</option>`).join('');
-    return `<div style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-bottom:1px solid #f0f0f0;font-size:12px">
-      <span style="flex:1;word-break:break-all;color:#555">${escapeHtml(l.name)}</span>
-      <select onchange="saveLabelFromSettings('${pk}','${name}',this.value)" style="padding:2px 4px;border:1px solid #ddd;border-radius:4px;font-size:11px">${opts}</select>
-      ${l.confidence < 1 ? `<span style="font-size:10px;color:#999;white-space:nowrap">${Math.round(l.confidence*100)}%</span>` : '<span style="font-size:10px;color:#43a047">手动</span>'}
+    const selectHtml = inList
+      ? `<select onchange="saveLabelFromSettings('${pk}','${name}',this.value)" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${opts}</select>`
+      : `<input type="text" value="${l.category}" onchange="saveLabelFromSettings('${pk}','${name}',this.value)" style="width:110px;padding:2px 4px;border:1px solid var(--primary);border-radius:4px;font-size:11px;background:var(--primary-light);color:var(--primary)" placeholder="一级_二级">`;
+    return `<div style="display:flex;align-items:center;gap:6px;padding:5px 8px;border-bottom:1px solid var(--border);font-size:12px">
+      <span style="flex:1;word-break:break-all;color:var(--text2)">${escapeHtml(l.name)}</span>
+      ${selectHtml}
+      ${l.confidence < 1 ? `<span style="font-size:10px;color:var(--text3);white-space:nowrap">${Math.round(l.confidence*100)}%</span>` : '<span style="font-size:10px;color:var(--success)">手动</span>'}
     </div>`;
   }).join('');
+
+  loadLabelChanges();
+}
+
+async function loadLabelChanges() {
+  const el = document.getElementById('labelChangeLog');
+  try {
+    const changes = await (await fetch('/api/label-changes')).json();
+    el.innerHTML = changes.slice(0, 30).map(c =>
+      `<div style="padding:3px 0;border-bottom:1px solid var(--border)">${escapeHtml(c.name)}: <span style="color:var(--danger)">${c.old_category||'?'}</span> → <span style="color:var(--success)">${c.new_category}</span> <span style="color:var(--text3);font-size:10px">${c.changed_at}</span></div>`
+    ).join('');
+    if (!changes.length) el.innerHTML = '<div style="color:var(--text3);padding:4px">暂无调整记录</div>';
+  } catch { el.innerHTML = ''; }
 }
 
 async function saveLabelFromSettings(productKey, name, category) {
