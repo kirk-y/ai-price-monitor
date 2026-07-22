@@ -4,6 +4,8 @@ let storeSummaries = [];
 let stores = [];
 let activeStoreId = 'all';
 let activeCategory = 'plus_已接码';
+let activeCatL1 = 'gpt';
+let activeCatL2 = 'plus_已接码';
 let renderLimit = 30;
 let expandedNoStock = {};
 let includeWords = [];
@@ -528,7 +530,11 @@ function applyStoreOrder() {
 function getFilteredProducts() {
   let all = getAllProducts();
   if (activeStoreId !== 'all') all = all.filter(p => p.storeId === activeStoreId);
-  if (activeCategory) all = all.filter(p => p.category === activeCategory);
+  if (activeCatL2) {
+    all = all.filter(p => p.category === activeCatL2);
+  } else if (activeCatL1) {
+    all = all.filter(p => catL1FromFull(p.category) === activeCatL1);
+  }
   if (includeWords.length || excludeWords.length) all = all.filter(p => matchesSearch(p.name));
   all.sort((a, b) => {
     if ((a.stock > 0) !== (b.stock > 0)) return a.stock > 0 ? -1 : 1;
@@ -554,7 +560,30 @@ function computeBestPrices() {
 const CAT_LABELS = {
   plus_已接码: 'Plus已接码', plus_未接码: 'Plus未接码', plus_质保: 'Plus质保',
   gpt_pro: 'GPT Pro', gpt_team: 'GPT Team', gemini: 'Gemini', claude: 'Claude',
-  grok: 'Grok', sms: '接码', gptk12: 'K12', 其他: '其他',
+  grok: 'Grok', sms: '接码', gptk12: 'K12', gpt_free: 'GPT Free', gpt_go: 'GPT GO',
+  gpt_max: 'GPT Max', gpt_image2: 'GPT Image2', gpt_cyber: 'GPT Cyber',
+  claude_pro: 'Claude Pro', claude_max: 'Claude Max',
+  gemini_优惠链接: 'Gemini优惠', gemini_成品号: 'Gemini成品',
+  ai_platform_cursor: 'Cursor', ai_platform_perplexity: 'Perplexity',
+  ai_platform_kiro: 'KIRO',
+  邮箱_gmail: 'Gmail', 邮箱_outlook: 'Outlook', 邮箱_icloud: 'iCloud',
+  邮箱_hotmail: 'Hotmail', 邮箱_教育邮箱: '教育邮箱', 邮箱_企业邮箱: '企业邮箱',
+  号码_美国: '美国号码', 号码_印度: '印度号码', 号码_英国: '英国号码',
+  号码_香港: '香港号码',
+  社交账号_twitter: 'Twitter', 社交账号_telegram: 'Telegram', 社交账号_tiktok: 'TikTok',
+  视频会员_腾讯视频: '腾讯视频', 视频会员_bilibili: 'B站', 视频会员_华为视频: '华为视频',
+  网盘_百度网盘: '百度网盘', 网盘_夸克网盘: '夸克网盘',
+  阅读会员_百度文库: '百度文库', 阅读会员_咪咕阅读: '咪咕阅读',
+  QQ会员_黄钻: 'QQ黄钻',
+  中转额度_额度充值: '额度充值', 中转额度_中转券: '中转券',
+  卡密兑换_兑换码: '兑换码', 卡密兑换_有效期卡密: '有效期卡密',
+  虚拟卡_visa虚拟卡: 'VISA虚拟卡',
+  开发工具_api: 'API', 开发工具_codex: 'Codex', 开发工具_cursor: 'Cursor',
+  生活券_美团: '美团', 生活券_古茗: '古茗', 生活券_霸王茶姬: '霸王茶姬',
+  电商工具_闲鱼助手: '闲鱼助手',
+  反重力_Antigravity: '反重力',
+  Adobe_Firefly: 'Adobe Firefly',
+  其他: '其他',
 };
 
 function visibleCatEntries() {
@@ -563,16 +592,109 @@ function visibleCatEntries() {
   return order.filter(k => !hidden.includes(k) && CAT_LABELS[k]).map(k => [k, CAT_LABELS[k]]);
 }
 
+const CAT_L1_LABELS = {
+  gpt: 'GPT', claude: 'Claude', gemini: 'Gemini', grok: 'Grok',
+  ai_platform: 'AI平台', 邮箱: '邮箱', 号码: '号码', 社交账号: '社交',
+  视频会员: '视频', 音乐会员: '音乐', 生活券: '生活券', 网盘: '网盘',
+  阅读会员: '阅读', QQ会员: 'QQ', 云服务: '云服务', 中转额度: '中转',
+  教程服务: '教程', IP代理: 'IP/代理', 卡密兑换: '卡密', 虚拟卡: '虚拟卡',
+  开发工具: '开发', 电商工具: '电商', 企业服务: '企业', 反重力: '反重力',
+  Adobe: 'Adobe', 修图剪辑: '修图', AI平台: 'AI平台', sms: '接码', 其他: '其他',
+};
+
+const CAT_L2_LABELS = {
+  'plus_已接码': 'Plus已接码', 'plus_未接码': 'Plus未接码', 'plus_质保': 'Plus质保',
+  'pro': 'Pro', 'team': 'Team', 'k12': 'K12', 'free': 'Free', 'go': 'GO', 'max': 'Max',
+  'image2': 'Image2', 'cyber': 'Cyber',
+  'pro年卡': 'Pro年卡', '优惠链接': '优惠链接', '成品号': '成品号',
+  'super_grok': 'Super Grok', '普号': '普号',
+  'gmail': 'Gmail', 'outlook': 'Outlook', 'icloud': 'iCloud', 'hotmail': 'Hotmail',
+  '教育邮箱': '教育邮箱', '企业邮箱': '企业邮箱', '其他邮箱': '其他邮箱',
+  '美国': '美国', '印度': '印度', '英国': '英国', '巴西': '巴西', '印尼': '印尼',
+  '随机国家': '随机', '香港': '香港', '其他号码': '其他号码',
+  'twitter': 'Twitter', 'telegram': 'Telegram', 'discord': 'Discord',
+  'tiktok': 'TikTok', 'instagram': 'Instagram', 'facebook': 'Facebook',
+  'YouTube': 'YouTube', '其他社交': '其他社交',
+  '腾讯视频': '腾讯', 'bilibili': 'B站', '芒果TV': '芒果', '华为视频': '华为',
+  '咪咕视频': '咪咕', '埋堆堆': '埋堆堆', '剪映': '剪映', '醒图': '醒图',
+  '其他视频': '其他视频',
+  '酷狗音乐': '酷狗', '网易云': '网易云', 'QQ音乐': 'QQ音乐', '其他音乐': '其他音乐',
+  '美团': '美团', '瑞幸': '瑞幸', '古茗': '古茗', '星巴克': '星巴克', '霸王茶姬': '霸王茶姬',
+  '其他券': '其他券',
+  '百度网盘': '百度网盘', '夸克网盘': '夸克网盘', '其他网盘': '其他网盘',
+  '百度文库': '百度文库', '咪咕阅读': '咪咕阅读', '其他阅读': '其他阅读',
+  '黄钻': '黄钻', '其他': '其他',
+  '云手机': '云手机', '星辰之恋': '星辰之恋',
+  '中转券': '中转券', '额度充值': '额度充值',
+  '教程': '教程',
+  '住宅IP': '住宅IP', '机房IP': '机房IP', 'vpn': 'VPN', '其他网络': '其他网络',
+  '有效期卡密': '有效期卡密', '兑换码': '兑换码', '充值码': '充值码',
+  'visa虚拟卡': 'VISA', '其他虚拟卡': '其他虚拟卡',
+  'cursor': 'Cursor', 'codex': 'Codex', 'api': 'API',
+  '闲鱼助手': '闲鱼助手', '其他电商': '其他电商',
+  '公司注册': '公司注册', '营业执照': '营业执照', '其他企业': '其他企业',
+  'Antigravity': 'Antigravity',
+  'Firefly': 'Firefly',
+  '云梦AI': '云梦AI', '咕噜咕噜AI': '咕噜咕噜AI',
+  '接码': '接码',
+  'cursor': 'Cursor', 'perplexity': 'Perplexity', 'kiro': 'KIRO', 'koro': 'KORO',
+  '其他AI平台': '其他', '其他': '其他',
+};
+
+function catL2Label(l1, l2) {
+  return CAT_L2_LABELS[l2] || l2;
+}
+
 function renderCatBar() {
   const all = getAllProducts();
   const counts = {};
-  for (const p of all) { counts[p.category] = (counts[p.category] || 0) + 1; }
+  const l1Counts = {};
+  for (const p of all) {
+    counts[p.category] = (counts[p.category] || 0) + 1;
+    const l1 = catL1FromFull(p.category);
+    l1Counts[l1] = (l1Counts[l1] || 0) + 1;
+  }
 
   const bar = document.getElementById('catBar');
-  bar.innerHTML = `<button class="cat-btn ${!activeCategory ? 'active' : ''}" onclick="setCategory('')">全部 <span class="cat-cnt">${all.length}</span></button>` +
-    visibleCatEntries().map(([k, label]) =>
-      counts[k] ? `<button class="cat-btn ${activeCategory === k ? 'active' : ''}" onclick="setCategory('${k}')">${label} <span class="cat-cnt">${counts[k]}</span></button>` : ''
-    ).join('');
+
+  // Row 1: Level 1 categories
+  const l1Buttons = CAT_L1.map(l1 =>
+    l1Counts[l1] ? `<button class="cat-btn ${activeCatL1 === l1 && !activeCatL2 ? 'active' : ''}" onclick="setCatL1('${l1}')">${CAT_L1_LABELS[l1]||l1} <span class="cat-cnt">${l1Counts[l1]}</span></button>` : ''
+  ).filter(Boolean).join('');
+
+  // Row 2: Level 2 subcategories (visible only when L1 is selected)
+  let l2Buttons = '';
+  if (activeCatL1) {
+    const subs = new Set();
+    for (const p of all) {
+      if (catL1FromFull(p.category) === activeCatL1) subs.add(p.category);
+    }
+    const sorted = [...subs].sort((a, b) => (counts[b]||0) - (counts[a]||0));
+    l2Buttons = sorted.map(full => {
+      const l2 = catL2FromFull(full);
+      return `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" onclick="setCatL2('${full}')">${catL2Label(activeCatL1, l2)} <span class="cat-cnt">${counts[full]||0}</span></button>`;
+    }).join('');
+  }
+
+  bar.innerHTML = `<div class="cat-bar-row">${l1Buttons}</div>` +
+    (l2Buttons ? `<div class="cat-bar-row cat-bar-row-l2">${l2Buttons}</div>` : '');
+}
+
+function setCatL1(l1) {
+  activeCatL1 = l1;
+  activeCatL2 = '';
+  activeCategory = '';
+  renderLimit = 30;
+  priceRange = { min: 0, max: 0 };
+  render();
+}
+
+function setCatL2(full) {
+  activeCatL2 = full;
+  activeCategory = full;
+  renderLimit = 30;
+  priceRange = { min: 0, max: 0 };
+  render();
 }
 
 function setCategory(cat) {

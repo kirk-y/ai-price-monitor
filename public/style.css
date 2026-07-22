@@ -238,13 +238,15 @@ body.dark .tag-plus_未接码 { background: #3e2723; color: #ffb74d; }
 
 .store-error { color: var(--danger); padding: 10px; background: var(--danger-light); border-radius: 6px; margin: 8px 0; font-size: 13px; }
 
-.cat-bar { display: flex; flex-wrap: nowrap; gap: 4px; align-items: center; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none; padding: 6px 0; position: sticky; top: 0; z-index: 10; background: var(--bg); margin-bottom: 10px; }
-.cat-bar::-webkit-scrollbar { width: 0; height: 0; }
-.cat-bar::-webkit-scrollbar { display: none; }
+.cat-bar { position: sticky; top: 0; z-index: 10; background: var(--bg); margin-bottom: 10px; }
+.cat-bar-row { display: flex; flex-wrap: nowrap; gap: 4px; align-items: center; overflow-x: auto; scrollbar-width: none; -ms-overflow-style: none; padding: 4px 0; }
+.cat-bar-row::-webkit-scrollbar { display: none; }
+.cat-bar-row-l2 { padding-bottom: 6px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
 .cat-btn { padding: 4px 10px; border: 1px solid var(--border); border-radius: 12px; background: var(--card-bg); cursor: pointer; font-size: 11px; transition: all .15s; white-space: nowrap; color: var(--text); flex-shrink: 0; }
 .cat-btn:hover { border-color: var(--primary); color: var(--primary); }
 .cat-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
 .cat-btn .cat-cnt { font-size: 10px; opacity: .6; margin-left: 2px; }
+.cat-btn-l2 { font-size: 10px; padding: 3px 8px; }
 .ns-toggle { grid-column: 1 / -1; padding: 8px; text-align: center; font-size: 12px; color: var(--text3); cursor: pointer; border: 1px dashed var(--border2); border-radius: 6px; transition: all .15s; background: var(--bg); }
 .ns-toggle:hover { border-color: var(--primary); color: var(--primary); background: var(--primary-light); }
 .empty-grid { grid-column: 1 / -1; padding: 16px; text-align: center; font-size: 12px; color: var(--text3); }
