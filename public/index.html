@@ -7,32 +7,68 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-  <div class="app">
-    <div class="top-bar" id="topBar"></div>
-
-    <div class="columns">
-      <div class="left-bar" id="leftBar">
-        <div class="add-store">
-          <button id="addStoreBtn">+ 添加店铺</button>
-          <button id="settingsBtn">设置</button>
-        </div>
-        <button id="refreshAllBtn">全局刷新</button>
-        <div class="store-list" id="storeList"></div>
+  <header class="app-header">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">¥</div>
+      <div class="brand-copy">
+        <strong>AI 价格监控</strong>
+        <span>PRICE WATCH</span>
       </div>
-      <div class="theme-toggle" id="themeToggle" onclick="toggleTheme()">🌙</div>
+    </div>
+    <div class="header-stats" aria-label="监控概览">
+      <div class="header-stat"><strong id="headerStoreCount">0</strong><span>店铺</span></div>
+      <div class="header-stat"><strong id="headerProductCount">0</strong><span>商品</span></div>
+      <div class="header-health"><span class="health-dot"></span><span id="headerHealthText">数据同步中</span></div>
+    </div>
+    <div class="header-actions">
+      <button id="settingsBtn" class="icon-btn" type="button" title="设置" aria-label="设置">⚙</button>
+      <button id="themeToggle" class="icon-btn" type="button" title="切换主题" aria-label="切换主题">☾</button>
+    </div>
+  </header>
 
-      <div class="main-area">
+  <div class="app">
+    <div class="columns">
+      <aside class="left-bar panel" id="leftBar">
+        <div class="panel-heading">
+          <div>
+            <span class="panel-kicker">Stores</span>
+            <h2>监控店铺</h2>
+          </div>
+          <span class="live-indicator" title="监控服务在线"></span>
+        </div>
+        <div class="add-store">
+          <button id="addStoreBtn" type="button"><span aria-hidden="true">＋</span><span>添加店铺</span></button>
+        </div>
+        <button id="refreshAllBtn" type="button"><span class="button-icon" aria-hidden="true">↻</span><span>刷新全部</span></button>
+        <div class="store-list" id="storeList"></div>
+      </aside>
+
+      <main class="main-area panel">
+        <div class="workspace-heading">
+          <div>
+            <span class="panel-kicker">Products</span>
+            <h1 id="activeViewTitle">全部商品</h1>
+          </div>
+          <span id="activeViewMeta" class="workspace-meta">正在加载</span>
+        </div>
         <div class="cat-bar" id="catBar"></div>
         <div id="storesContainer"></div>
-      </div>
+      </main>
 
-      <div class="right-bar" id="rightBar">
-        <div class="rb-search">
+      <aside class="right-bar panel" id="rightBar">
+        <div class="panel-heading compact">
+          <div>
+            <span class="panel-kicker">Filters</span>
+            <h2>筛选与价格</h2>
+          </div>
+        </div>
+        <div class="rb-search filter-section">
+          <label for="includeInput">包含关键词</label>
           <div class="search-inc">
             <div class="search-chips" id="includeChips"></div>
             <input type="text" id="includeInput" placeholder="包含..." autocomplete="off">
           </div>
-          <div class="search-sep-rb"></div>
+          <label for="excludeInput">排除关键词</label>
           <div class="search-exc">
             <div class="search-chips" id="excludeChips"></div>
             <input type="text" id="excludeInput" placeholder="排除..." autocomplete="off">
@@ -42,30 +78,39 @@
         <div class="rb-divider"></div>
         <div class="rb-price-range" id="rbPriceRange"></div>
         <div class="rb-divider"></div>
-        <h3>最优价格</h3>
+        <div class="section-title"><h3>最优价格</h3><span>实时</span></div>
         <div id="bestPriceList"></div>
-      </div>
+      </aside>
     </div>
   </div>
 
   <div id="historyModal" class="modal">
     <div class="modal-content">
-      <span class="close">&times;</span>
+      <button type="button" class="close" aria-label="关闭">&times;</button>
       <div class="modal-nav">
-        <button id="prevProductBtn" class="nav-btn">&lt; 上一个</button>
+        <button id="prevProductBtn" class="nav-btn" title="上一个商品" aria-label="上一个商品">‹</button>
         <div>
           <h3 id="modalTitle">价格历史</h3>
           <div id="modalProductMeta" class="modal-meta"></div>
         </div>
-        <button id="nextProductBtn" class="nav-btn">下一个 &gt;</button>
+        <button id="nextProductBtn" class="nav-btn" title="下一个商品" aria-label="下一个商品">›</button>
       </div>
-      <canvas id="priceChart"></canvas>
+      <div id="historySummary" class="history-summary" hidden>
+        <div><span>当前价格</span><strong id="historyCurrentPrice">-</strong></div>
+        <div><span>最低价格</span><strong id="historyMinPrice">-</strong></div>
+        <div><span>最高价格</span><strong id="historyMaxPrice">-</strong></div>
+        <div><span>区间变化</span><strong id="historyPriceChange">-</strong></div>
+      </div>
+      <div class="history-chart-wrap">
+        <div id="historyState" class="history-state">正在加载价格记录...</div>
+        <canvas id="priceChart" hidden></canvas>
+      </div>
     </div>
   </div>
 
   <div id="addStoreModal" class="modal">
     <div class="modal-content add-modal-content">
-      <span class="close close-add">&times;</span>
+      <button type="button" class="close close-add" aria-label="关闭">&times;</button>
       <h3>添加店铺</h3>
       <input type="text" id="addStoreUrl" placeholder="输入店铺URL，如 https://pay.ldxp.cn/shop/xxx" autocomplete="off">
       <div class="add-modal-actions">
@@ -77,7 +122,7 @@
 
   <div id="settingsModal" class="modal">
     <div class="modal-content settings-content">
-      <span class="close close-settings">&times;</span>
+      <button type="button" class="close close-settings" aria-label="关闭">&times;</button>
       <h2 class="settings-h2">设置</h2>
       <div class="settings-body">
         <div class="settings-sidebar">
@@ -128,7 +173,7 @@
                 <option value="中转额度">中转额度</option>
                 <option value="其他">其他</option>
               </select>
-              <button onclick="loadLabelManager()" style="padding:6px 12px;background:#1a73e8;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
+              <button id="labelManagerRefreshBtn" style="padding:6px 12px;background:#1a73e8;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px">刷新</button>
             </div>
             <div id="labelManagerList" style="max-height:300px;overflow-y:auto;border:1px solid #eee;border-radius:6px"></div>
             <div class="settings-divider"></div>
@@ -151,6 +196,23 @@
               <button id="storeExportBtn" class="settings-action-btn">导出</button>
             </div>
             <span id="storeExportMsg" class="settings-msg"></span>
+            <div class="settings-divider"></div>
+            <p class="settings-desc">导出/导入价格历史数据，支持全量或单店铺操作。</p>
+            <div style="display:flex;gap:8px;margin:10px 0;flex-wrap:wrap">
+              <button id="historyExportAllBtn" class="settings-action-btn">导出全量历史</button>
+              <button id="historyImportAllBtn" class="settings-action-btn settings-import-btn">导入全量历史</button>
+              <input type="file" id="historyImportAllFile" accept=".json" style="display:none">
+            </div>
+            <div style="display:flex;gap:8px;margin:10px 0">
+              <select id="storeHistoryExportSelect" style="flex:1;padding:7px 10px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)"></select>
+              <button id="storeHistoryExportBtn" class="settings-action-btn">导出历史</button>
+            </div>
+            <div style="display:flex;gap:8px;margin:10px 0">
+              <select id="storeHistoryImportSelect" style="flex:1;padding:7px 10px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)"></select>
+              <button id="storeHistoryImportBtn" class="settings-action-btn settings-import-btn">导入历史</button>
+              <input type="file" id="storeHistoryImportFile" accept=".json" style="display:none">
+            </div>
+            <span id="historyMsg" class="settings-msg"></span>
           </div>
           <div id="settingsPanelKeywords" class="settings-panel-item">
             <p class="settings-desc">每行一个关键词，回车分隔。常用关键词会显示在搜索栏下方，点击即添加。</p>
@@ -180,7 +242,7 @@
     </div>
   </div>
 
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <script src="/chart.umd.min.js"></script>
   <script src="/app.js"></script>
 </body>
 </html>

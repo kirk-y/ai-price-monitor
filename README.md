@@ -14,6 +14,8 @@
 
 ## 快速开始
 
+需要 Node.js 22 或更高版本。
+
 ```bash
 # 安装依赖
 npm install
@@ -23,6 +25,8 @@ node server.js  # 或双击 start.bat
 ```
 
 访问 http://localhost:3000
+
+服务默认只监听 `127.0.0.1`。如需局域网或公网访问，请设置 `HOST`，并同时配置高强度 `AUTH_TOKEN`；未配置令牌时服务会拒绝监听非本机地址。可复制 `.env.example` 作为配置参考。
 
 ## 技术栈
 

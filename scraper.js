@@ -1,11 +1,9 @@
 const axios = require('axios');
-const { spawn } = require('child_process');
-const path = require('path');
 
 const BASE = 'https://pay.ldxp.cn';
 const GOODS_TYPES = ['card', 'article', 'resource', 'equity'];
 const REQ_TIMEOUT = 10000;
-const CLASSIFIER_SCRIPT = path.join(__dirname, 'python', 'classifier.py');
+const MAX_PAGES = 30;
 
 function extractToken(url) {
   const m = url.match(/\/shop\/([^/?#]+)/);
@@ -34,7 +32,7 @@ async function fetchProducts(token, goodsType, cookies) {
   let current = 1;
   const pageSize = 100;
 
-  while (true) {
+  while (current <= MAX_PAGES) {
     const res = await axios.post(`${BASE}/shopApi/Shop/goodsList`, {
       token, goods_type: goodsType, current, pageSize,
     }, { headers: headers(cookies), timeout: REQ_TIMEOUT });
@@ -51,7 +49,7 @@ async function fetchProducts(token, goodsType, cookies) {
         name: item.name || '',
         price: typeof item.price === 'number' ? item.price : parseFloat(item.price) || 0,
         stock: item.extend?.stock_count !== undefined ? item.extend.stock_count : -1,
-        purchaseUrl: item.link || '',
+        purchaseUrl: normalizeHttpUrl(item.link),
         updatedAt: new Date().toISOString(),
       });
     }
@@ -79,7 +77,9 @@ async function scrapeShop(url) {
 
   const shopInfo = infoRes.data.data;
   const shopName = shopInfo.nickname || shopInfo.link?.split('/').pop() || token;
-  const goodsTypeSort = shopInfo.goods_type_sort || GOODS_TYPES;
+  const goodsTypeSort = Array.isArray(shopInfo.goods_type_sort)
+    ? shopInfo.goods_type_sort.filter(type => GOODS_TYPES.includes(type))
+    : GOODS_TYPES;
 
   const allProducts = [];
   for (const gt of goodsTypeSort) {
@@ -92,38 +92,40 @@ async function scrapeShop(url) {
   return { shopName, products: allProducts };
 }
 
-function classifyProduct(name) {
-  return new Promise((resolve) => {
-    const proc = spawn('python', [CLASSIFIER_SCRIPT, 'predict', name], {
-      cwd: path.join(__dirname, 'python'),
-      env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
-    });
-    let stdout = '';
-    let stderr = '';
-    proc.stdout.setEncoding('utf8');
-    proc.stdout.on('data', d => stdout += d);
-    proc.stderr.setEncoding('utf8');
-    proc.stderr.on('data', d => stderr += d);
-    proc.on('close', (code) => {
-      if (code !== 0) return resolve(null);
-      try { resolve(JSON.parse(stdout)); }
-      catch { resolve(null); }
-    });
-    proc.on('error', () => resolve(null));
-  });
+function normalizeHttpUrl(value) {
+  if (!value) return '';
+  try {
+    const parsed = new URL(String(value));
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.toString() : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function classifyProduct(name, filterPatterns) {
+  for (const [category, patterns] of Object.entries(filterPatterns || {})) {
+    if (!Array.isArray(patterns)) continue;
+    for (const pattern of patterns) {
+      try {
+        if (new RegExp(pattern, 'i').test(name)) return { category, confidence: 0.55 };
+      } catch (_) { }
+    }
+  }
+  return null;
 }
 
 async function classifyProducts(products, storeId) {
   const store = require('./store');
+  const filterPatterns = store.getFilterConfig().filterPatterns || {};
   for (const p of products) {
     const pk = `${storeId}:${p.id}`;
     const existing = store.getProductLabel(pk);
     if (existing) continue;
-    const result = await classifyProduct(p.name);
+    const result = classifyProduct(p.name, filterPatterns);
     if (result && result.category) {
       store.upsertProductLabel(pk, p.name, result.category, result.confidence, 0);
     }
   }
 }
 
-module.exports = { scrapeShop, classifyProducts };
+module.exports = { scrapeShop, classifyProducts, classifyProduct, normalizeHttpUrl };

@@ -1,13 +1,78 @@
 const express = require('express');
 const path = require('path');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { scrapeShop, classifyProducts } = require('./scraper');
 const store = require('./store');
+const {
+  isLoopbackHost,
+  normalizeShopUrl,
+  validateCategory,
+} = require('./validation');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT || 3000);
+const HOST = process.env.HOST || '127.0.0.1';
 
-app.use(express.json({ limit: '50mb' }));
+const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+
+if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
+  throw new Error('PORT 必须是 1 到 65535 之间的整数');
+}
+if (!AUTH_TOKEN && !isLoopbackHost(HOST)) {
+  throw new Error('监听非本机地址时必须设置 AUTH_TOKEN');
+}
+
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      baseUri: ["'none'"],
+      connectSrc: ["'self'"],
+      imgSrc: ["'self'", 'data:', 'https:'],
+      objectSrc: ["'none'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      upgradeInsecureRequests: null,
+    },
+  },
+  crossOriginEmbedderPolicy: false,
+}));
+
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 1000,
+  message: { error: '请求过于频繁，请稍后再试' },
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 10,
+  message: { error: '操作过于频繁，请稍后再试' },
+});
+
+app.use('/api/', apiLimiter);
 app.use(express.static(path.join(__dirname, 'public')));
+
+function requireAuth(req, res, next) {
+  if (!AUTH_TOKEN) return next();
+  const token = req.headers['x-auth-token'];
+  if (token === AUTH_TOKEN) return next();
+  res.status(401).json({ error: '未授权，请提供有效的访问令牌' });
+}
+
+app.use('/api/', requireAuth);
+
+function requireStrictLimit(req, res, next) {
+  strictLimiter(req, res, next);
+}
+
+function safeDownloadName(value, fallback = 'export') {
+  const name = String(value || fallback).replace(/[^\p{L}\p{N}._-]+/gu, '_').slice(0, 100);
+  return name || fallback;
+}
+
+app.use(express.json({ limit: '10mb' }));
 
 process.on('unhandledRejection', (err) => {
   console.error('未处理的Promise拒绝:', err.message);
@@ -23,7 +88,7 @@ app.get('/api/stores/export', (req, res) => {
   res.json(data);
 });
 
-app.post('/api/stores/import', (req, res) => {
+app.post('/api/stores/import', requireStrictLimit, (req, res) => {
   try {
     store.importAllData(req.body);
     res.json({ success: true });
@@ -32,7 +97,7 @@ app.post('/api/stores/import', (req, res) => {
   }
 });
 
-app.post('/api/stores/import-single', (req, res) => {
+app.post('/api/stores/import-single', requireStrictLimit, (req, res) => {
   try {
     if (!req.body.stores?.length) return res.status(400).json({ error: '数据格式错误，缺少店铺信息' });
     store.importSingleStore(req.body);
@@ -61,7 +126,7 @@ app.get('/api/stores/summary', (req, res) => {
 app.get('/api/stores/:id/export', (req, res) => {
   const data = store.exportStore(req.params.id);
   if (!data) return res.status(404).json({ error: '店铺不存在' });
-  const name = data.stores[0]?.name || req.params.id;
+  const name = safeDownloadName(data.stores[0]?.name || req.params.id, req.params.id);
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', `attachment; filename="${name}-${new Date().toISOString().slice(0,10)}.json"`);
   res.json(data);
@@ -73,13 +138,15 @@ app.get('/api/stores/:id', (req, res) => {
   res.json(s);
 });
 
-app.post('/api/stores', async (req, res) => {
-  const { url } = req.body;
-  if (!url || !url.startsWith('http')) {
-    return res.status(400).json({ error: '请提供有效的URL' });
+app.post('/api/stores', requireStrictLimit, async (req, res) => {
+  let shop;
+  try {
+    shop = normalizeShopUrl(req.body?.url);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
 
-  const existing = store.addStore(url);
+  const existing = store.addStore(shop.url);
   if (!existing) {
     return res.status(409).json({ error: '该店铺已存在' });
   }
@@ -87,14 +154,14 @@ app.post('/api/stores', async (req, res) => {
   store.updateStore(existing.id, { status: 'pending' });
   res.json(store.getStore(existing.id));
 
-  scrapeAndUpdate(existing.id, url);
+  scrapeAndUpdate(existing.id, shop.url);
 });
 
-app.delete('/api/stores/:id', (req, res) => {
+app.delete('/api/stores/:id', requireStrictLimit, (req, res) => {
   res.json({ success: store.removeStore(req.params.id) });
 });
 
-app.post('/api/stores/:id/refresh', async (req, res) => {
+app.post('/api/stores/:id/refresh', requireStrictLimit, async (req, res) => {
   const s = store.getStore(req.params.id);
   if (!s) return res.status(404).json({ error: '店铺不存在' });
 
@@ -108,6 +175,40 @@ app.get('/api/products/:storeId/:productId/history', (req, res) => {
   res.json(store.getPriceHistory(`${req.params.storeId}:${req.params.productId}`));
 });
 
+app.get('/api/stores/:id/history/export', (req, res) => {
+  const data = store.exportStoreHistory(req.params.id);
+  if (!data.priceHistory || !Object.keys(data.priceHistory).length) return res.status(404).json({ error: '该店铺暂无历史数据' });
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="history-${req.params.id}-${new Date().toISOString().slice(0,10)}.json"`);
+  res.json(data);
+});
+
+app.post('/api/stores/:id/history/import', requireStrictLimit, (req, res) => {
+  try {
+    store.importStoreHistory(req.params.id, req.body);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(400).json({ error: '导入失败: ' + e.message });
+  }
+});
+
+app.get('/api/history/export', (req, res) => {
+  const data = store.exportAllHistory();
+  if (!data.priceHistory || !Object.keys(data.priceHistory).length) return res.status(404).json({ error: '暂无历史数据' });
+  res.setHeader('Content-Type', 'application/json');
+  res.setHeader('Content-Disposition', `attachment; filename="all-history-${new Date().toISOString().slice(0,10)}.json"`);
+  res.json(data);
+});
+
+app.post('/api/history/import', requireStrictLimit, (req, res) => {
+  try {
+    store.importAllHistory(req.body);
+    res.json({ success: true });
+  } catch (e) {
+    res.status(400).json({ error: '导入失败: ' + e.message });
+  }
+});
+
 app.get('/api/product-labels', (req, res) => {
   res.json(store.getLabeledData());
 });
@@ -117,14 +218,21 @@ app.get('/api/label-changes', (req, res) => {
 });
 
 app.put('/api/product-labels/:productKey', (req, res) => {
-  const { category } = req.body;
-  if (!category) return res.status(400).json({ error: '缺少category' });
-  const old = store.getProductLabel(req.params.productKey);
-  store.upsertProductLabel(req.params.productKey, req.body.name || '', category, 1.0, 1);
-  if (old && old.category !== category) {
-    store.recordLabelChange(req.params.productKey, req.body.name || '', old.category, category);
+  try {
+    const category = validateCategory(req.body?.category);
+    const previousCategory = req.body?.previousCategory
+      ? validateCategory(req.body.previousCategory)
+      : null;
+    const result = store.setProductLabel(
+      req.params.productKey,
+      String(req.body?.name || '').slice(0, 1000),
+      category,
+      previousCategory,
+    );
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
-  res.json({ success: true });
 });
 
 app.get('/api/filter-config', (req, res) => {
@@ -132,7 +240,11 @@ app.get('/api/filter-config', (req, res) => {
 });
 
 app.put('/api/filter-config', (req, res) => {
-  res.json(store.updateFilterConfig(req.body));
+  try {
+    res.json(store.updateFilterConfig(req.body));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 app.get('/api/refresh-config', (req, res) => {
@@ -142,7 +254,11 @@ app.get('/api/refresh-config', (req, res) => {
 });
 
 app.put('/api/refresh-config', (req, res) => {
-  res.json(store.updateRefreshConfig(req.body));
+  try {
+    res.json(store.updateRefreshConfig(req.body));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 app.get('/api/store-order', (req, res) => {
@@ -150,27 +266,44 @@ app.get('/api/store-order', (req, res) => {
 });
 
 app.put('/api/store-order', (req, res) => {
-  res.json(store.updateStoreOrder(req.body));
+  try {
+    res.json(store.updateStoreOrder(req.body));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
-async function scrapeAndUpdate(storeId, url) {
-  try {
-    const result = await scrapeShop(url);
-    store.updateStore(storeId, {
-      name: result.shopName,
-      status: 'ok',
-      lastUpdated: new Date().toISOString(),
-      products: result.products,
-    });
-    store.recordPrices(storeId, result.products);
-    await classifyProducts(result.products, storeId);
-  } catch (err) {
-    store.updateStore(storeId, { status: 'error', error: err.message });
-  }
+const activeRefreshes = new Map();
+
+function scrapeAndUpdate(storeId, url) {
+  if (activeRefreshes.has(storeId)) return activeRefreshes.get(storeId);
+  const task = (async () => {
+    try {
+      const result = await scrapeShop(url);
+      store.updateStore(storeId, {
+        name: result.shopName,
+        status: 'ok',
+        error: '',
+        lastUpdated: new Date().toISOString(),
+        products: result.products,
+      });
+      store.recordPrices(storeId, result.products);
+      try {
+        await classifyProducts(result.products, storeId);
+      } catch (err) {
+        console.error(`店铺 ${storeId} 分类失败:`, err.message);
+      }
+    } catch (err) {
+      store.updateStore(storeId, { status: 'error', error: err.message });
+    }
+  })();
+  activeRefreshes.set(storeId, task);
+  task.finally(() => activeRefreshes.delete(storeId));
+  return task;
 }
 
-const server = app.listen(PORT, () => {
-  console.log(`AI价格监控服务已启动: http://localhost:${PORT}`);
+const server = app.listen(PORT, HOST, () => {
+  console.log(`AI价格监控服务已启动: http://${HOST}:${PORT}`);
   startAutoRefresh();
 });
 
@@ -193,7 +326,7 @@ function scheduleNextRefresh(delay) {
   setTimeout(startAutoRefresh, delay);
 }
 
-function startAutoRefresh() {
+async function startAutoRefresh() {
   nextRefreshAt = null;
   const all = store.getAllStores();
   const ok = all.filter(s => s.status === 'ok');
@@ -203,7 +336,7 @@ function startAutoRefresh() {
   }
 
   const pick = ok[Math.floor(Math.random() * ok.length)];
-  scrapeAndUpdate(pick.id, pick.url);
+  await scrapeAndUpdate(pick.id, pick.url);
 
   const cfg = store.getRefreshConfig();
   let delay;

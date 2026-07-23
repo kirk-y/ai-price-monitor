@@ -25,7 +25,7 @@
 | price | REAL | 价格 |
 | date | TEXT | 记录时间 (ISO 8601) |
 
-索引: `idx_price_history_product_key` (product_key)
+索引: `idx_price_history_product_key` (product_key)；唯一索引 `idx_price_history_unique` (product_key, price, date)，保证历史导入幂等。
 
 **config** — 配置
 | 列 | 类型 | 说明 |

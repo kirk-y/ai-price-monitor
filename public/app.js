@@ -3,15 +3,16 @@ let refreshConfig = {};
 let storeSummaries = [];
 let stores = [];
 let activeStoreId = 'all';
-let activeCategory = 'plus_已接码';
+let activeCategory = 'plus_未接码';
 let activeCatL1 = 'gpt';
-let activeCatL2 = 'plus_已接码';
+let activeCatL2 = 'plus_未接码';
 let renderLimit = 30;
 let expandedNoStock = {};
 let includeWords = [];
 let excludeWords = [];
 let lastActiveSearch = 'include';
 let priceChart = null;
+let historyRequestId = 0;
 let navProducts = [];
 let navIndex = -1;
 let productLabels = {};
@@ -21,31 +22,148 @@ let storeOrder = [];
 let priceRange = { min: 0, max: 0 };
 let _priceTimer = null;
 
+localStorage.removeItem('authToken');
+let _authToken = sessionStorage.getItem('authToken') || '';
+
+async function apiFetch(url, opts) {
+  const h = { ...(opts?.headers || {}) };
+  if (_authToken) h['x-auth-token'] = _authToken;
+  const res = await fetch(url, { ...opts, headers: h });
+  if (res.status === 401) {
+    if (!_authToken) {
+      showAuthPrompt();
+    } else {
+      _authToken = '';
+      sessionStorage.removeItem('authToken');
+      showAuthPrompt();
+    }
+    throw new Error('未授权');
+  }
+  return res;
+}
+
+function showAuthPrompt() {
+  const token = prompt('请输入访问令牌:');
+  if (token) {
+    _authToken = token;
+    sessionStorage.setItem('authToken', token);
+    location.reload();
+  }
+}
+
 function initTheme() {
   const saved = localStorage.getItem('theme');
   if (saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
     document.body.classList.add('dark');
-    document.getElementById('themeToggle').textContent = '☀️';
+    document.getElementById('themeToggle').textContent = '☀';
   }
 }
 
 function toggleTheme() {
   const isDark = document.body.classList.toggle('dark');
   localStorage.setItem('theme', isDark ? 'dark' : 'light');
-  document.getElementById('themeToggle').textContent = isDark ? '☀️' : '🌙';
+  document.getElementById('themeToggle').textContent = isDark ? '☀' : '☾';
+}
+
+function handleActionClick(event) {
+  const target = event.target.closest('[data-action]');
+  if (!target) return;
+
+  const { action } = target.dataset;
+  const handlers = {
+    'add-suggest-key': () => addSuggestKey(target.dataset.key),
+    'remove-word': () => removeWord(target.dataset.word, target.dataset.type),
+    'set-cat-l1': () => setCatL1(target.dataset.category),
+    'set-cat-l2': () => setCatL2(target.dataset.category),
+    'switch-store': () => switchStore(target.dataset.storeId),
+    'go-best-price': () => goToBestPrice(target.dataset.storeId, target.dataset.category),
+    'delete-store': () => deleteStore(target.dataset.storeId),
+    'toggle-no-stock': () => toggleNoStock(target.dataset.storeId),
+    'refresh-store': () => refreshStore(target.dataset.storeId),
+    'edit-label': () => editLabel(
+      target.dataset.productKey,
+      target.dataset.productName,
+      target.dataset.category,
+      Number(target.dataset.confidence || 0),
+    ),
+    'show-history': () => showHistory(
+      target.dataset.storeId,
+      target.dataset.productId,
+      target.dataset.productName,
+    ),
+    'close-label-editor': () => document.getElementById('labelOverlay')?.remove(),
+    'save-label': () => saveLabel(
+      target.dataset.productKey,
+      target.dataset.productName,
+      target.dataset.previousCategory,
+    ),
+  };
+
+  handlers[action]?.();
+}
+
+function handleActionChange(event) {
+  const target = event.target.closest('[data-change-action]');
+  if (!target) return;
+
+  const handlers = {
+    'toggle-category': () => toggleCatVisibility(target.dataset.category, target.checked),
+    'edit-label-l1': () => onEditL1Change(),
+    'category-l1': () => onCatL1Change(target, target.dataset.productKey, target.dataset.productName),
+    'save-label-settings': () => saveLabelFromSettings(
+      target.dataset.productKey,
+      target.dataset.productName,
+      target.value,
+      target.dataset.previousCategory,
+      target,
+    ),
+    'price-number': () => onPriceInputNum(target, target.dataset.bound),
+  };
+
+  handlers[target.dataset.changeAction]?.();
+}
+
+function handleActionInput(event) {
+  const target = event.target.closest('[data-input-action]');
+  if (target?.dataset.inputAction === 'price-range') onPriceInput(target);
+}
+
+function handleActionDrag(event) {
+  const target = event.target.closest('[data-drag-type]');
+  if (!target) return;
+
+  if (target.dataset.dragType === 'category') {
+    if (event.type === 'dragstart') catDragStart(event, target.dataset.cat);
+    if (event.type === 'dragover') catDragOver(event);
+    if (event.type === 'drop') catDrop(event, target.dataset.cat);
+    if (event.type === 'dragend') catDragEnd();
+  }
+  if (target.dataset.dragType === 'store') {
+    if (event.type === 'dragstart') dragStart(event, target.dataset.id);
+    if (event.type === 'dragover') dragOver(event);
+    if (event.type === 'drop') dropStore(event, target.dataset.id);
+    if (event.type === 'dragend') dragEnd();
+  }
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
   initTheme();
-  filterConfig = await (await fetch('/api/filter-config')).json();
+  document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+  document.addEventListener('click', handleActionClick);
+  document.addEventListener('change', handleActionChange);
+  document.addEventListener('input', handleActionInput);
+  ['dragstart', 'dragover', 'drop', 'dragend'].forEach(type => {
+    document.addEventListener(type, handleActionDrag);
+  });
+  filterConfig = await (await apiFetch('/api/filter-config')).json();
   suggestedKeywords = filterConfig.suggestedKeywords || ['GPT', 'Plus', 'Pro', 'Team', '接码', '直充', '成品', '账号', 'Claude', 'Gemini', 'OpenAI', 'SMS', '谷歌', '微软', '邮箱', 'API', '订阅', '会员', 'Access'];
   keywordUsage = filterConfig.keywordUsage || {};
-  refreshConfig = await (await fetch('/api/refresh-config')).json();
+  refreshConfig = await (await apiFetch('/api/refresh-config')).json();
   await loadStoreSummaries();
-  stores = await (await fetch('/api/stores')).json();
-  storeOrder = await (await fetch('/api/store-order')).json();
+  stores = await (await apiFetch('/api/stores')).json();
+  storeOrder = await (await apiFetch('/api/store-order')).json();
   applyStoreOrder();
-  const labels = await (await fetch('/api/product-labels')).json();
+  const labels = await (await apiFetch('/api/product-labels')).json();
   for (const l of labels) { productLabels[l.product_key] = l; }
   markDirty();
   render();
@@ -107,7 +225,7 @@ function renderSuggestedKeys() {
   const sorted = [...keys].sort((a, b) => (keywordUsage[b] || 0) - (keywordUsage[a] || 0)).slice(0, 7);
   container.innerHTML = '<span class="sk-label">常用:</span> ' +
     sorted.map(k =>
-      `<span class="sk-item" onclick="addSuggestKey('${escapeHtml(k)}')">${escapeHtml(k)}</span>`
+      `<span class="sk-item" data-action="add-suggest-key" data-key="${escapeHtml(k)}">${escapeHtml(k)}</span>`
     ).join('');
 }
 
@@ -131,7 +249,7 @@ function scheduleSaveKeywordUsage() {
 async function saveKeywordUsage() {
   filterConfig.keywordUsage = keywordUsage;
   try {
-    await fetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
+    await apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
   } catch (e) {}
 }
 
@@ -149,15 +267,22 @@ function initSettings() {
   document.getElementById('refreshAllBtn').addEventListener('click', refreshAllStores);
   document.getElementById('settingsBtn').addEventListener('click', openSettings);
   document.querySelector('.close-settings').addEventListener('click', closeSettings);
-  document.getElementById('settingsExportBtn').addEventListener('click', () => window.open('/api/stores/export', '_blank'));
+  document.getElementById('settingsExportBtn').addEventListener('click', () => downloadBlob('/api/stores/export', 'ai-price-monitor-data.json'));
   document.getElementById('settingsImportBtn').addEventListener('click', () => document.getElementById('settingsImportFile').click());
   document.getElementById('settingsImportFile').addEventListener('change', importData);
   document.getElementById('saveRefreshBtn').addEventListener('click', saveRefreshConfig);
   document.getElementById('saveKeywordsBtn').addEventListener('click', saveKeywords);
   document.getElementById('storeExportBtn').addEventListener('click', exportSingleStore);
-  document.getElementById('storeListExportBtn').addEventListener('click', () => window.open('/api/stores/export-list', '_blank'));
+  document.getElementById('storeListExportBtn').addEventListener('click', () => downloadBlob('/api/stores/export-list', 'stores-list.json'));
   document.getElementById('storeListImportBtn').addEventListener('click', () => document.getElementById('storeListImportFile').click());
   document.getElementById('storeListImportFile').addEventListener('change', importStoreList);
+  document.getElementById('historyExportAllBtn').addEventListener('click', () => downloadBlob('/api/history/export', 'all-history.json'));
+  document.getElementById('historyImportAllBtn').addEventListener('click', () => document.getElementById('historyImportAllFile').click());
+  document.getElementById('historyImportAllFile').addEventListener('change', importAllHistoryFile);
+  document.getElementById('storeHistoryExportBtn').addEventListener('click', exportStoreHistory);
+  document.getElementById('storeHistoryImportBtn').addEventListener('click', () => document.getElementById('storeHistoryImportFile').click());
+  document.getElementById('storeHistoryImportFile').addEventListener('change', importStoreHistoryFile);
+  document.getElementById('labelManagerRefreshBtn').addEventListener('click', loadLabelManager);
   document.querySelectorAll('.settings-option').forEach(el => {
     el.addEventListener('click', () => switchSettingsOption(el.dataset.option));
   });
@@ -180,6 +305,7 @@ function openSettings() {
   renderNextRefresh(cfg.nextRefreshAt);
   startNextRefreshTimer(cfg.nextRefreshAt);
   renderStoreExportSelect();
+  renderStoreHistorySelects();
   document.getElementById('settingsModal').style.display = 'block';
 }
 
@@ -213,11 +339,10 @@ function renderCatVisibility() {
   const order = filterConfig.categoryOrder || Object.keys(CAT_LABELS);
   const container = document.getElementById('catVisibility');
   container.innerHTML = order.filter(k => CAT_LABELS[k]).map((k, i) =>
-    `<div class="cat-vis-row" draggable="true" data-cat="${k}"
-      ondragstart="catDragStart(event,'${k}')" ondragover="catDragOver(event)" ondrop="catDrop(event,'${k}')" ondragend="catDragEnd()">
+    `<div class="cat-vis-row" draggable="true" data-drag-type="category" data-cat="${escapeHtml(k)}">
       <span class="cat-drag-handle">⠿</span>
       <label style="flex:1;font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer">
-        <input type="checkbox" ${hidden.includes(k) ? '' : 'checked'} onchange="toggleCatVisibility('${k}',this.checked)">
+        <input type="checkbox" ${hidden.includes(k) ? '' : 'checked'} data-change-action="toggle-category" data-category="${escapeHtml(k)}">
         ${CAT_LABELS[k]}
       </label>
     </div>`
@@ -239,7 +364,7 @@ function catDrop(e, targetKey) {
   order.splice(to, 0, _catDragKey);
   filterConfig.categoryOrder = order;
   renderCatVisibility();
-  fetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
+  apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
   markDirty();
   render();
 }
@@ -248,7 +373,7 @@ function toggleCatVisibility(k, show) {
   if (!filterConfig.hiddenCategories) filterConfig.hiddenCategories = [];
   if (show) filterConfig.hiddenCategories = filterConfig.hiddenCategories.filter(c => c !== k);
   else if (!filterConfig.hiddenCategories.includes(k)) filterConfig.hiddenCategories.push(k);
-  fetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
+  apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
 }
 
 function closeSettings() {
@@ -272,7 +397,7 @@ async function saveRefreshConfig() {
   const fixedMinutes = parseInt(document.getElementById('refreshFixed').value) || 120;
   const config = { mode, minMinutes, maxMinutes, fixedMinutes };
   try {
-    const res = await fetch('/api/refresh-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
+    const res = await apiFetch('/api/refresh-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
     if (res.ok) {
       refreshConfig = await res.json();
       renderNextRefresh(refreshConfig.nextRefreshAt);
@@ -293,7 +418,7 @@ function renderStoreExportSelect() {
   const sel = document.getElementById('storeExportSelect');
   sel.innerHTML = '<option value="">-- 选择店铺 --</option>' +
     storeSummaries.filter(s => s.status === 'ok' || s.status === 'error').map(s =>
-      `<option value="${s.id}">${escapeHtml(s.name || s.id)}</option>`
+      `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name || s.id)}</option>`
     ).join('');
 }
 
@@ -302,9 +427,24 @@ function exportSingleStore() {
   const id = sel.value;
   const msg = document.getElementById('storeExportMsg');
   if (!id) { msg.textContent = '请先选择店铺'; msg.style.color = '#e53935'; return; }
-  window.open(`/api/stores/${id}/export`, '_blank');
+  downloadBlob(`/api/stores/${id}/export`, `store-${id}.json`);
   msg.textContent = '✓ 已开始下载';
   msg.style.color = '#43a047';
+}
+
+async function downloadBlob(url, filename) {
+  try {
+    const res = await apiFetch(url);
+    if (!res.ok) throw new Error('下载失败');
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = filename;
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) {
+    console.error('下载失败:', e);
+  }
 }
 
 async function importStoreList(e) {
@@ -323,15 +463,15 @@ async function importStoreList(e) {
       if (!item.url || !item.url.startsWith('http')) { skipped++; continue; }
       if (existing.includes(item.id)) { skipped++; continue; }
       try {
-        await fetch('/api/stores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: item.url }) });
+        await apiFetch('/api/stores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: item.url }) });
         added++;
       } catch { skipped++; }
     }
     msg.textContent = `✓ 导入完成: 新增 ${added} 个，跳过 ${skipped} 个`;
     msg.style.color = '#43a047';
     e.target.value = '';
-    storeSummaries = await (await fetch('/api/stores/summary')).json();
-    stores = await (await fetch('/api/stores')).json();
+    storeSummaries = await (await apiFetch('/api/stores/summary')).json();
+    stores = await (await apiFetch('/api/stores')).json();
     markDirty();
     render();
     renderStoreList();
@@ -350,13 +490,13 @@ async function importSingleStoreFile(e) {
   try {
     const text = await file.text();
     const data = JSON.parse(text);
-    const res = await fetch('/api/stores/import-single', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    const res = await apiFetch('/api/stores/import-single', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
     if (res.ok) {
       const result = await res.json();
       msg.textContent = '✓ 导入成功，即将刷新';
       msg.style.color = '#43a047';
-      storeSummaries = await (await fetch('/api/stores/summary')).json();
-      stores = await (await fetch('/api/stores')).json();
+      storeSummaries = await (await apiFetch('/api/stores/summary')).json();
+      stores = await (await apiFetch('/api/stores')).json();
       e.target.value = '';
       setTimeout(() => location.reload(), 1500);
     } else {
@@ -377,7 +517,7 @@ async function saveKeywords() {
   try {
     filterConfig.suggestedKeywords = keys;
     filterConfig.keywordUsage = keywordUsage;
-    const res = await fetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
+    const res = await apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
     if (res.ok) {
       suggestedKeywords = keys;
       renderSuggestedKeys();
@@ -402,7 +542,7 @@ async function importData(e) {
   try {
     const text = await file.text();
     const data = JSON.parse(text);
-    const res = await fetch('/api/stores/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    const res = await apiFetch('/api/stores/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
     if (res.ok) {
       msg.textContent = '✓ 导入成功，页面即将刷新';
       msg.style.color = '#43a047';
@@ -419,6 +559,76 @@ async function importData(e) {
   e.target.value = '';
 }
 
+function renderStoreHistorySelects() {
+  const stores = storeSummaries.filter(s => s.status === 'ok' || s.status === 'error');
+  const html = stores.map(s => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.name || s.id)}</option>`).join('');
+  document.getElementById('storeHistoryExportSelect').innerHTML = '<option value="">-- 选择店铺 --</option>' + html;
+  document.getElementById('storeHistoryImportSelect').innerHTML = '<option value="">-- 选择店铺 --</option>' + html;
+}
+
+function exportStoreHistory() {
+  const sel = document.getElementById('storeHistoryExportSelect');
+  const id = sel.value;
+  const msg = document.getElementById('historyMsg');
+  if (!id) { msg.textContent = '请先选择店铺'; msg.style.color = '#e53935'; return; }
+  downloadBlob(`/api/stores/${encodeURIComponent(id)}/history/export`, `history-${id}.json`);
+  msg.textContent = '✓ 已开始下载';
+  msg.style.color = '#43a047';
+}
+
+async function importStoreHistoryFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const sel = document.getElementById('storeHistoryImportSelect');
+  const id = sel.value;
+  const msg = document.getElementById('historyMsg');
+  if (!id) { msg.textContent = '请先选择店铺'; msg.style.color = '#e53935'; return; }
+  msg.textContent = '导入中...';
+  msg.style.color = 'var(--primary)';
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    const res = await apiFetch(`/api/stores/${encodeURIComponent(id)}/history/import`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    if (res.ok) {
+      msg.textContent = '✓ 历史数据导入成功';
+      msg.style.color = '#43a047';
+    } else {
+      const err = await res.json();
+      msg.textContent = '导入失败: ' + (err.error || '');
+      msg.style.color = '#e53935';
+    }
+  } catch (err) {
+    msg.textContent = '导入失败: ' + err.message;
+    msg.style.color = '#e53935';
+  }
+  e.target.value = '';
+}
+
+async function importAllHistoryFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const msg = document.getElementById('historyMsg');
+  msg.textContent = '导入中...';
+  msg.style.color = 'var(--primary)';
+  try {
+    const text = await file.text();
+    const data = JSON.parse(text);
+    const res = await apiFetch('/api/history/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    if (res.ok) {
+      msg.textContent = '✓ 全量历史数据导入成功';
+      msg.style.color = '#43a047';
+    } else {
+      const err = await res.json();
+      msg.textContent = '导入失败: ' + (err.error || '');
+      msg.style.color = '#e53935';
+    }
+  } catch (err) {
+    msg.textContent = '导入失败: ' + err.message;
+    msg.style.color = '#e53935';
+  }
+  e.target.value = '';
+}
+
 function removeWord(word, type) {
   if (type === 'include') includeWords = includeWords.filter(w => w !== word);
   else excludeWords = excludeWords.filter(w => w !== word);
@@ -429,16 +639,17 @@ function removeWord(word, type) {
 function renderChips() {
   const inc = document.getElementById('includeChips');
   inc.innerHTML = includeWords.map(w =>
-    `<span class="chip chip-inc">${escapeHtml(w)}<span class="chip-del" onclick="removeWord('${escapeHtml(w)}','include')">&times;</span></span>`
+    `<span class="chip chip-inc">${escapeHtml(w)}<span class="chip-del" data-action="remove-word" data-word="${escapeHtml(w)}" data-type="include">&times;</span></span>`
   ).join('');
 
   const exc = document.getElementById('excludeChips');
   exc.innerHTML = excludeWords.map(w =>
-    `<span class="chip chip-exc">${escapeHtml(w)}<span class="chip-del" onclick="removeWord('${escapeHtml(w)}','exclude')">&times;</span></span>`
+    `<span class="chip chip-exc">${escapeHtml(w)}<span class="chip-del" data-action="remove-word" data-word="${escapeHtml(w)}" data-type="exclude">&times;</span></span>`
   ).join('');
 }
 
 function closeModal() {
+  historyRequestId++;
   document.getElementById('historyModal').style.display = 'none';
 }
 
@@ -451,7 +662,7 @@ function navigateProduct(dir) {
 }
 
 async function loadStoreSummaries() {
-  storeSummaries = await (await fetch('/api/stores/summary')).json();
+  storeSummaries = await (await apiFetch('/api/stores/summary')).json();
   renderStoreList();
   renderBestPrices();
   renderPriceRange();
@@ -462,11 +673,11 @@ async function loadStoreSummaries() {
 
 async function loadStoreWithProducts(storeId) {
   if (storeId === 'all') {
-    stores = await (await fetch('/api/stores')).json();
+    stores = await (await apiFetch('/api/stores')).json();
     markDirty();
     return;
   }
-  const full = await (await fetch(`/api/stores/${storeId}`)).json();
+  const full = await (await apiFetch(`/api/stores/${storeId}`)).json();
   const idx = stores.findIndex(s => s.id === storeId);
   if (idx >= 0) stores[idx] = full;
   else stores.push(full);
@@ -533,7 +744,7 @@ function getFilteredProducts() {
   if (activeCatL2) {
     all = all.filter(p => p.category === activeCatL2);
   } else if (activeCatL1) {
-    all = all.filter(p => catL1FromFull(p.category) === activeCatL1);
+    all = all.filter(p => catL1Display(catL1FromFull(p.category)) === activeCatL1);
   }
   if (includeWords.length || excludeWords.length) all = all.filter(p => matchesSearch(p.name));
   all.sort((a, b) => {
@@ -592,6 +803,8 @@ function visibleCatEntries() {
   return order.filter(k => !hidden.includes(k) && CAT_LABELS[k]).map(k => [k, CAT_LABELS[k]]);
 }
 
+const CAT_L1_DISPLAY = ['gpt', 'claude', 'gemini', 'grok', '邮箱', '接码', '中转', '其他'];
+
 const CAT_L1_LABELS = {
   gpt: 'GPT', claude: 'Claude', gemini: 'Gemini', grok: 'Grok',
   ai_platform: 'AI平台', 邮箱: '邮箱', 号码: '号码', 社交账号: '社交',
@@ -600,6 +813,7 @@ const CAT_L1_LABELS = {
   教程服务: '教程', IP代理: 'IP/代理', 卡密兑换: '卡密', 虚拟卡: '虚拟卡',
   开发工具: '开发', 电商工具: '电商', 企业服务: '企业', 反重力: '反重力',
   Adobe: 'Adobe', 修图剪辑: '修图', AI平台: 'AI平台', sms: '接码', 其他: '其他',
+  接码: '接码', 中转: '中转',
 };
 
 const CAT_L2_LABELS = {
@@ -652,14 +866,15 @@ function renderCatBar() {
   for (const p of all) {
     counts[p.category] = (counts[p.category] || 0) + 1;
     const l1 = catL1FromFull(p.category);
-    l1Counts[l1] = (l1Counts[l1] || 0) + 1;
+    const dl1 = catL1Display(l1);
+    l1Counts[dl1] = (l1Counts[dl1] || 0) + 1;
   }
 
   const bar = document.getElementById('catBar');
 
-  // Row 1: Level 1 categories
-  const l1Buttons = CAT_L1.map(l1 =>
-    l1Counts[l1] ? `<button class="cat-btn ${activeCatL1 === l1 && !activeCatL2 ? 'active' : ''}" onclick="setCatL1('${l1}')">${CAT_L1_LABELS[l1]||l1} <span class="cat-cnt">${l1Counts[l1]}</span></button>` : ''
+  // Row 1: Display Level 1 (7 major categories)
+  const l1Buttons = CAT_L1_DISPLAY.map(l1 =>
+    l1Counts[l1] ? `<button class="cat-btn ${activeCatL1 === l1 && !activeCatL2 ? 'active' : ''}" data-action="set-cat-l1" data-category="${escapeHtml(l1)}">${CAT_L1_LABELS[l1]||l1} <span class="cat-cnt">${l1Counts[l1]}</span></button>` : ''
   ).filter(Boolean).join('');
 
   // Row 2: Level 2 subcategories (visible only when L1 is selected)
@@ -667,12 +882,12 @@ function renderCatBar() {
   if (activeCatL1) {
     const subs = new Set();
     for (const p of all) {
-      if (catL1FromFull(p.category) === activeCatL1) subs.add(p.category);
+      if (catL1Display(catL1FromFull(p.category)) === activeCatL1) subs.add(p.category);
     }
     const sorted = [...subs].sort((a, b) => (counts[b]||0) - (counts[a]||0));
     l2Buttons = sorted.map(full => {
       const l2 = catL2FromFull(full);
-      return `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" onclick="setCatL2('${full}')">${catL2Label(activeCatL1, l2)} <span class="cat-cnt">${counts[full]||0}</span></button>`;
+      return `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" data-action="set-cat-l2" data-category="${escapeHtml(full)}">${catL2Label(activeCatL1, l2)} <span class="cat-cnt">${counts[full]||0}</span></button>`;
     }).join('');
   }
 
@@ -706,12 +921,14 @@ function setCategory(cat) {
 
 function render() {
   renderLimit = 30;
+  const scrollHost = document.getElementById('storesContainer');
+  const hostRect = scrollHost?.getBoundingClientRect();
   const cards = document.querySelectorAll('.store-card');
   let anchor = null;
   for (const c of cards) {
     const r = c.getBoundingClientRect();
-    if (r.top < window.innerHeight && r.bottom > 0) {
-      anchor = { id: c.dataset.storeId, offset: r.top };
+    if (hostRect && r.top < hostRect.bottom && r.bottom > hostRect.top) {
+      anchor = { id: c.dataset.storeId, offset: r.top - hostRect.top };
       break;
     }
   }
@@ -719,13 +936,47 @@ function render() {
   renderBestPrices();
   renderPriceRange();
   renderCatBar();
+  document.querySelectorAll('.cat-bar-row').forEach(makeDragScroll);
   renderStores();
   if (anchor) {
     requestAnimationFrame(() => {
       const el = document.querySelector(`.store-card[data-store-id="${anchor.id}"]`);
-      if (el) window.scrollBy(0, el.getBoundingClientRect().top - anchor.offset);
+      const nextHostRect = scrollHost?.getBoundingClientRect();
+      if (el && scrollHost && nextHostRect) scrollHost.scrollBy(0, el.getBoundingClientRect().top - nextHostRect.top - anchor.offset);
     });
   }
+
+let _dragClick = true;
+
+function makeDragScroll(el) {
+  let isDown = false, startX, scrollLeft, dragDist;
+  el.addEventListener('mousedown', e => {
+    isDown = true;
+    dragDist = 0;
+    _dragClick = false;
+    el.classList.add('dragging');
+    startX = e.pageX - el.offsetLeft;
+    scrollLeft = el.scrollLeft;
+  });
+  const up = () => {
+    isDown = false;
+    el.classList.remove('dragging');
+    if (dragDist <= 5) _dragClick = true;
+  };
+  el.addEventListener('mouseleave', up);
+  el.addEventListener('mouseup', up);
+  el.addEventListener('mousemove', e => {
+    if (!isDown) return;
+    e.preventDefault();
+    const x = e.pageX - el.offsetLeft;
+    const dx = x - startX;
+    dragDist = Math.abs(dx);
+    el.scrollLeft = scrollLeft - dx;
+  });
+  el.addEventListener('click', e => {
+    if (!_dragClick) { e.stopPropagation(); _dragClick = true; }
+  }, true);
+}
 }
 
 let dragId = null;
@@ -737,25 +988,51 @@ function renderStoreList() {
   const pend = storeSummaries.filter(s => s.status === 'pending');
   const total = storeSummaries.reduce((s, st) => s + (st.productCount || 0), 0);
 
-  container.innerHTML = `<button class="store-btn ${activeStoreId === 'all' ? 'active' : ''}" onclick="switchStore('all')"><span class="sb-name">全部</span> <span class="badge">${total}</span></button>
+  container.innerHTML = `<button class="store-btn store-btn-all ${activeStoreId === 'all' ? 'active' : ''}" data-action="switch-store" data-store-id="all"><span class="sb-name">全部</span> <span class="badge">${total}</span></button>
   ${ok.map(s => {
+    const sid = escapeHtml(s.id);
     const isRefreshing = refreshingStores.has(s.id);
-    return `<div class="store-row${isRefreshing ? ' is-refreshing' : ''}" draggable="true" data-id="${s.id}"
-      ondragstart="dragStart(event,'${s.id}')" ondragover="dragOver(event)" ondrop="dropStore(event,'${s.id}')" ondragend="dragEnd()">
-      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="switchStore('${s.id}')" title="${formatTime(s.lastUpdated)}"><span class="drag-handle">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span> <span class="badge">${s.productCount||0}</span></button>
+    return `<div class="store-row${isRefreshing ? ' is-refreshing' : ''}" draggable="true" data-drag-type="store" data-id="${sid}">
+      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${formatTime(s.lastUpdated)}"><span class="drag-handle">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span> <span class="badge">${s.productCount||0}</span></button>
       ${isRefreshing ? '<div class="refresh-bar"><div class="refresh-bar-inner"></div></div>' : ''}
     </div>`;
   }).join('')}
   ${error.map(s => {
-    return `<div class="store-row store-row-error" data-id="${s.id}">
-      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="switchStore('${s.id}')" title="${escapeHtml(s.error||'刷新失败')}"><span class="drag-handle" style="color:var(--danger)">⚠</span><span class="sb-name" style="color:var(--danger)">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-error">失败</span></button>
+    const sid = escapeHtml(s.id);
+    return `<div class="store-row store-row-error" data-id="${escapeHtml(s.id)}">
+      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${escapeHtml(s.error||'刷新失败')}"><span class="drag-handle" style="color:var(--danger)">⚠</span><span class="sb-name" style="color:var(--danger)">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-error">失败</span></button>
     </div>`;
   }).join('')}
   ${pend.map(s => {
-    return `<div class="store-row store-row-pending" data-id="${s.id}">
-      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" onclick="switchStore('${s.id}')" title="获取中..."><span class="drag-handle" style="color:var(--text3);opacity:.5">⠿</span><span class="sb-name" style="opacity:.7">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-pending">获取中</span></button>
+    const sid = escapeHtml(s.id);
+    return `<div class="store-row store-row-pending" data-id="${escapeHtml(s.id)}">
+      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="获取中..."><span class="drag-handle" style="color:var(--text3);opacity:.5">⠿</span><span class="sb-name" style="opacity:.7">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-pending">获取中</span></button>
     </div>`;
   }).join('')}`;
+  updateDashboardChrome(total, ok.length, error.length, pend.length);
+}
+
+function updateDashboardChrome(totalProducts, healthyCount, errorCount, pendingCount) {
+  const activeStore = activeStoreId === 'all' ? null : storeSummaries.find(s => s.id === activeStoreId);
+  const title = activeStore ? (activeStore.name || activeStore.id) : '全部商品';
+  const viewCount = activeStore ? (activeStore.productCount || 0) : totalProducts;
+  document.getElementById('headerStoreCount').textContent = storeSummaries.length;
+  document.getElementById('headerProductCount').textContent = totalProducts;
+  document.getElementById('activeViewTitle').textContent = title;
+  document.getElementById('activeViewMeta').textContent = `${viewCount} 个商品`;
+
+  const healthText = document.getElementById('headerHealthText');
+  const healthDot = document.querySelector('.health-dot');
+  healthDot.classList.remove('warning', 'error');
+  if (errorCount > 0) {
+    healthText.textContent = `${errorCount} 个店铺异常`;
+    healthDot.classList.add('error');
+  } else if (pendingCount > 0) {
+    healthText.textContent = `${pendingCount} 个店铺同步中`;
+    healthDot.classList.add('warning');
+  } else {
+    healthText.textContent = `${healthyCount} 个店铺正常`;
+  }
 }
 
 function dragStart(e, id) {
@@ -781,7 +1058,9 @@ function dropStore(e, targetId) {
   const [movedStore] = stores.splice(from, 1);
   stores.splice(to, 0, movedStore);
   storeOrder = storeSummaries.filter(s => s.status === 'ok').map(s => s.id);
-  fetch('/api/store-order', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(storeOrder) });
+  apiFetch('/api/store-order', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(storeOrder) })
+    .then(res => { if (!res.ok) throw new Error('保存店铺排序失败'); })
+    .catch(err => console.error(err.message));
   markDirty();
   render();
 }
@@ -797,7 +1076,7 @@ async function switchStore(storeId) {
   priceRange = { min: 0, max: 0 };
   document.querySelectorAll('.store-btn').forEach(b => b.classList.remove('active'));
   document.querySelectorAll('.store-btn').forEach(b => {
-    if ((storeId === 'all' && b.textContent.includes('全部')) || b.getAttribute('onclick')?.includes(storeId)) b.classList.add('active');
+    if (b.dataset.storeId === storeId) b.classList.add('active');
   });
 
   const area = document.getElementById('storesContainer');
@@ -834,8 +1113,20 @@ function renderBestPrices() {
     const items = pool.filter(p => p.category === k && p.price > 0 && p.stock > 0).sort((a, b) => a.price - b.price);
     if (!items.length) return `<div class="bp-item"><div class="bp-cat">${label}</div><div class="bp-na">暂无</div></div>`;
     const item = items[0];
-    return `<div class="bp-item"><div class="bp-cat">${label}</div><div class="bp-price">¥${item.price.toFixed(2)}</div><div class="bp-store">${escapeHtml(item.storeName)}</div></div>`;
+    const storeId = item.storeId;
+    const catFull = item.category;
+    return `<div class="bp-item" data-action="go-best-price" data-store-id="${escapeHtml(storeId)}" data-category="${escapeHtml(catFull)}">
+      <div class="bp-cat">${label}</div>
+      <div class="bp-row"><span class="bp-price">¥${item.price.toFixed(2)}</span><span class="bp-store" title="${escapeHtml(item.storeName)}">${escapeHtml(item.storeName)}</span></div>
+    </div>`;
   }).join('');
+}
+
+function goToBestPrice(storeId, category) {
+  activeCatL1 = catL1FromFull(category);
+  activeCatL2 = category;
+  activeCategory = category;
+  switchStore(storeId);
 }
 
 function renderStores() {
@@ -855,7 +1146,7 @@ function renderStores() {
     const s = stores.find(st => st.id === id);
     if (!s) return '';
     if (s.status === 'pending') return `<div class="store-card"><div class="sc-name">${escapeHtml(s.name||s.id)}</div><div class="store-loading">正在获取商品数据...</div></div>`;
-    if (s.status === 'error') return `<div class="store-card"><div class="sc-name">${escapeHtml(s.name||s.id)}</div><div class="store-error">${escapeHtml(s.error||'获取失败')}</div><button class="del-btn" onclick="deleteStore('${s.id}')">删除</button></div>`;
+    if (s.status === 'error') return `<div class="store-card"><div class="sc-name">${escapeHtml(s.name||s.id)}</div><div class="store-error">${escapeHtml(s.error||'获取失败')}</div><button class="del-btn" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div>`;
 
     let products = filtered.filter(p => p.storeId === id);
     const storePrices = products.map(p => p.price).filter(v => v > 0);
@@ -877,19 +1168,19 @@ function renderStores() {
         cardCount++;
       }
       if (!reachedLimit) {
-        if (hidden > 0) gridItems.push(`<div class="ns-toggle" onclick="toggleNoStock('${id}')">展开 ${noStock.length} 个无货商品...</div>`);
-        if (expanded && noStock.length > 0) gridItems.push(`<div class="ns-toggle" onclick="toggleNoStock('${id}')">收起无货商品</div>`);
+        if (hidden > 0) gridItems.push(`<div class="ns-toggle" data-action="toggle-no-stock" data-store-id="${escapeHtml(id)}">展开 ${noStock.length} 个无货商品...</div>`);
+        if (expanded && noStock.length > 0) gridItems.push(`<div class="ns-toggle" data-action="toggle-no-stock" data-store-id="${escapeHtml(id)}">收起无货商品</div>`);
       }
     }
     if (reachedLimit && !gridItems.length) return '';
-    return `<div class="store-card" data-store-id="${s.id}">
+    return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">
       <div class="sc-header">
         <span class="sc-name">${escapeHtml(s.name||s.id)}</span>
         <span class="sc-time">${formatTime(s.lastUpdated)}</span>
         <span class="sc-meta">${products.length} 个商品</span>
         <div class="sc-actions">
-          <button class="ref-btn" onclick="refreshStore('${s.id}')">更新</button>
-          <button class="del-btn" onclick="deleteStore('${s.id}')">删除</button>
+          <button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button>
+          <button class="del-btn" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button>
         </div>
       </div>
       <div class="product-grid">${gridItems.join('')}</div>
@@ -920,27 +1211,51 @@ function observeSentinel() {
   window._scrollObs.observe(el);
 }
 
-function q(s) { return (s||'').replace(/'/g, "\\'").replace(/"/g, '&quot;'); }
+function safeUrl(url) {
+  if (!url) return '';
+  try {
+    const parsed = new URL(String(url));
+    if (['http:', 'https:'].includes(parsed.protocol)) return escapeHtml(parsed.toString());
+  } catch (_) { }
+  return '';
+}
+
+function safeCssToken(value) {
+  return String(value || 'other').replace(/[^\p{L}\p{N}_-]/gu, '') || 'other';
+}
 
 function renderProductCard(p) {
   const inStock = p.stock > 0;
   const stockText = p.stock < 0 ? '未知' : inStock ? `有货 ${p.stock}` : `无货`;
-  const confPct = p.confidence > 0 ? Math.round(p.confidence * 100) : 0;
+  const confidence = Number.isFinite(Number(p.confidence)) ? Number(p.confidence) : 0;
+  const confPct = confidence > 0 ? Math.round(confidence * 100) : 0;
+  const category = String(p.category || 'other');
+  const categoryText = escapeHtml(category);
+  const categoryClass = safeCssToken(category);
+  const price = Number.isFinite(Number(p.price)) ? Number(p.price) : 0;
 
-  return `<div class="product-card ${inStock ? 'has-stock' : 'no-stock'}" data-price="${p.price}">
+  return `<div class="product-card ${inStock ? 'has-stock' : 'no-stock'}" data-price="${price}">
     <div class="pc-top">
-      ${p.category !== 'other' ? `<span class="tag tag-${p.category}" onclick="editLabel('${q(p.productKey)}','${q(p.name)}','${q(p.category)}',${p.confidence})" title="点击修改分类 (置信度: ${confPct}%)">${p.category}${confPct > 0 ? `<small> ${confPct}%</small>` : ''}</span>` : `<span class="tag tag-other" onclick="editLabel('${q(p.productKey)}','${q(p.name)}','其他',0)" title="点击添加分类">其他</span>`}
-      <span class="pc-name" title="${q(p.name)}">${escapeHtml(p.name)}</span>
+      ${category !== 'other' ? `<span class="tag tag-${categoryClass}" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="${escapeHtml(category)}" data-confidence="${confidence}" title="点击修改分类 (置信度: ${confPct}%)">${categoryText}${confPct > 0 ? `<small> ${confPct}%</small>` : ''}</span>` : `<span class="tag tag-other" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="其他" data-confidence="0" title="点击添加分类">其他</span>`}
+      <span class="pc-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</span>
     </div>
     <div class="pc-mid">
-      <span class="pc-price">¥${p.price.toFixed(2)}</span>
+      <span class="pc-price">¥${price.toFixed(2)}</span>
       <span class="pc-stock">${stockText}</span>
     </div>
     <div class="pc-bot">
-      ${p.purchaseUrl ? `<a href="${q(p.purchaseUrl)}" target="_blank" class="buy-btn">购买</a>` : ''}
-      <button class="hist-btn" onclick="showHistory('${q(p.storeId)}','${q(p.id)}','${q(p.name)}')">走势</button>
+      ${p.purchaseUrl && safeUrl(p.purchaseUrl) ? `<a href="${safeUrl(p.purchaseUrl)}" target="_blank" rel="noopener noreferrer" class="buy-btn">购买</a>` : ''}
+      <button class="hist-btn" data-action="show-history" data-store-id="${escapeHtml(p.storeId)}" data-product-id="${escapeHtml(p.id)}" data-product-name="${escapeHtml(p.name)}">走势</button>
     </div>
   </div>`;
+}
+
+function categoryKey(l1, l2) {
+  if (l1 === '其他') return '其他';
+  if (l1 === 'gpt' && l2.startsWith('plus_')) return l2;
+  if (l1 === 'gpt' && l2 === 'k12') return 'gptk12';
+  if (l1 === 'sms' && l2 === '接码') return 'sms';
+  return `${l1}_${l2}`;
 }
 
 function editLabel(productKey, name, currentCat, confidence) {
@@ -949,7 +1264,7 @@ function editLabel(productKey, name, currentCat, confidence) {
   const l1Opts = CAT_L1.map(c => `<option value="${c}" ${c === l1 ? 'selected' : ''}>${c}</option>`).join('');
   const l2List = CAT_L2_MAP[l1] || ['其他'];
   const l2Opts = l2List.map(c => {
-    const full = l1 + '_' + c;
+    const full = categoryKey(l1, c);
     return `<option value="${full}" ${full === currentCat || c === l2 ? 'selected' : ''}>${c}</option>`;
   }).join('');
   const div = document.createElement('div');
@@ -960,12 +1275,12 @@ function editLabel(productKey, name, currentCat, confidence) {
     <div style="margin-bottom:12px;font-weight:600;font-size:15px;color:var(--text)">修改商品分类</div>
     <div style="margin-bottom:14px;font-size:13px;color:var(--text2);word-break:break-all">${escapeHtml(name)}</div>
     <div style="display:flex;gap:6px;margin-bottom:16px">
-      <select id="labelSelectL1" onchange="onEditL1Change()" style="flex:1;padding:8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
+      <select id="labelSelectL1" data-change-action="edit-label-l1" style="flex:1;padding:8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
       <select id="labelSelect" style="flex:1;padding:8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)">${l2Opts}</select>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end">
-      <button onclick="document.getElementById('labelOverlay').remove()" style="padding:8px 16px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:13px">取消</button>
-      <button onclick="saveLabel('${productKey}','${escapeHtml(name)}')" style="padding:8px 16px;background:var(--primary);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">保存</button>
+      <button data-action="close-label-editor" style="padding:8px 16px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:13px">取消</button>
+      <button data-action="save-label" data-product-key="${escapeHtml(productKey)}" data-product-name="${escapeHtml(name)}" data-previous-category="${escapeHtml(currentCat)}" style="padding:8px 16px;background:var(--primary);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">保存</button>
     </div>
   </div>`;
   document.body.appendChild(div);
@@ -975,7 +1290,7 @@ function onEditL1Change() {
   const l1 = document.getElementById('labelSelectL1').value;
   const l2sel = document.getElementById('labelSelect');
   const subs = CAT_L2_MAP[l1] || ['其他'];
-  l2sel.innerHTML = subs.map(c => `<option value="${l1 + '_' + c}">${c}</option>`).join('');
+  l2sel.innerHTML = subs.map(c => `<option value="${categoryKey(l1, c)}">${c}</option>`).join('');
 }
 
 const CAT_L1 = ['gpt','claude','gemini','grok','ai_platform','邮箱','号码','社交账号','视频会员','音乐会员','生活券','网盘','阅读会员','QQ会员','云服务','中转额度','教程服务','IP代理','卡密兑换','虚拟卡','开发工具','电商工具','企业服务','反重力','Adobe','修图剪辑','AI平台','sms','其他'];
@@ -1018,7 +1333,24 @@ function catL1FromFull(full) {
     if (full.startsWith(l1 + '_') || full === l1) return l1;
   }
   if (full.startsWith('plus_') || full.startsWith('gpt_') || full === 'gptk12') return 'gpt';
+  if (full.startsWith('反重力') || full.startsWith('Antigravity')) return '反重力';
   return '其他';
+}
+
+function catL1Display(l1) {
+  if (!l1) return '其他';
+  if (CAT_L1_DISPLAY.includes(l1)) return l1;
+  const map = {
+    '号码': '接码', '反重力': 'gemini', 'sms': '接码',
+    'ai_platform': 'gpt', '开发工具': 'gpt', '卡密兑换': 'gpt',
+    '虚拟卡': 'gpt', '电商工具': 'gpt',
+    '视频会员': '其他', '音乐会员': '其他', '生活券': '其他',
+    '网盘': '其他', '阅读会员': '其他', 'QQ会员': '其他',
+    '云服务': '其他', '教程服务': '其他', 'IP代理': '其他',
+    '社交账号': '其他', '企业服务': '其他', 'Adobe': '其他',
+    '修图剪辑': '其他', 'AI平台': '其他',
+  };
+  return map[l1] || '其他';
 }
 
 function catL2FromFull(full) {
@@ -1040,13 +1372,13 @@ function renderCatSelect(pk, name, currentCat) {
   const l2 = catL2FromFull(currentCat);
   const l1Opts = CAT_L1.map(c => `<option value="${c}" ${c === l1 ? 'selected' : ''}>${c}</option>`).join('');
   const l2Opts = (CAT_L2_MAP[l1] || ['其他']).map(c => {
-    const full = l1 + '_' + c;
+    const full = categoryKey(l1, c);
     return `<option value="${full}" ${full === currentCat || c === l2 ? 'selected' : ''}>${c}</option>`;
   }).join('');
-  const escapedPk = pk.replace(/['"\\]/g, '');
-  const escapedName = name.replace(/['"\\]/g, '');
-  return `<select class="cl2-l1" onchange="onCatL1Change(this,'${escapedPk}','${escapedName}')" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
-    <select class="cl2-l2" onchange="saveLabelFromSettings('${escapedPk}','${escapedName}',this.value)" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l2Opts}</select>`;
+  const epk = escapeHtml(pk), ename = escapeHtml(name);
+  const previous = escapeHtml(currentCat);
+  return `<select class="cl2-l1" data-change-action="category-l1" data-product-key="${epk}" data-product-name="${ename}" data-previous-category="${previous}" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
+    <select class="cl2-l2" data-change-action="save-label-settings" data-product-key="${epk}" data-product-name="${ename}" data-previous-category="${previous}" style="padding:2px 4px;border:1px solid var(--border);border-radius:4px;font-size:11px;background:var(--card-bg);color:var(--text)">${l2Opts}</select>`;
 }
 
 function onCatL1Change(l1sel, pk, name) {
@@ -1056,10 +1388,10 @@ function onCatL1Change(l1sel, pk, name) {
   const currentFull = l2sel.value;
   const currentL2 = currentFull.startsWith(l1 + '_') ? currentFull.slice(l1.length + 1) : '';
   l2sel.innerHTML = subs.map(c => {
-    const full = l1 + '_' + c;
+    const full = categoryKey(l1, c);
     return `<option value="${full}" ${c === currentL2 ? 'selected' : ''}>${c}</option>`;
   }).join('');
-  saveLabelFromSettings(pk, name, l2sel.value);
+  saveLabelFromSettings(pk, name, l2sel.value, l1sel.dataset.previousCategory, l2sel);
 }
 
 function loadLabelManager() {
@@ -1106,36 +1438,45 @@ function loadLabelManager() {
 async function loadLabelChanges() {
   const el = document.getElementById('labelChangeLog');
   try {
-    const changes = await (await fetch('/api/label-changes')).json();
+    const changes = await (await apiFetch('/api/label-changes')).json();
     el.innerHTML = changes.slice(0, 30).map(c =>
-      `<div style="padding:3px 0;border-bottom:1px solid var(--border)">${escapeHtml(c.name)}: <span style="color:var(--danger)">${c.old_category||'?'}</span> → <span style="color:var(--success)">${c.new_category}</span> <span style="color:var(--text3);font-size:10px">${c.changed_at}</span></div>`
+      `<div style="padding:3px 0;border-bottom:1px solid var(--border)">${escapeHtml(c.name)}: <span style="color:var(--danger)">${escapeHtml(c.old_category||'?')}</span> → <span style="color:var(--success)">${escapeHtml(c.new_category)}</span> <span style="color:var(--text3);font-size:10px">${escapeHtml(c.changed_at)}</span></div>`
     ).join('');
     if (!changes.length) el.innerHTML = '<div style="color:var(--text3);padding:4px">暂无调整记录</div>';
   } catch { el.innerHTML = ''; }
 }
 
-async function saveLabelFromSettings(productKey, name, category) {
-  const res = await fetch(`/api/product-labels/${encodeURIComponent(productKey)}`, {
+async function saveLabelFromSettings(productKey, name, category, previousCategory, source) {
+  const res = await apiFetch(`/api/product-labels/${encodeURIComponent(productKey)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ category, name }),
+    body: JSON.stringify({ category, name, previousCategory }),
   });
   if (res.ok) {
-    productLabels[productKey] = { product_key: productKey, name, category, confidence: 1.0 };
+    const result = await res.json();
+    productLabels[productKey] = result.label || { product_key: productKey, name, category, confidence: 1.0 };
+    if (source) {
+      source.dataset.previousCategory = category;
+      const sibling = source.previousElementSibling || source.nextElementSibling;
+      if (sibling?.dataset) sibling.dataset.previousCategory = category;
+    }
     markDirty();
+    renderCatBar();
+    renderBestPrices();
   }
 }
 
-async function saveLabel(productKey, name) {
+async function saveLabel(productKey, name, previousCategory) {
   const select = document.getElementById('labelSelect');
   const category = select.value;
-  const res = await fetch(`/api/product-labels/${encodeURIComponent(productKey)}`, {
+  const res = await apiFetch(`/api/product-labels/${encodeURIComponent(productKey)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ category, name }),
+    body: JSON.stringify({ category, name, previousCategory }),
   });
   if (res.ok) {
-    productLabels[productKey] = { product_key: productKey, name, category, confidence: 1.0 };
+    const result = await res.json();
+    productLabels[productKey] = result.label || { product_key: productKey, name, category, confidence: 1.0 };
     markDirty();
     document.getElementById('labelOverlay')?.remove();
     render();
@@ -1179,7 +1520,7 @@ async function submitAddStore() {
   btn.disabled = true; btn.textContent = '获取中...';
   msg.textContent = '';
   try {
-    const res = await fetch('/api/stores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
+    const res = await apiFetch('/api/stores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url }) });
     if (!res.ok) {
       const e = await res.json();
       msg.textContent = e.error || '添加失败';
@@ -1193,12 +1534,12 @@ async function submitAddStore() {
     let n = 0;
     while (n < 30) {
       await new Promise(r => setTimeout(r, 1500));
-      const check = await (await fetch('/api/stores/summary')).json();
+      const check = await (await apiFetch('/api/stores/summary')).json();
       const updated = check.find(s => s.id === storeData.id);
       if (updated && updated.status === 'ok') {
         storeSummaries = check;
         await loadStoreWithProducts(storeData.id);
-        const newLabels = await (await fetch('/api/product-labels')).json();
+        const newLabels = await (await apiFetch('/api/product-labels')).json();
         for (const l of newLabels) { productLabels[l.product_key] = l; }
         markDirty();
         if (activeStoreId === 'all' || activeStoreId === storeData.id) {
@@ -1223,7 +1564,7 @@ async function submitAddStore() {
     msg.textContent = '获取超时，请稍后手动刷新';
     msg.style.color = '#e53935';
     btn.disabled = false; btn.textContent = '重试';
-    storeSummaries = await (await fetch('/api/stores/summary')).json();
+    storeSummaries = await (await apiFetch('/api/stores/summary')).json();
     renderStoreList();
   } catch (e) {
     msg.textContent = '添加失败: ' + e.message;
@@ -1236,18 +1577,18 @@ async function refreshStore(id, silent) {
   refreshingStores.add(id);
   renderStoreList();
   try {
-    await fetch(`/api/stores/${id}/refresh`, { method: 'POST' });
+    await apiFetch(`/api/stores/${id}/refresh`, { method: 'POST' });
     let n = 0;
     while (n < 30) {
       await new Promise(r => setTimeout(r, 1500));
-      const summary = await (await fetch('/api/stores/summary')).json();
+      const summary = await (await apiFetch('/api/stores/summary')).json();
       const updated = summary.find(s => s.id === id);
       if (updated) {
         storeSummaries = summary.map(s => s.id === id ? updated : s);
         applyStoreOrder();
         if (updated.status === 'ok') {
           await loadStoreWithProducts(id);
-          const newLabels = await (await fetch('/api/product-labels')).json();
+          const newLabels = await (await apiFetch('/api/product-labels')).json();
           for (const l of newLabels) { productLabels[l.product_key] = l; }
           markDirty();
           flashSuccess(id);
@@ -1287,19 +1628,19 @@ async function refreshAllStores() {
     refreshingStores.add(s.id);
     renderStoreList();
     try {
-      await fetch(`/api/stores/${s.id}/refresh`, { method: 'POST' });
+      await apiFetch(`/api/stores/${s.id}/refresh`, { method: 'POST' });
       let n = 0;
       while (n < 30 && !_stopRefreshAll) {
         await new Promise(r => setTimeout(r, 1500));
         if (_stopRefreshAll) break;
-        const summary = await (await fetch('/api/stores/summary')).json();
+        const summary = await (await apiFetch('/api/stores/summary')).json();
         const updated = summary.find(x => x.id === s.id);
         if (updated) {
           storeSummaries = summary.map(x => x.id === s.id ? updated : x);
           applyStoreOrder();
           if (updated.status === 'ok') {
             await loadStoreWithProducts(s.id);
-            const newLabels = await (await fetch('/api/product-labels')).json();
+            const newLabels = await (await apiFetch('/api/product-labels')).json();
             for (const l of newLabels) { productLabels[l.product_key] = l; }
             markDirty();
             flashSuccess(s.id);
@@ -1345,8 +1686,6 @@ function flashSuccess(id) {
   if (row) { row.classList.add('flash-ok'); setTimeout(() => row.classList.remove('flash-ok'), 1200); }
   refreshingStores.delete(id);
   renderStoreList();
-  renderBestPrices();
-  renderPriceRange();
 }
 
 function sliderToPrice(val) { return Math.round(200 * Math.pow(val / 200, 2.5)); }
@@ -1359,15 +1698,29 @@ function renderPriceRange() {
   const rawMin = priceToSlider(min);
   const rawMax = priceToSlider(max);
   container.innerHTML = `
-    <div class="pr-row pr-row-top"><input class="pr-input pr-max-input" type="number" min="0" max="200" value="${max}" onchange="onPriceInputNum(this,'max')"></div>
-    <div class="pr-row pr-row-mid">
+    <div class="pr-header">
+      <span class="pr-label">价格区间</span>
+      <span class="pr-value">¥${min} - ¥${max}</span>
+    </div>
+    <div class="pr-track-wrap">
       <div class="pr-track">
-        <input type="range" min="0" max="200" value="${rawMin}" step="1" class="pr-min" id="prMinSlider" oninput="onPriceInput(this)">
-        <input type="range" min="0" max="200" value="${rawMax}" step="1" class="pr-max" id="prMaxSlider" oninput="onPriceInput(this)">
+        <div class="pr-track-bg"></div>
         <div class="pr-fill" style="left:${rawMin/2}%;right:${100-rawMax/2}%"></div>
+        <input type="range" min="0" max="200" value="${rawMin}" step="1" class="pr-min" id="prMinSlider" data-input-action="price-range">
+        <input type="range" min="0" max="200" value="${rawMax}" step="1" class="pr-max" id="prMaxSlider" data-input-action="price-range">
       </div>
     </div>
-    <div class="pr-row pr-row-bot"><input class="pr-input pr-min-input" type="number" min="0" max="200" value="${min}" onchange="onPriceInputNum(this,'min')"></div>
+    <div class="pr-inputs">
+      <div class="pr-input-group">
+        <span class="pr-input-symbol">¥</span>
+        <input class="pr-min-input" type="number" min="0" max="200" value="${min}" data-change-action="price-number" data-bound="min">
+      </div>
+      <span class="pr-input-sep">—</span>
+      <div class="pr-input-group">
+        <span class="pr-input-symbol">¥</span>
+        <input class="pr-max-input" type="number" min="0" max="200" value="${max}" data-change-action="price-number" data-bound="max">
+      </div>
+    </div>
   `;
 }
 
@@ -1420,7 +1773,7 @@ function toggleNoStock(id) {
 
 async function deleteStore(id) {
   if (!confirm('确定删除?')) return;
-  await fetch(`/api/stores/${id}`, { method: 'DELETE' });
+  await apiFetch(`/api/stores/${id}`, { method: 'DELETE' });
   storeSummaries = storeSummaries.filter(s => s.id !== id);
   stores = stores.filter(s => s.id !== id);
   markDirty();
@@ -1431,24 +1784,142 @@ async function deleteStore(id) {
   render();
 }
 
+function compactHistory(entries) {
+  const points = (Array.isArray(entries) ? entries : [])
+    .map(entry => ({ price: Number(entry.price), date: new Date(entry.date) }))
+    .filter(entry => Number.isFinite(entry.price) && !Number.isNaN(entry.date.getTime()))
+    .sort((a, b) => a.date - b.date);
+  const compact = [];
+  for (let start = 0; start < points.length;) {
+    let end = start;
+    while (end + 1 < points.length && points[end + 1].price === points[start].price) end++;
+    compact.push(points[start]);
+    if (end !== start) compact.push(points[end]);
+    start = end + 1;
+  }
+  return { points, compact };
+}
+
+function setHistoryState(message, isError = false) {
+  const state = document.getElementById('historyState');
+  const canvas = document.getElementById('priceChart');
+  state.textContent = message;
+  state.classList.toggle('error', isError);
+  state.hidden = false;
+  canvas.hidden = true;
+}
+
+function formatHistoryTime(date, includeDate = true) {
+  return new Intl.DateTimeFormat('zh-CN', includeDate
+    ? { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }
+    : { hour: '2-digit', minute: '2-digit' }
+  ).format(date);
+}
+
+function renderHistorySummary(points) {
+  const prices = points.map(point => point.price);
+  const first = prices[0];
+  const current = prices[prices.length - 1];
+  const difference = current - first;
+  const percent = first ? difference / first * 100 : 0;
+  const change = document.getElementById('historyPriceChange');
+  document.getElementById('historyCurrentPrice').textContent = `¥${current.toFixed(2)}`;
+  document.getElementById('historyMinPrice').textContent = `¥${Math.min(...prices).toFixed(2)}`;
+  document.getElementById('historyMaxPrice').textContent = `¥${Math.max(...prices).toFixed(2)}`;
+  change.textContent = `${difference > 0 ? '+' : ''}${difference.toFixed(2)} (${percent > 0 ? '+' : ''}${percent.toFixed(1)}%)`;
+  change.classList.toggle('price-up', difference > 0);
+  change.classList.toggle('price-down', difference < 0);
+  document.getElementById('historySummary').hidden = false;
+}
+
 async function showHistory(storeId, productId, name, isNav) {
   if (!isNav) {
     const all = getFilteredProducts();
     navProducts = all;
     navIndex = all.findIndex(p => p.storeId === storeId && p.id === productId);
   }
-  const data = await (await fetch(`/api/products/${storeId}/${productId}/history`)).json();
+  const requestId = ++historyRequestId;
+  const modal = document.getElementById('historyModal');
+  const canvas = document.getElementById('priceChart');
   document.getElementById('modalTitle').textContent = name || '价格历史';
   document.getElementById('modalProductMeta').textContent = navIndex >= 0 ? `${navIndex+1}/${navProducts.length}` : '';
   document.getElementById('prevProductBtn').style.visibility = navIndex > 0 ? 'visible' : 'hidden';
   document.getElementById('nextProductBtn').style.visibility = navIndex < navProducts.length-1 ? 'visible' : 'hidden';
-  document.getElementById('historyModal').style.display = 'block';
-  if (priceChart) priceChart.destroy();
-  if (!data.length) { document.getElementById('priceChart').style.display = 'none'; return; }
-  document.getElementById('priceChart').style.display = 'block';
-  priceChart = new Chart(document.getElementById('priceChart').getContext('2d'), {
+  document.getElementById('historySummary').hidden = true;
+  modal.style.display = 'block';
+  modal.setAttribute('aria-busy', 'true');
+  if (priceChart) {
+    priceChart.destroy();
+    priceChart = null;
+  }
+  setHistoryState('正在加载价格记录...');
+
+  try {
+    const response = await apiFetch(`/api/products/${encodeURIComponent(storeId)}/${encodeURIComponent(productId)}/history`);
+    if (!response.ok) throw new Error('价格记录请求失败');
+    const { points, compact } = compactHistory(await response.json());
+    if (requestId !== historyRequestId) return;
+    if (!points.length) {
+      setHistoryState('暂无价格记录');
+      return;
+    }
+    if (typeof globalThis.Chart !== 'function') throw new Error('走势图组件加载失败');
+
+    renderHistorySummary(points);
+    const firstDate = points[0].date;
+    const lastDate = points[points.length - 1].date;
+    const navMeta = navIndex >= 0 ? `${navIndex+1}/${navProducts.length} · ` : '';
+    document.getElementById('modalProductMeta').textContent = `${navMeta}${points.length} 条记录 · ${formatHistoryTime(firstDate)} - ${formatHistoryTime(lastDate)}`;
+    document.getElementById('historyState').hidden = true;
+    canvas.hidden = false;
+
+    const styles = getComputedStyle(document.body);
+    const primary = styles.getPropertyValue('--primary').trim() || '#1677ff';
+    const grid = styles.getPropertyValue('--border').trim() || '#e5e7eb';
+    const text = styles.getPropertyValue('--text3').trim() || '#8c8c8c';
+    const oneDay = lastDate - firstDate < 24 * 60 * 60 * 1000;
+    priceChart = new globalThis.Chart(canvas.getContext('2d'), {
     type: 'line',
-    data: { labels: data.map(d => new Date(d.date).toLocaleString('zh-CN')), datasets: [{ label: '价格 (¥)', data: data.map(d => d.price), borderColor: '#1a73e8', backgroundColor: 'rgba(26,115,232,0.1)', fill: true, tension: 0.3, pointRadius: 4 }] },
-    options: { responsive: true, interaction: { intersect: false, mode: 'index' }, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: false, ticks: { callback: v => '¥'+v.toFixed(2) } }, x: { ticks: { maxRotation: 45, font: { size: 10 } } } } }
-  });
+    data: {
+      labels: compact.map(point => formatHistoryTime(point.date, !oneDay)),
+      datasets: [{
+        label: '价格',
+        data: compact.map(point => point.price),
+        borderColor: primary,
+        backgroundColor: `${primary}18`,
+        fill: true,
+        stepped: 'after',
+        borderWidth: 2,
+        pointRadius: compact.length > 24 ? 0 : 3,
+        pointHoverRadius: 4,
+      }],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: { display: false },
+        tooltip: { callbacks: { label: context => ` ¥${Number(context.raw).toFixed(2)}` } },
+      },
+      scales: {
+        y: {
+          beginAtZero: false,
+          grid: { color: grid },
+          ticks: { color: text, callback: value => `¥${Number(value).toFixed(2)}` },
+        },
+        x: {
+          grid: { display: false },
+          ticks: { color: text, maxRotation: 0, autoSkip: true, maxTicksLimit: 7, font: { size: 10 } },
+        },
+      },
+    },
+    });
+  } catch (error) {
+    if (requestId !== historyRequestId) return;
+    console.error('加载价格走势失败:', error);
+    setHistoryState(error.message || '价格走势加载失败', true);
+  } finally {
+    if (requestId === historyRequestId) modal.removeAttribute('aria-busy');
+  }
 }
