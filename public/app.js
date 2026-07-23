@@ -226,6 +226,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   renderSuggestedKeys();
   initSettings();
   setupStoreScrollTracking();
+  startStoreStatusPolling();
 });
 
 function setupSearch(inputId, chipsId, wordsVar, type) {
@@ -353,6 +354,7 @@ function openSettings() {
 }
 
 let _nextRefreshTimer = null;
+let _refreshConfigReloading = false;
 
 function renderNextRefresh(ts) {
   const el = document.getElementById('nextRefreshInfo');
@@ -371,6 +373,20 @@ function startNextRefreshTimer(ts) {
     const el = document.getElementById('nextRefreshInfo');
     if (!el || document.getElementById('settingsModal').style.display !== 'block') {
       clearInterval(_nextRefreshTimer);
+      return;
+    }
+    if (ts <= Date.now()) {
+      if (_refreshConfigReloading) return;
+      _refreshConfigReloading = true;
+      apiFetch('/api/refresh-config')
+        .then(response => response.json())
+        .then(config => {
+          refreshConfig = config;
+          renderNextRefresh(config.nextRefreshAt);
+          startNextRefreshTimer(config.nextRefreshAt);
+        })
+        .catch(() => renderNextRefresh(ts))
+        .finally(() => { _refreshConfigReloading = false; });
       return;
     }
     renderNextRefresh(ts);
@@ -2276,7 +2292,54 @@ async function submitAddStore() {
   }
 }
 
+async function waitForStoreRefresh(id, maxAttempts = 60) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (_refreshingAll && _stopRefreshAll) throw new Error('已停止全局刷新');
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    const summary = await (await apiFetch('/api/stores/summary')).json();
+    const updated = summary.find(store => store.id === id);
+    if (!updated) throw new Error('店铺不存在');
+    storeSummaries = summary;
+    applyStoreOrder();
+    renderStoreList();
+    if (updated.status === 'error') throw new Error(updated.error || '店铺刷新失败');
+    if (updated.status !== 'pending') {
+      await loadStoreWithProducts(id);
+      const newLabels = await (await apiFetch('/api/product-labels')).json();
+      for (const label of newLabels) productLabels[label.product_key] = label;
+      markDirty();
+      return updated;
+    }
+  }
+  throw new Error('刷新超时，请稍后查看店铺状态');
+}
+
 async function refreshStore(id, silent) {
+  if (!id || (_refreshingAll && !silent)) return;
+  if (refreshingStores.has(id)) {
+    if (_refreshingAll && silent) await waitForStoreRefresh(id);
+    return;
+  }
+  refreshingStores.add(id);
+  storeSummaries = storeSummaries.map(store => store.id === id
+    ? { ...store, status: 'pending', error: '' }
+    : store);
+  renderStoreList();
+  try {
+    await apiFetch(`/api/stores/${id}/refresh`, { method: 'POST' });
+    await waitForStoreRefresh(id);
+    flashSuccess(id);
+    if (!silent) render();
+  } catch (error) {
+    if (!silent) alert('刷新失败: ' + error.message);
+    renderStoreList();
+  } finally {
+    refreshingStores.delete(id);
+    renderStoreList();
+  }
+}
+
+async function legacyRefreshStore(id, silent) {
   refreshingStores.add(id);
   renderStoreList();
   try {
@@ -2316,8 +2379,80 @@ async function refreshStore(id, silent) {
 let _refreshingAll = false;
 let _stopRefreshAll = false;
 let refreshingStores = new Set();
+let _storeStatusTimer = null;
+
+function startStoreStatusPolling() {
+  clearInterval(_storeStatusTimer);
+  _storeStatusTimer = setInterval(async () => {
+    if (document.visibilityState === 'hidden') return;
+    try {
+      const summary = await (await apiFetch('/api/stores/summary')).json();
+      const changed = summary.length !== storeSummaries.length || summary.some(next => {
+        const prev = storeSummaries.find(store => store.id === next.id);
+        return !prev || prev.status !== next.status || prev.lastUpdated !== next.lastUpdated || prev.productCount !== next.productCount;
+      });
+      if (!changed) return;
+      const refreshed = summary.some(next => {
+        const prev = storeSummaries.find(store => store.id === next.id);
+        return next.status === 'ok' && prev && prev.lastUpdated !== next.lastUpdated;
+      });
+      const refreshedIds = summary.filter(next => {
+        const prev = storeSummaries.find(store => store.id === next.id);
+        return next.status === 'ok' && prev && prev.lastUpdated !== next.lastUpdated;
+      }).map(store => store.id);
+      storeSummaries = summary;
+      applyStoreOrder();
+      renderStoreList();
+      renderActiveStoreCard();
+      if (refreshed) {
+        for (const id of refreshedIds) await loadStoreWithProducts(id);
+        markDirty();
+        renderStores();
+      }
+    } catch (_) { /* A later poll will retry. */ }
+  }, 5000);
+}
 
 async function refreshAllStores() {
+  if (_refreshingAll) return;
+  _refreshingAll = true;
+  _stopRefreshAll = false;
+  const btn = document.getElementById('refreshAllBtn');
+  btn.textContent = '停止刷新';
+  btn.disabled = false;
+  btn.onclick = stopRefreshAll;
+  // 全局刷新遵循当前店铺展示顺序，避免因刷新时间改变用户关注顺序。
+  const order = [...storeSummaries].filter(store => !isStoreHidden(store.id));
+  try {
+    const ids = order.map(store => store.id);
+    storeSummaries = storeSummaries.map(store => ids.includes(store.id)
+      ? { ...store, status: 'pending', error: '' }
+      : store);
+    ids.forEach(id => refreshingStores.add(id));
+    renderStoreList();
+    await apiFetch('/api/stores/refresh-all', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ storeIds: ids }),
+    });
+    for (const summary of order) {
+      if (_stopRefreshAll) break;
+      try {
+        await waitForStoreRefresh(summary.id);
+        flashSuccess(summary.id);
+      } catch (error) {
+        console.error(`店铺 ${summary.id} 刷新失败:`, error.message);
+      }
+    }
+  } catch (error) {
+    showToast('全局刷新失败: ' + error.message);
+  } finally {
+    refreshingStores.clear();
+    finishRefreshAll();
+  }
+}
+
+async function legacyRefreshAllStores() {
   if (_refreshingAll) return;
   _refreshingAll = true;
   _stopRefreshAll = false;

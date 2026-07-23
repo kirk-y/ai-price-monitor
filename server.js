@@ -123,6 +123,24 @@ app.get('/api/stores/summary', (req, res) => {
   res.json(store.getStoreSummaries());
 });
 
+app.post('/api/stores/refresh-all', requireStrictLimit, (req, res) => {
+  const requested = Array.isArray(req.body?.storeIds) ? req.body.storeIds : [];
+  const byId = new Map(store.getAllStores().map(item => [item.id, item]));
+  const storesToRefresh = requested
+    .filter(id => typeof id === 'string' && byId.has(id))
+    .map(id => byId.get(id));
+  if (!storesToRefresh.length) return res.status(400).json({ error: '没有可刷新的店铺' });
+
+  for (const item of storesToRefresh) store.updateStore(item.id, { status: 'pending', error: '' });
+  res.json({ status: 'pending', storeIds: storesToRefresh.map(item => item.id) });
+
+  (async () => {
+    for (const item of storesToRefresh) {
+      enqueueStoreRefresh(item.id, item.url, 'global');
+    }
+  })().catch(error => console.error('全局刷新任务失败:', error.message));
+});
+
 app.get('/api/stores/:id/export', (req, res) => {
   const data = store.exportStore(req.params.id);
   if (!data) return res.status(404).json({ error: '店铺不存在' });
@@ -154,7 +172,7 @@ app.post('/api/stores', requireStrictLimit, async (req, res) => {
   store.updateStore(existing.id, { status: 'pending' });
   res.json(store.getStore(existing.id));
 
-  scrapeAndUpdate(existing.id, shop.url);
+  enqueueStoreRefresh(existing.id, shop.url, 'initial');
 });
 
 app.delete('/api/stores/:id', requireStrictLimit, (req, res) => {
@@ -165,10 +183,10 @@ app.post('/api/stores/:id/refresh', requireStrictLimit, async (req, res) => {
   const s = store.getStore(req.params.id);
   if (!s) return res.status(404).json({ error: '店铺不存在' });
 
-  store.updateStore(s.id, { status: 'pending' });
+  store.updateStore(s.id, { status: 'pending', error: '' });
   res.json({ status: 'pending' });
 
-  scrapeAndUpdate(s.id, s.url);
+  enqueueStoreRefresh(s.id, s.url, 'manual');
 });
 
 app.get('/api/products/:storeId/:productId/history', (req, res) => {
@@ -308,6 +326,56 @@ app.put('/api/store-order', (req, res) => {
 });
 
 const activeRefreshes = new Map();
+const refreshQueue = [];
+const queuedRefreshes = new Map();
+let refreshQueueRunning = false;
+let refreshSequence = 0;
+let lastRefreshFinishedAt = 0;
+
+function queueDelay(min, max) {
+  const lo = Number(process.env.REFRESH_STORE_DELAY_MIN || min);
+  const hi = Number(process.env.REFRESH_STORE_DELAY_MAX || max);
+  return Math.floor(Math.random() * Math.max(1, hi - lo + 1) + lo);
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function enqueueStoreRefresh(storeId, url, reason = 'manual') {
+  if (activeRefreshes.has(storeId)) return activeRefreshes.get(storeId);
+  if (queuedRefreshes.has(storeId)) return queuedRefreshes.get(storeId);
+
+  const priority = reason === 'manual' ? 0 : reason === 'global' ? 10 : 20;
+  const task = new Promise((resolve) => {
+    refreshQueue.push({ storeId, url, reason, priority, sequence: refreshSequence++, resolve });
+    refreshQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+  });
+  queuedRefreshes.set(storeId, task);
+  processRefreshQueue();
+  return task;
+}
+
+async function processRefreshQueue() {
+  if (refreshQueueRunning) return;
+  refreshQueueRunning = true;
+  try {
+    while (refreshQueue.length) {
+      const job = refreshQueue.shift();
+      queuedRefreshes.delete(job.storeId);
+      const sinceLast = Date.now() - lastRefreshFinishedAt;
+      const minimumGap = queueDelay(2000, 6000);
+      if (lastRefreshFinishedAt && sinceLast < minimumGap) await sleep(minimumGap - sinceLast);
+      store.updateStore(job.storeId, { status: 'pending', error: '' });
+      await scrapeAndUpdate(job.storeId, job.url);
+      lastRefreshFinishedAt = Date.now();
+      job.resolve();
+    }
+  } finally {
+    refreshQueueRunning = false;
+    if (refreshQueue.length) processRefreshQueue();
+  }
+}
 
 function scrapeAndUpdate(storeId, url) {
   if (activeRefreshes.has(storeId)) return activeRefreshes.get(storeId);
@@ -370,7 +438,7 @@ async function startAutoRefresh() {
   }
 
   const pick = ok[Math.floor(Math.random() * ok.length)];
-  await scrapeAndUpdate(pick.id, pick.url);
+  await enqueueStoreRefresh(pick.id, pick.url, 'auto');
 
   const cfg = store.getRefreshConfig();
   let delay;

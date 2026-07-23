@@ -4,6 +4,32 @@ const BASE = 'https://pay.ldxp.cn';
 const GOODS_TYPES = ['card', 'article', 'resource', 'equity'];
 const REQ_TIMEOUT = 10000;
 const MAX_PAGES = 30;
+const PAGE_DELAY_MIN = Number(process.env.SCRAPER_PAGE_DELAY_MIN || 200);
+const PAGE_DELAY_MAX = Number(process.env.SCRAPER_PAGE_DELAY_MAX || 600);
+const TYPE_DELAY_MIN = Number(process.env.SCRAPER_TYPE_DELAY_MIN || 500);
+const TYPE_DELAY_MAX = Number(process.env.SCRAPER_TYPE_DELAY_MAX || 1500);
+
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+function randomDelay(min, max) {
+  const lo = Math.max(0, Number(min) || 0);
+  const hi = Math.max(lo, Number(max) || lo);
+  return Math.floor(Math.random() * (hi - lo + 1)) + lo;
+}
+
+async function requestWithBackoff(config) {
+  let attempt = 0;
+  while (true) {
+    try {
+      return await axios.request(config);
+    } catch (err) {
+      const status = err.response?.status;
+      const retryable = status === 429 || status === 502 || status === 503 || status === 504 || !status;
+      if (!retryable || attempt >= 2) throw err;
+      await sleep((2 ** attempt) * 1000 + randomDelay(200, 800));
+      attempt++;
+    }
+  }
+}
 
 function extractToken(url) {
   const m = url.match(/\/shop\/([^/?#]+)/);
@@ -11,7 +37,7 @@ function extractToken(url) {
 }
 
 async function getCookies(token) {
-  const res = await axios.get(`${BASE}/shop/${token}`, {
+  const res = await requestWithBackoff({ method: 'get', url: `${BASE}/shop/${token}`,
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     timeout: REQ_TIMEOUT,
   });
@@ -33,9 +59,13 @@ async function fetchProducts(token, goodsType, cookies) {
   const pageSize = 100;
 
   while (current <= MAX_PAGES) {
-    const res = await axios.post(`${BASE}/shopApi/Shop/goodsList`, {
-      token, goods_type: goodsType, current, pageSize,
-    }, { headers: headers(cookies), timeout: REQ_TIMEOUT });
+    const res = await requestWithBackoff({
+      method: 'post',
+      url: `${BASE}/shopApi/Shop/goodsList`,
+      data: { token, goods_type: goodsType, current, pageSize },
+      headers: headers(cookies),
+      timeout: REQ_TIMEOUT,
+    });
 
     const data = res.data;
     if (!data || data.code !== 1 || !data.data?.list) break;
@@ -56,6 +86,7 @@ async function fetchProducts(token, goodsType, cookies) {
 
     if (list.length < pageSize) break;
     current++;
+    await sleep(randomDelay(PAGE_DELAY_MIN, PAGE_DELAY_MAX));
   }
 
   return products;
@@ -67,8 +98,12 @@ async function scrapeShop(url) {
 
   const cookies = await getCookies(token);
 
-  const infoRes = await axios.post(`${BASE}/shopApi/Shop/info`, { token }, {
-    headers: headers(cookies), timeout: REQ_TIMEOUT,
+  const infoRes = await requestWithBackoff({
+    method: 'post',
+    url: `${BASE}/shopApi/Shop/info`,
+    data: { token },
+    headers: headers(cookies),
+    timeout: REQ_TIMEOUT,
   });
 
   if (!infoRes.data || infoRes.data.code !== 1) {
@@ -87,6 +122,7 @@ async function scrapeShop(url) {
       const products = await fetchProducts(token, gt, cookies);
       allProducts.push(...products);
     } catch (_) { }
+    await sleep(randomDelay(TYPE_DELAY_MIN, TYPE_DELAY_MAX));
   }
 
   return { shopName, products: allProducts };
