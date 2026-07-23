@@ -3,6 +3,11 @@ let refreshConfig = {};
 let storeSummaries = [];
 let stores = [];
 let activeStoreId = 'all';
+let activeBrowseStoreId = '';
+let hiddenStoreIds = [];
+let storeWindowStart = 0;
+let storeWindowEnd = 4;
+let storeWindowBusy = false;
 let activeCategory = 'plus_未接码';
 let activeCatL1 = 'gpt';
 let activeCatL2 = 'plus_未接码';
@@ -13,6 +18,12 @@ let excludeWords = [];
 let lastActiveSearch = 'include';
 let priceChart = null;
 let historyRequestId = 0;
+let historyBestChart = null;
+let historyBestCharts = [];
+let historyBestData = null;
+let activeHistoryBestCategory = 'plus_未接码';
+let historicalBestMode = false;
+let historyBestStoreId = '';
 let navProducts = [];
 let navIndex = -1;
 let productLabels = {};
@@ -75,10 +86,20 @@ function handleActionClick(event) {
     'remove-word': () => removeWord(target.dataset.word, target.dataset.type),
     'set-cat-l1': () => setCatL1(target.dataset.category),
     'set-cat-l2': () => setCatL2(target.dataset.category),
+    'set-cat-all': () => setAllCategories(),
     'switch-store': () => switchStore(target.dataset.storeId),
-    'go-best-price': () => goToBestPrice(target.dataset.storeId, target.dataset.category),
+    'go-best-price': () => goToBestPrice(target.dataset.storeId, target.dataset.category, target.dataset.productId),
+    'history-cat': () => selectHistoryBestCategory(target.dataset.category),
+    'open-history-best': () => openHistoricalBestView(),
+    'open-history-store': () => openHistoricalBestForStore(target.dataset.storeId),
+    'open-history-global': () => openHistoricalBestGlobal(),
+    'toggle-history-cat': () => toggleHistoryBestCategory(target.dataset.category),
+    'exit-history-best': () => exitHistoricalBestView(),
     'delete-store': () => deleteStore(target.dataset.storeId),
     'toggle-no-stock': () => toggleNoStock(target.dataset.storeId),
+    'hide-store': () => hideStore(target.dataset.storeId),
+    'copy-store-link': () => copyStoreLink(target.dataset.storeUrl),
+    'restore-store': () => restoreStore(target.dataset.storeId),
     'refresh-store': () => refreshStore(target.dataset.storeId),
     'edit-label': () => editLabel(
       target.dataset.productKey,
@@ -97,6 +118,7 @@ function handleActionClick(event) {
       target.dataset.productName,
       target.dataset.previousCategory,
     ),
+    'delete-category-definition': () => deleteCategoryDefinition(target.dataset.category),
   };
 
   handlers[action]?.();
@@ -117,6 +139,8 @@ function handleActionChange(event) {
       target.dataset.previousCategory,
       target,
     ),
+    'category-parent': () => moveCategoryDefinition(target.dataset.category, target.value),
+    'category-visibility': () => toggleCatVisibility(target.dataset.category, target.checked),
     'price-number': () => onPriceInputNum(target, target.dataset.bound),
   };
 
@@ -144,6 +168,12 @@ function handleActionDrag(event) {
     if (event.type === 'drop') dropStore(event, target.dataset.id);
     if (event.type === 'dragend') dragEnd();
   }
+  if (target.dataset.dragType === 'history-category') {
+    if (event.type === 'dragstart') historyCatDragStart(event, target.dataset.category);
+    if (event.type === 'dragover') historyCatDragOver(event);
+    if (event.type === 'drop') historyCatDrop(event, target.dataset.category);
+    if (event.type === 'dragend') historyCatDragEnd();
+  }
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -156,6 +186,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.addEventListener(type, handleActionDrag);
   });
   filterConfig = await (await apiFetch('/api/filter-config')).json();
+  syncCategoryDefinitions();
+  hiddenStoreIds = Array.isArray(filterConfig.hiddenStoreIds) ? filterConfig.hiddenStoreIds : [];
   suggestedKeywords = filterConfig.suggestedKeywords || ['GPT', 'Plus', 'Pro', 'Team', '接码', '直充', '成品', '账号', 'Claude', 'Gemini', 'OpenAI', 'SMS', '谷歌', '微软', '邮箱', 'API', '订阅', '会员', 'Access'];
   keywordUsage = filterConfig.keywordUsage || {};
   refreshConfig = await (await apiFetch('/api/refresh-config')).json();
@@ -193,6 +225,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupSearch('excludeInput', 'excludeChips', 'excludeWords', 'exclude');
   renderSuggestedKeys();
   initSettings();
+  setupStoreScrollTracking();
 });
 
 function setupSearch(inputId, chipsId, wordsVar, type) {
@@ -276,6 +309,7 @@ function initSettings() {
   document.getElementById('storeListExportBtn').addEventListener('click', () => downloadBlob('/api/stores/export-list', 'stores-list.json'));
   document.getElementById('storeListImportBtn').addEventListener('click', () => document.getElementById('storeListImportFile').click());
   document.getElementById('storeListImportFile').addEventListener('change', importStoreList);
+  document.getElementById('aiClassifyBtn').addEventListener('click', runAiClassification);
   document.getElementById('historyExportAllBtn').addEventListener('click', () => downloadBlob('/api/history/export', 'all-history.json'));
   document.getElementById('historyImportAllBtn').addEventListener('click', () => document.getElementById('historyImportAllFile').click());
   document.getElementById('historyImportAllFile').addEventListener('change', importAllHistoryFile);
@@ -283,6 +317,9 @@ function initSettings() {
   document.getElementById('storeHistoryImportBtn').addEventListener('click', () => document.getElementById('storeHistoryImportFile').click());
   document.getElementById('storeHistoryImportFile').addEventListener('change', importStoreHistoryFile);
   document.getElementById('labelManagerRefreshBtn').addEventListener('click', loadLabelManager);
+  document.getElementById('categoryManagerAdd').addEventListener('click', addCategoryDefinition);
+  document.getElementById('categoryManagerFilter').addEventListener('change', renderCategoryManager);
+  document.getElementById('categoryManagerSearch').addEventListener('input', renderCategoryManager);
   document.querySelectorAll('.settings-option').forEach(el => {
     el.addEventListener('click', () => switchSettingsOption(el.dataset.option));
   });
@@ -301,7 +338,13 @@ function openSettings() {
   document.getElementById('refreshSaveMsg').textContent = '';
   document.getElementById('keywordsTextarea').value = (filterConfig.suggestedKeywords || suggestedKeywords).join('\n');
   document.getElementById('keywordsSaveMsg').textContent = '';
+  const ai = filterConfig.aiClassify || {};
+  document.getElementById('aiClassifyUrl').value = ai.url || '';
+  document.getElementById('aiClassifyKey').value = ai.key || '';
+  document.getElementById('aiClassifyModel').value = ai.model || 'gpt-4o-mini';
+  document.getElementById('aiClassifyMsg').textContent = '';
   renderCatVisibility();
+  renderCategoryManager();
   renderNextRefresh(cfg.nextRefreshAt);
   startNextRefreshTimer(cfg.nextRefreshAt);
   renderStoreExportSelect();
@@ -334,10 +377,137 @@ function startNextRefreshTimer(ts) {
   }, 1000);
 }
 
+function categoryDefinitionSeed() {
+  const entries = [];
+  for (const parent of CAT_L1) {
+    for (const child of (CAT_L2_MAP[parent] || [])) {
+      const id = categoryKey(parent, child);
+      entries.push({ id, name: CAT_LABELS[id] || child, parent, builtin: true });
+    }
+  }
+  return entries;
+}
+
+function getCategoryDefinitions() {
+  if (!Array.isArray(filterConfig.categoryDefinitions) || !filterConfig.categoryDefinitions.length) {
+    filterConfig.categoryDefinitions = categoryDefinitionSeed();
+  }
+  return filterConfig.categoryDefinitions;
+}
+
+function categoryDefinitionsForParent(parent) {
+  return getCategoryDefinitions().filter(item => item.parent === parent);
+}
+
+function syncCategoryDefinitions() {
+  const definitions = getCategoryDefinitions();
+  for (const item of definitions) {
+    CAT_LABELS[item.id] = item.name;
+  }
+  for (const parent of CAT_L1) {
+    const custom = definitions.filter(item => item.parent === parent).map(item => item.name);
+    if (custom.length) CAT_L2_MAP[parent] = custom;
+  }
+}
+
+async function persistCategoryDefinitions() {
+  filterConfig.categoryDefinitions = getCategoryDefinitions();
+  await apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
+  syncCategoryDefinitions();
+  markDirty();
+  render();
+  renderCatVisibility();
+  renderCategoryManager();
+}
+
+function renderCategoryManager() {
+  const parentSelect = document.getElementById('categoryManagerParent');
+  const list = document.getElementById('categoryManagerList');
+  if (!parentSelect || !list || typeof CAT_L1 === 'undefined') return;
+  parentSelect.innerHTML = CAT_L1.map(parent => `<option value="${escapeHtml(parent)}">${escapeHtml(CAT_L1_LABELS[parent] || parent)}</option>`).join('');
+  const definitions = getCategoryDefinitions();
+  const managerFilter = document.getElementById('categoryManagerFilter');
+  const selectedParent = managerFilter?.value || '';
+  if (managerFilter) {
+    managerFilter.innerHTML = '<option value="">全部一级分类</option>' + CAT_L1.map(parent => `<option value="${escapeHtml(parent)}">${escapeHtml(CAT_L1_LABELS[parent] || parent)}</option>`).join('');
+    managerFilter.value = CAT_L1.includes(selectedParent) ? selectedParent : '';
+  }
+  const search = String(document.getElementById('categoryManagerSearch')?.value || '').trim().toLowerCase();
+  const catFilter = document.getElementById('labelCatFilter');
+  if (catFilter) {
+    const selected = catFilter.value;
+    catFilter.innerHTML = '<option value="">全部分类</option>' + definitions.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(categoryDisplayLabel(item.id))}</option>`).join('');
+    catFilter.value = definitions.some(item => item.id === selected) ? selected : '';
+  }
+  const hidden = filterConfig.hiddenCategories || [];
+  const order = categoryOrderWithDefinitions();
+  const visibleDefinitions = order.map(id => definitions.find(item => item.id === id)).filter(Boolean)
+    .filter(item => !selectedParent || item.parent === selectedParent)
+    .filter(item => !search || `${item.name} ${categoryDisplayLabel(item.id)}`.toLowerCase().includes(search));
+  list.innerHTML = visibleDefinitions.map(item => {
+    const parentOptions = CAT_L1.map(parent => `<option value="${escapeHtml(parent)}" ${parent === item.parent ? 'selected' : ''}>${escapeHtml(CAT_L1_LABELS[parent] || parent)}</option>`).join('');
+    return `<div class="category-manager-row"><span title="${escapeHtml(item.id)}">${escapeHtml(categoryDisplayLabel(item.id))}</span><select data-change-action="category-parent" data-category="${escapeHtml(item.id)}">${parentOptions}</select><button type="button" data-action="delete-category-definition" data-category="${escapeHtml(item.id)}" title="删除分类">删除</button></div>`;
+  }).join('') || '<div style="padding:12px;color:var(--text3);text-align:center">暂无二级分类</div>';
+  list.querySelectorAll('.category-manager-row').forEach(row => {
+    const category = row.querySelector('[data-category]')?.dataset.category;
+    if (!category) return;
+    row.setAttribute('draggable', 'true');
+    row.dataset.dragType = 'category';
+    row.dataset.cat = category;
+    row.insertAdjacentHTML('afterbegin', '<span class="category-manager-drag" title="拖动调整顺序">☷</span>');
+    row.insertAdjacentHTML('beforeend', `<label class="category-manager-visible"><input type="checkbox" ${hidden.includes(category) ? '' : 'checked'} data-change-action="category-visibility" data-category="${escapeHtml(category)}">显示</label>`);
+  });
+}
+
+async function addCategoryDefinition() {
+  const parent = document.getElementById('categoryManagerParent')?.value;
+  const input = document.getElementById('categoryManagerName');
+  const name = String(input?.value || '').trim();
+  const msg = document.getElementById('categoryManagerMsg');
+  if (!parent || !name) { if (msg) msg.textContent = '请输入分类名称'; return; }
+  const definitions = getCategoryDefinitions();
+  if (definitions.some(item => item.parent === parent && item.name === name)) { if (msg) msg.textContent = '该一级分类下已存在同名分类'; return; }
+  const id = `custom_${Date.now().toString(36)}`;
+  definitions.push({ id, name, parent, builtin: false });
+  input.value = '';
+  if (msg) msg.textContent = '已添加';
+  await persistCategoryDefinitions();
+}
+
+async function moveCategoryDefinition(category, parent) {
+  const item = getCategoryDefinitions().find(entry => entry.id === category);
+  if (!item || !CAT_L1.includes(parent) || item.parent === parent) return;
+  const oldParent = item.parent;
+  item.parent = parent;
+  const changed = Object.values(productLabels).filter(label => label.category === category);
+  for (const label of changed) {
+    await saveLabelFromSettings(label.product_key, label.name, category, category);
+  }
+  const msg = document.getElementById('categoryManagerMsg');
+  if (msg) msg.textContent = `已将“${item.name}”从${oldParent}调整到${parent}`;
+  await persistCategoryDefinitions();
+}
+
+async function deleteCategoryDefinition(category) {
+  const item = getCategoryDefinitions().find(entry => entry.id === category);
+  if (!item) return;
+  if (!confirm(`确定删除二级分类“${item.name}”？使用中的商品将归入其他`)) return;
+  const definitions = getCategoryDefinitions();
+  filterConfig.categoryDefinitions = definitions.filter(entry => entry.id !== category);
+  const changed = Object.values(productLabels).filter(label => label.category === category);
+  for (const label of changed) {
+    await saveLabelFromSettings(label.product_key, label.name, '其他', category);
+  }
+  const hidden = filterConfig.hiddenCategories || [];
+  filterConfig.hiddenCategories = hidden.filter(key => key !== category);
+  await persistCategoryDefinitions();
+}
+
 function renderCatVisibility() {
   const hidden = filterConfig.hiddenCategories || [];
-  const order = filterConfig.categoryOrder || Object.keys(CAT_LABELS);
+  const order = categoryOrderWithDefinitions();
   const container = document.getElementById('catVisibility');
+  if (!container) return;
   container.innerHTML = order.filter(k => CAT_LABELS[k]).map((k, i) =>
     `<div class="cat-vis-row" draggable="true" data-drag-type="category" data-cat="${escapeHtml(k)}">
       <span class="cat-drag-handle">⠿</span>
@@ -349,21 +519,27 @@ function renderCatVisibility() {
   ).join('');
 }
 
+function categoryOrderWithDefinitions() {
+  const configured = Array.isArray(filterConfig.categoryOrder) ? [...filterConfig.categoryOrder] : Object.keys(CAT_LABELS);
+  for (const item of getCategoryDefinitions()) if (!configured.includes(item.id)) configured.push(item.id);
+  return configured;
+}
+
 let _catDragKey = null;
-function catDragStart(e, k) { _catDragKey = k; e.dataTransfer.effectAllowed = 'move'; e.target.classList.add('dragging'); }
+function catDragStart(e, k) { _catDragKey = k; e.dataTransfer.effectAllowed = 'move'; e.target.closest('[data-drag-type]')?.classList.add('dragging'); }
 function catDragOver(e) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }
-function catDragEnd() { document.querySelectorAll('.cat-vis-row.dragging').forEach(el => el.classList.remove('dragging')); _catDragKey = null; }
+function catDragEnd() { document.querySelectorAll('.cat-vis-row.dragging, .category-manager-row.dragging').forEach(el => el.classList.remove('dragging')); _catDragKey = null; }
 function catDrop(e, targetKey) {
   e.preventDefault();
   if (!_catDragKey || _catDragKey === targetKey) return;
-  const order = filterConfig.categoryOrder || Object.keys(CAT_LABELS);
+  const order = categoryOrderWithDefinitions();
   const from = order.indexOf(_catDragKey);
   const to = order.indexOf(targetKey);
   if (from === -1 || to === -1) return;
   order.splice(from, 1);
   order.splice(to, 0, _catDragKey);
   filterConfig.categoryOrder = order;
-  renderCatVisibility();
+  renderCategoryManager();
   apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
   markDirty();
   render();
@@ -374,6 +550,9 @@ function toggleCatVisibility(k, show) {
   if (show) filterConfig.hiddenCategories = filterConfig.hiddenCategories.filter(c => c !== k);
   else if (!filterConfig.hiddenCategories.includes(k)) filterConfig.hiddenCategories.push(k);
   apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
+  markDirty();
+  render();
+  renderCategoryManager();
 }
 
 function closeSettings() {
@@ -458,27 +637,41 @@ async function importStoreList(e) {
     const list = JSON.parse(text);
     if (!Array.isArray(list)) throw new Error('数据格式错误，应为店铺数组');
     let added = 0, skipped = 0;
-    const existing = storeSummaries.map(s => s.id);
+    const existing = new Set(storeSummaries.map(s => s.id));
+    const importedIds = [];
     for (const item of list) {
       if (!item.url || !item.url.startsWith('http')) { skipped++; continue; }
-      if (existing.includes(item.id)) { skipped++; continue; }
+      if (item.id && existing.has(item.id)) { skipped++; continue; }
       try {
-        await apiFetch('/api/stores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: item.url }) });
+        const response = await apiFetch('/api/stores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: item.url }) });
+        const created = await response.json();
+        if (created.id) importedIds.push(created.id);
         added++;
       } catch { skipped++; }
     }
     msg.textContent = `✓ 导入完成: 新增 ${added} 个，跳过 ${skipped} 个`;
     msg.style.color = '#43a047';
     e.target.value = '';
-    storeSummaries = await (await apiFetch('/api/stores/summary')).json();
-    stores = await (await apiFetch('/api/stores')).json();
-    markDirty();
-    render();
-    renderStoreList();
+    await waitForImportedStores(importedIds, msg, skipped);
   } catch (err) {
     msg.textContent = '导入失败: ' + err.message;
     msg.style.color = '#e53935';
   }
+}
+
+async function waitForImportedStores(ids, msg, skipped) {
+  for (let attempt = 0; attempt < 30; attempt++) {
+    storeSummaries = await (await apiFetch('/api/stores/summary')).json();
+    stores = await (await apiFetch('/api/stores')).json();
+    markDirty();
+    render();
+    const pending = ids.some(id => storeSummaries.find(store => store.id === id)?.status === 'pending');
+    if (!pending) break;
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+  const ok = ids.filter(id => storeSummaries.find(store => store.id === id)?.status === 'ok').length;
+  msg.textContent = `导入完成：新增 ${ids.length} 家，已完成 ${ok} 家，跳过 ${skipped} 家`;
+  msg.style.color = '#43a047';
 }
 
 async function importSingleStoreFile(e) {
@@ -530,6 +723,43 @@ async function saveKeywords() {
   } catch (e) {
     msg.textContent = '保存失败';
     msg.style.color = '#e53935';
+  }
+}
+
+async function runAiClassification() {
+  const url = document.getElementById('aiClassifyUrl').value.trim();
+  const key = document.getElementById('aiClassifyKey').value.trim();
+  const model = document.getElementById('aiClassifyModel').value.trim() || 'gpt-4o-mini';
+  const msg = document.getElementById('aiClassifyMsg');
+  const button = document.getElementById('aiClassifyBtn');
+  if (!url || !key) { msg.textContent = '请填写接口 URL 和 API Key'; return; }
+  const products = getAllProducts().map(product => ({ productKey: product.productKey, name: product.name, category: product.category }));
+  const categories = Object.keys(CAT_LABELS);
+  button.disabled = true;
+  msg.textContent = `正在请求大模型分类（${products.length} 件）...`;
+  try {
+    filterConfig.aiClassify = { url, key, model };
+    await apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) });
+    const response = await apiFetch('/api/ai-classify', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url, key, model, products, categories }) });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '分类请求失败');
+    let saved = 0;
+    for (const item of result.items || []) {
+      const product = products.find(candidate => candidate.productKey === item.productKey);
+      if (!product) continue;
+      const labelResponse = await apiFetch(`/api/product-labels/${encodeURIComponent(item.productKey)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ category: item.category, name: product.name, previousCategory: product.category }) });
+      if (labelResponse.ok) {
+        productLabels[item.productKey] = { product_key: item.productKey, name: product.name, category: item.category, confidence: 1, manual: 1 };
+        saved++;
+      }
+    }
+    markDirty();
+    render();
+    msg.textContent = `分类完成，已保存 ${saved} 件商品`;
+  } catch (error) {
+    msg.textContent = `分类失败：${error.message}`;
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -665,6 +895,7 @@ async function loadStoreSummaries() {
   storeSummaries = await (await apiFetch('/api/stores/summary')).json();
   renderStoreList();
   renderBestPrices();
+  renderHistoricalBestPrices();
   renderPriceRange();
   if (!stores.length) {
     document.getElementById('storesContainer').innerHTML = '<div class="empty-state">请添加店铺开始监控</div>';
@@ -684,11 +915,6 @@ async function loadStoreWithProducts(storeId) {
   markDirty();
 }
 
-function needsAutoRefresh(lastUpdated) {
-  if (!lastUpdated) return true;
-  return Date.now() - new Date(lastUpdated).getTime() > 10 * 60 * 1000;
-}
-
 function categorize(name) {
   for (const [cat, patterns] of Object.entries(filterConfig.filterPatterns || {})) {
     for (const p of patterns) {
@@ -705,6 +931,14 @@ function matchesSearch(name) {
   return true;
 }
 
+function resolveProductCategory(name, labelCategory) {
+  const category = labelCategory || categorize(name);
+  // Explicit free-account wording is stronger than a stale Plus subcategory label.
+  if (/free\s*号|free\s*账号|普号|普通号|白号/i.test(String(name)) && /^plus_/.test(category)) return 'gpt_free';
+  if (!labelCategory && /\bk12\b/i.test(String(name))) return 'gptk12';
+  return category;
+}
+
 function getAllProducts() {
   if (!productsDirty) return cachedProducts;
   const all = [];
@@ -712,7 +946,7 @@ function getAllProducts() {
     for (const p of (s.products || [])) {
       const pk = `${s.id}:${p.id}`;
       const label = productLabels[pk];
-      const cat = label ? label.category : categorize(p.name);
+      const cat = resolveProductCategory(p.name, label ? label.category : '');
       const conf = label ? label.confidence : 0;
       all.push({ ...p, category: cat, confidence: conf, productKey: pk, storeName: s.name, storeId: s.id });
     }
@@ -739,8 +973,7 @@ function applyStoreOrder() {
 }
 
 function getFilteredProducts() {
-  let all = getAllProducts();
-  if (activeStoreId !== 'all') all = all.filter(p => p.storeId === activeStoreId);
+  let all = getAllProducts().filter(p => !isStoreHidden(p.storeId));
   if (activeCatL2) {
     all = all.filter(p => p.category === activeCatL2);
   } else if (activeCatL1) {
@@ -756,7 +989,7 @@ function getFilteredProducts() {
 
 function computeBestPrices() {
   const cats = ['gpt_plus', 'gpt_pro', 'gpt_team', 'sms'];
-  const all = (includeWords.length || excludeWords.length) ? getFilteredProducts() : getAllProducts();
+  const all = (includeWords.length || excludeWords.length) ? getFilteredProducts() : getAllProducts().filter(p => !isStoreHidden(p.storeId));
   const result = {};
   for (const cat of cats) {
     const items = all.filter(p => p.category === cat && p.price > 0);
@@ -799,11 +1032,11 @@ const CAT_LABELS = {
 
 function visibleCatEntries() {
   const hidden = filterConfig.hiddenCategories || [];
-  const order = filterConfig.categoryOrder || Object.keys(CAT_LABELS);
-  return order.filter(k => !hidden.includes(k) && CAT_LABELS[k]).map(k => [k, CAT_LABELS[k]]);
+  const order = categoryOrderWithDefinitions();
+  return order.filter(k => !hidden.includes(k) && CAT_LABELS[k]).map(k => [k, categoryDisplayLabel(k)]);
 }
 
-const CAT_L1_DISPLAY = ['gpt', 'claude', 'gemini', 'grok', '邮箱', '接码', '中转', '其他'];
+const CAT_L1_DISPLAY = ['gpt', 'claude', 'gemini', 'grok', 'ai_platform', '邮箱', '接码', '中转', '其他'];
 
 const CAT_L1_LABELS = {
   gpt: 'GPT', claude: 'Claude', gemini: 'Gemini', grok: 'Grok',
@@ -859,8 +1092,16 @@ function catL2Label(l1, l2) {
   return CAT_L2_LABELS[l2] || l2;
 }
 
+function categoryDisplayLabel(full) {
+  const configured = Array.isArray(filterConfig.categoryDefinitions)
+    ? filterConfig.categoryDefinitions.find(item => item.id === full)
+    : null;
+  const l2 = configured ? configured.name : catL2FromFull(full);
+  return CAT_L2_LABELS[l2] || CAT_LABELS[full] || l2 || full;
+}
+
 function renderCatBar() {
-  const all = getAllProducts();
+  const all = getAllProducts().filter(product => !isStoreHidden(product.storeId));
   const counts = {};
   const l1Counts = {};
   for (const p of all) {
@@ -873,21 +1114,23 @@ function renderCatBar() {
   const bar = document.getElementById('catBar');
 
   // Row 1: Display Level 1 (7 major categories)
-  const l1Buttons = CAT_L1_DISPLAY.map(l1 =>
-    l1Counts[l1] ? `<button class="cat-btn ${activeCatL1 === l1 && !activeCatL2 ? 'active' : ''}" data-action="set-cat-l1" data-category="${escapeHtml(l1)}">${CAT_L1_LABELS[l1]||l1} <span class="cat-cnt">${l1Counts[l1]}</span></button>` : ''
-  ).filter(Boolean).join('');
+  const allButton = `<button class="cat-btn ${!activeCatL1 && !activeCatL2 ? 'active' : ''}" data-action="set-cat-all">全部 <span class="cat-cnt">${all.length}</span></button>`;
+  const l1Buttons = [allButton, ...CAT_L1_DISPLAY.map(l1 =>
+    l1Counts[l1] ? `<button class="cat-btn ${activeCatL1 === l1 ? 'active' : ''} ${activeCatL1 === l1 && activeCatL2 ? 'has-sub-selection' : ''}" data-action="set-cat-l1" data-category="${escapeHtml(l1)}">${CAT_L1_LABELS[l1]||l1} <span class="cat-cnt">${l1Counts[l1]}</span></button>` : ''
+  )].filter(Boolean).join('');
 
   // Row 2: Level 2 subcategories (visible only when L1 is selected)
   let l2Buttons = '';
   if (activeCatL1) {
-    const subs = new Set();
-    for (const p of all) {
-      if (catL1Display(catL1FromFull(p.category)) === activeCatL1) subs.add(p.category);
-    }
-    const sorted = [...subs].sort((a, b) => (counts[b]||0) - (counts[a]||0));
+    const hidden = new Set(filterConfig.hiddenCategories || []);
+    const definitions = getCategoryDefinitions();
+    const configuredIds = categoryOrderWithDefinitions().filter(id => !hidden.has(id));
+    const sorted = configuredIds.filter(full => {
+      const definition = definitions.find(item => item.id === full);
+      return definition && catL1Display(definition.parent) === activeCatL1;
+    });
     l2Buttons = sorted.map(full => {
-      const l2 = catL2FromFull(full);
-      return `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" data-action="set-cat-l2" data-category="${escapeHtml(full)}">${catL2Label(activeCatL1, l2)} <span class="cat-cnt">${counts[full]||0}</span></button>`;
+      return `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" data-action="set-cat-l2" data-category="${escapeHtml(full)}">${escapeHtml(categoryDisplayLabel(full))} <span class="cat-cnt">${counts[full]||0}</span></button>`;
     }).join('');
   }
 
@@ -896,6 +1139,8 @@ function renderCatBar() {
 }
 
 function setCatL1(l1) {
+  historicalBestMode = false;
+  historyBestStoreId = '';
   activeCatL1 = l1;
   activeCatL2 = '';
   activeCategory = '';
@@ -904,7 +1149,20 @@ function setCatL1(l1) {
   render();
 }
 
+function setAllCategories() {
+  historicalBestMode = false;
+  historyBestStoreId = '';
+  activeCatL1 = '';
+  activeCatL2 = '';
+  activeCategory = '';
+  renderLimit = 30;
+  priceRange = { min: 0, max: 0 };
+  render();
+}
+
 function setCatL2(full) {
+  historicalBestMode = false;
+  historyBestStoreId = '';
   activeCatL2 = full;
   activeCategory = full;
   renderLimit = 30;
@@ -934,8 +1192,16 @@ function render() {
   }
   renderStoreList();
   renderBestPrices();
+  renderHistoricalBestPrices();
   renderPriceRange();
-  renderCatBar();
+  if (historicalBestMode) renderHistoryBestControls();
+  else renderCatBar();
+  const historyMain = document.getElementById('historicalBestMain');
+  const storesHost = document.getElementById('storesContainer');
+  if (historyMain && storesHost) {
+    historyMain.hidden = !historicalBestMode;
+    storesHost.hidden = historicalBestMode;
+  }
   document.querySelectorAll('.cat-bar-row').forEach(makeDragScroll);
   renderStores();
   if (anchor) {
@@ -981,45 +1247,119 @@ function makeDragScroll(el) {
 
 let dragId = null;
 
+function isStoreHidden(storeId) {
+  return hiddenStoreIds.includes(storeId);
+}
+
+function visibleStoreSummaries() {
+  return storeSummaries.filter(summary => !isStoreHidden(summary.id));
+}
+
+function browseStoreIsActive(storeId) {
+  return activeBrowseStoreId === storeId;
+}
+
 function renderStoreList() {
   const container = document.getElementById('storeList');
-  const ok = storeSummaries.filter(s => s.status === 'ok');
-  const error = storeSummaries.filter(s => s.status === 'error');
-  const pend = storeSummaries.filter(s => s.status === 'pending');
-  const total = storeSummaries.reduce((s, st) => s + (st.productCount || 0), 0);
+  const visible = visibleStoreSummaries();
+  const ok = visible.filter(s => s.status === 'ok');
+  const error = visible.filter(s => s.status === 'error');
+  const pend = visible.filter(s => s.status === 'pending');
+  const total = visible.reduce((s, st) => s + (st.productCount || 0), 0);
 
-  container.innerHTML = `<button class="store-btn store-btn-all ${activeStoreId === 'all' ? 'active' : ''}" data-action="switch-store" data-store-id="all"><span class="sb-name">全部</span> <span class="badge">${total}</span></button>
+  container.innerHTML = `<button class="store-btn store-btn-all ${!activeBrowseStoreId ? 'active' : ''}" data-action="switch-store" data-store-id="all"><span class="sb-name">顶部</span> <span class="badge">${total}</span></button>
   ${ok.map(s => {
     const sid = escapeHtml(s.id);
     const isRefreshing = refreshingStores.has(s.id);
     return `<div class="store-row${isRefreshing ? ' is-refreshing' : ''}" draggable="true" data-drag-type="store" data-id="${sid}">
-      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${formatTime(s.lastUpdated)}"><span class="drag-handle">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span> <span class="badge">${s.productCount||0}</span></button>
+      <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${formatTime(s.lastUpdated)}"><span class="drag-handle">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span> <span class="badge">${s.productCount||0}</span></button>
       ${isRefreshing ? '<div class="refresh-bar"><div class="refresh-bar-inner"></div></div>' : ''}
     </div>`;
   }).join('')}
   ${error.map(s => {
     const sid = escapeHtml(s.id);
     return `<div class="store-row store-row-error" data-id="${escapeHtml(s.id)}">
-      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${escapeHtml(s.error||'刷新失败')}"><span class="drag-handle" style="color:var(--danger)">⚠</span><span class="sb-name" style="color:var(--danger)">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-error">失败</span></button>
+      <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${escapeHtml(s.error||'刷新失败')}"><span class="drag-handle" style="color:var(--danger)">⚠</span><span class="sb-name" style="color:var(--danger)">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-error">失败</span></button>
     </div>`;
   }).join('')}
   ${pend.map(s => {
     const sid = escapeHtml(s.id);
     return `<div class="store-row store-row-pending" data-id="${escapeHtml(s.id)}">
-      <button class="store-btn ${activeStoreId === s.id ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="获取中..."><span class="drag-handle" style="color:var(--text3);opacity:.5">⠿</span><span class="sb-name" style="opacity:.7">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-pending">获取中</span></button>
+      <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="获取中..."><span class="drag-handle" style="color:var(--text3);opacity:.5">⠿</span><span class="sb-name" style="opacity:.7">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-pending">获取中</span></button>
     </div>`;
   }).join('')}`;
   updateDashboardChrome(total, ok.length, error.length, pend.length);
 }
 
+function renderActiveStoreCard() {
+  const card = document.getElementById('activeStoreCard');
+  const meta = document.getElementById('browseStoreMeta');
+  if (card && meta) {
+    const summary = storeSummaries.find(store => store.id === activeBrowseStoreId);
+    if (!summary || isStoreHidden(summary.id)) {
+      meta.textContent = '顶部';
+      card.innerHTML = '<div class="active-store-empty">当前浏览全部店铺</div>';
+    } else {
+      meta.textContent = `${summary.productCount || 0} 个商品`;
+      card.innerHTML = `<div class="active-store-name">${escapeHtml(summary.name || summary.id)}</div>
+        <div class="active-store-meta">${summary.productCount || 0} 个商品 · ${formatTime(summary.lastUpdated)}</div>
+        <button class="active-store-hide" data-action="hide-store" data-store-id="${escapeHtml(summary.id)}">隐藏店铺</button>`;
+    }
+  }
+
+  const hiddenList = document.getElementById('hiddenStoreList');
+  if (!hiddenList) return;
+  const hidden = storeSummaries.filter(store => isStoreHidden(store.id));
+  hiddenList.innerHTML = hidden.length
+    ? hidden.map(store => `<div class="hidden-store-item"><span title="${escapeHtml(store.name || store.id)}">${escapeHtml(store.name || store.id)}</span><button data-action="restore-store" data-store-id="${escapeHtml(store.id)}">恢复</button></div>`).join('')
+    : '<div class="hidden-store-empty">暂无隐藏店铺</div>';
+}
+
+function persistHiddenStores() {
+  filterConfig.hiddenStoreIds = [...hiddenStoreIds];
+  apiFetch('/api/filter-config', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(filterConfig),
+  }).catch(error => console.error('保存隐藏店铺失败:', error.message));
+}
+
+function showToast(message) {
+  let toast = document.getElementById('appToast');
+  if (!toast) {
+    toast = document.createElement('div');
+    toast.id = 'appToast';
+    toast.className = 'app-toast';
+    document.body.appendChild(toast);
+  }
+  toast.textContent = message;
+  toast.classList.add('visible');
+  clearTimeout(showToast.timer);
+  showToast.timer = setTimeout(() => toast.classList.remove('visible'), 3600);
+}
+
+function hideStore(storeId) {
+  if (isStoreHidden(storeId)) return;
+  hiddenStoreIds.push(storeId);
+  if (activeBrowseStoreId === storeId) activeBrowseStoreId = '';
+  persistHiddenStores();
+  render();
+  showToast('店铺已隐藏，可在右侧“隐藏店铺”中找回');
+}
+
+function restoreStore(storeId) {
+  hiddenStoreIds = hiddenStoreIds.filter(id => id !== storeId);
+  persistHiddenStores();
+  render();
+  showToast('店铺已恢复显示');
+}
+
 function updateDashboardChrome(totalProducts, healthyCount, errorCount, pendingCount) {
-  const activeStore = activeStoreId === 'all' ? null : storeSummaries.find(s => s.id === activeStoreId);
-  const title = activeStore ? (activeStore.name || activeStore.id) : '全部商品';
-  const viewCount = activeStore ? (activeStore.productCount || 0) : totalProducts;
-  document.getElementById('headerStoreCount').textContent = storeSummaries.length;
+  const activeStore = storeSummaries.find(s => s.id === activeBrowseStoreId);
+  const visible = visibleStoreSummaries();
+  document.getElementById('headerStoreCount').textContent = visible.length;
   document.getElementById('headerProductCount').textContent = totalProducts;
-  document.getElementById('activeViewTitle').textContent = title;
-  document.getElementById('activeViewMeta').textContent = `${viewCount} 个商品`;
+  renderActiveStoreCard();
 
   const healthText = document.getElementById('headerHealthText');
   const healthDot = document.querySelector('.health-dot');
@@ -1070,44 +1410,184 @@ function dragEnd() {
   dragId = null;
 }
 
-async function switchStore(storeId) {
-  if (storeId === activeStoreId) return;
-  activeStoreId = storeId;
-  priceRange = { min: 0, max: 0 };
-  document.querySelectorAll('.store-btn').forEach(b => b.classList.remove('active'));
-  document.querySelectorAll('.store-btn').forEach(b => {
-    if (b.dataset.storeId === storeId) b.classList.add('active');
-  });
-
-  const area = document.getElementById('storesContainer');
-  area.style.opacity = '0'; area.style.transform = 'translateX(20px)';
-
-  if (storeId === 'all') {
-    await loadStoreWithProducts('all');
-  } else {
-    const summary = storeSummaries.find(s => s.id === storeId);
-    const existing = stores.find(s => s.id === storeId);
-    const isError = summary?.status === 'error';
-    const isPending = summary?.status === 'pending';
-    if (isError || isPending || !existing || needsAutoRefresh(summary?.lastUpdated)) {
-      if ((isError || isPending) && existing) {
-        renderStores();
+function setupStoreScrollTracking() {
+  const container = document.getElementById('storesContainer');
+  if (!container) return;
+  let frame = 0;
+  let previousScrollTop = container.scrollTop;
+  const expandPreviousStores = () => {
+    if (storeWindowStart <= 0 || storeWindowBusy) return false;
+    storeWindowBusy = true;
+    const anchor = container.querySelector('.store-card[data-store-id]');
+    const host = container.getBoundingClientRect();
+    const anchorId = anchor?.dataset.storeId;
+    const anchorOffset = anchor ? anchor.getBoundingClientRect().top - host.top : 0;
+    storeWindowStart = Math.max(0, storeWindowStart - 4);
+    renderStores();
+    requestAnimationFrame(() => {
+      const nextAnchor = anchorId
+        ? container.querySelector(`.store-card[data-store-id="${CSS.escape(anchorId)}"]`)
+        : null;
+      if (!nextAnchor) {
+        storeWindowBusy = false;
+        return;
       }
-      await refreshStore(storeId, true);
+      const nextHost = container.getBoundingClientRect();
+      container.scrollTop += nextAnchor.getBoundingClientRect().top - nextHost.top - anchorOffset;
+      requestAnimationFrame(() => { storeWindowBusy = false; });
+    });
+    return true;
+  };
+  const update = () => {
+    frame = 0;
+    if (storeWindowBusy) return;
+    const currentScrollTop = container.scrollTop;
+    const scrollingUp = currentScrollTop < previousScrollTop;
+    previousScrollTop = currentScrollTop;
+    const atTop = container.scrollTop <= 4;
+    const cards = [...container.querySelectorAll('.store-card[data-store-id]')];
+    if (!cards.length) return;
+    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 180) {
+      const max = visibleStoreSummaries().length - 1;
+      if (storeWindowEnd < max) {
+        storeWindowBusy = true;
+        storeWindowEnd = Math.min(max, storeWindowEnd + 4);
+        renderStores();
+        requestAnimationFrame(() => requestAnimationFrame(() => { storeWindowBusy = false; }));
+      }
+    } else if ((scrollingUp || atTop) && container.scrollTop <= 120 && storeWindowStart > 0) {
+      expandPreviousStores();
     }
-    if (!stores.find(s => s.id === storeId)) {
-      await loadStoreWithProducts(storeId);
+    if (atTop) {
+      if (activeBrowseStoreId) {
+        activeBrowseStoreId = '';
+        renderStoreList();
+        renderActiveStoreCard();
+      }
+      return;
     }
-  }
+    const host = container.getBoundingClientRect();
+    if (scrollingUp && storeWindowStart > 0) {
+      const firstRect = cards[0].getBoundingClientRect();
+      if (firstRect.top >= host.top - 20) expandPreviousStores();
+    }
+    const visible = cards.filter(card => {
+      const rect = card.getBoundingClientRect();
+      return rect.bottom > host.top + 12 && rect.top < host.bottom - 12;
+    });
+    if (!visible.length) return;
+    const current = visible.reduce((best, card) => {
+      const distance = Math.abs(card.getBoundingClientRect().top - host.top - 12);
+      return distance < best.distance ? { card, distance } : best;
+    }, { card: visible[0], distance: Infinity }).card;
+    const nextId = current.dataset.storeId || '';
+    if (nextId !== activeBrowseStoreId) {
+      activeBrowseStoreId = nextId;
+      renderStoreList();
+      renderActiveStoreCard();
+    }
+  };
+  container.addEventListener('scroll', () => {
+    if (!frame) frame = requestAnimationFrame(update);
+  }, { passive: true });
+  container.addEventListener('wheel', event => {
+    if (storeWindowBusy) {
+      event.preventDefault();
+      return;
+    }
+    if (event.deltaY < 0 && container.scrollTop <= 160 && storeWindowStart > 0) {
+      const first = container.querySelector('.store-card[data-store-id]');
+      const host = container.getBoundingClientRect();
+      if (!first || first.getBoundingClientRect().top >= host.top - 20) expandPreviousStores();
+    }
+  }, { passive: true });
+  requestAnimationFrame(update);
+}
 
+async function switchStore(storeId) {
+  const container = document.getElementById('storesContainer');
+  if (!container) return;
+  if (historicalBestMode) {
+    historyBestStoreId = storeId === 'all' ? '' : storeId;
+    activeBrowseStoreId = historyBestStoreId;
+    renderStoreList();
+    renderHistoryBestControls();
+    renderHistoricalBestPrices();
+    return;
+  }
+  historicalBestMode = false;
+  if (storeId === 'all') {
+    activeBrowseStoreId = '';
+    storeWindowStart = 0;
+    storeWindowEnd = Math.max(4, storeWindowEnd);
+    renderStores();
+    container.scrollTo({ top: 0, behavior: 'smooth' });
+    renderStoreList();
+    renderActiveStoreCard();
+    return;
+  }
+  const summary = storeSummaries.find(s => s.id === storeId);
+  if (!summary || isStoreHidden(storeId)) return;
+  const loadedStore = stores.find(store => store.id === storeId);
+  if (!loadedStore || loadedStore.status === 'pending' || loadedStore.status === 'error') {
+    showStoreLoadingOverlay('正在加载店铺数据…');
+    try {
+      await loadStoreWithProducts(storeId);
+    } catch (error) {
+      showStoreLoadingOverlay(`加载失败：${error.message || '请稍后重试'}`, true);
+      setTimeout(() => hideStoreLoadingOverlay(), 2200);
+      return;
+    }
+    hideStoreLoadingOverlay();
+  }
+  const visibleIds = visibleStoreSummaries().map(s => s.id);
+  const targetIndex = visibleIds.indexOf(storeId);
+  if (targetIndex < 0) return;
+  storeWindowStart = Math.max(0, targetIndex - 4);
+  storeWindowEnd = Math.min(visibleIds.length - 1, targetIndex + 4);
+  renderStores();
+  let target = container.querySelector(`.store-card[data-store-id="${CSS.escape(storeId)}"]`);
+  if (!target) {
+    renderLimit = Math.max(renderLimit, getFilteredProducts().length + 1);
+    renderStores();
+    target = container.querySelector(`.store-card[data-store-id="${CSS.escape(storeId)}"]`);
+  }
+  if (!target) return;
+  const hostRect = container.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const direction = targetRect.top < hostRect.top ? 'up' : 'down';
+  activeBrowseStoreId = storeId;
+  target.classList.remove('store-target-up', 'store-target-down');
+  target.classList.add(`store-target-${direction}`);
+  setTimeout(() => target.classList.remove(`store-target-${direction}`), 500);
+  const targetTop = container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - 12;
+  container.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
   renderStoreList();
-  renderBestPrices();
-  setTimeout(() => { renderStores(); area.style.opacity = '1'; area.style.transform = 'translateX(0)'; }, 150);
+  renderActiveStoreCard();
+}
+
+function showStoreLoadingOverlay(message, failed = false) {
+  const container = document.getElementById('storesContainer');
+  if (!container) return;
+  let overlay = document.getElementById('storeLoadingOverlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'storeLoadingOverlay';
+    overlay.className = 'store-loading-overlay';
+    container.appendChild(overlay);
+  }
+  overlay.classList.toggle('failed', failed);
+  overlay.innerHTML = `<div class="store-loading-box"><span class="store-loading-spinner"></span><span>${escapeHtml(message)}</span></div>`;
+  overlay.hidden = false;
+}
+
+function hideStoreLoadingOverlay() {
+  const overlay = document.getElementById('storeLoadingOverlay');
+  if (overlay) overlay.hidden = true;
 }
 
 function renderBestPrices() {
-  let pool = getAllProducts();
-  if (activeStoreId !== 'all') pool = pool.filter(p => p.storeId === activeStoreId);
+  let pool = getAllProducts().filter(p => !isStoreHidden(p.storeId));
   if (includeWords.length || excludeWords.length) pool = pool.filter(p => matchesSearch(p.name));
   document.getElementById('bestPriceList').innerHTML = visibleCatEntries().map(([k, label]) => {
     const items = pool.filter(p => p.category === k && p.price > 0 && p.stock > 0).sort((a, b) => a.price - b.price);
@@ -1115,25 +1595,206 @@ function renderBestPrices() {
     const item = items[0];
     const storeId = item.storeId;
     const catFull = item.category;
-    return `<div class="bp-item" data-action="go-best-price" data-store-id="${escapeHtml(storeId)}" data-category="${escapeHtml(catFull)}">
+    return `<div class="bp-item" data-action="go-best-price" data-store-id="${escapeHtml(storeId)}" data-category="${escapeHtml(catFull)}" data-product-id="${escapeHtml(item.id)}">
       <div class="bp-cat">${label}</div>
       <div class="bp-row"><span class="bp-price">¥${item.price.toFixed(2)}</span><span class="bp-store" title="${escapeHtml(item.storeName)}">${escapeHtml(item.storeName)}</span></div>
     </div>`;
   }).join('');
 }
 
-function goToBestPrice(storeId, category) {
+const HISTORY_BEST_CATEGORIES = [
+  ['plus_未接码', 'GPT Plus 未接码'], ['plus_已接码', 'GPT Plus 已接码'],
+  ['plus_质保', 'GPT Plus 质保'], ['gpt_free', 'GPT Free'],
+  ['gptk12', 'GPT K12'], ['gpt_team', 'GPT Team'],
+  ['claude_pro', 'Claude Pro'], ['claude_max', 'Claude MAX'],
+  ['claude_kiro', 'Claude Kiro'],
+];
+
+function visibleHistoryBestCategories() {
+  const saved = filterConfig.historyBestVisibleCategories;
+  const visible = Array.isArray(saved) ? new Set(saved) : null;
+  return historyBestCategoriesInOrder().filter(([key]) => !visible || visible.has(key));
+}
+
+function historyBestCategoriesInOrder() {
+  const known = new Map(HISTORY_BEST_CATEGORIES);
+  const order = Array.isArray(filterConfig.historyBestCategoryOrder) ? filterConfig.historyBestCategoryOrder : HISTORY_BEST_CATEGORIES.map(([key]) => key);
+  return [...new Set([...order, ...HISTORY_BEST_CATEGORIES.map(([key]) => key)])].filter(key => known.has(key)).map(key => [key, known.get(key)]);
+}
+
+function renderHistoryBestControls() {
+  const bar = document.getElementById('catBar');
+  if (!bar) return;
+  const visible = new Set(visibleHistoryBestCategories().map(([key]) => key));
+  const storeLabel = historyBestStoreId ? (storeSummaries.find(store => store.id === historyBestStoreId)?.name || '当前店铺') : '全部店铺';
+  bar.innerHTML = `<div class="history-view-toolbar"><button class="history-back-btn" data-action="exit-history-best" title="返回商品列表" aria-label="返回商品列表"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 19-7-7 7-7"></path><path d="M19 12H5"></path></svg></button><button class="history-global-btn" data-action="open-history-global">全局最低价</button><span class="history-scope-label">${escapeHtml(storeLabel)}</span></div><div class="cat-bar-row history-category-controls">${historyBestCategoriesInOrder().map(([key, label]) => `<button draggable="true" data-drag-type="history-category" data-category="${escapeHtml(key)}" class="cat-btn history-cat-toggle ${visible.has(key) ? 'active' : ''}" data-action="toggle-history-cat">${label}</button>`).join('')}</div>`;
+}
+
+let historyCatDragKey = null;
+function historyCatDragStart(event, key) { historyCatDragKey = key; event.dataTransfer.effectAllowed = 'move'; event.currentTarget.classList.add('dragging'); }
+function historyCatDragOver(event) { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; }
+function historyCatDragEnd() { document.querySelectorAll('.history-cat-toggle.dragging').forEach(el => el.classList.remove('dragging')); historyCatDragKey = null; }
+function historyCatDrop(event, targetKey) {
+  event.preventDefault();
+  if (!historyCatDragKey || historyCatDragKey === targetKey) return;
+  const order = historyBestCategoriesInOrder().map(([key]) => key);
+  const from = order.indexOf(historyCatDragKey);
+  const to = order.indexOf(targetKey);
+  if (from < 0 || to < 0) return;
+  order.splice(from, 1); order.splice(to, 0, historyCatDragKey);
+  filterConfig.historyBestCategoryOrder = order;
+  apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) }).catch(error => console.error('保存曲线顺序失败:', error.message));
+  renderHistoryBestControls();
+  renderHistoricalBestPrices();
+}
+
+function exitHistoricalBestView() {
+  const storeId = historyBestStoreId;
+  historicalBestMode = false;
+  historyBestStoreId = '';
+  render();
+  if (storeId) requestAnimationFrame(() => switchStore(storeId));
+}
+
+function toggleHistoryBestCategory(category) {
+  const visible = new Set(visibleHistoryBestCategories().map(([key]) => key));
+  if (visible.has(category)) {
+    if (visible.size <= 1) return;
+    visible.delete(category);
+  } else visible.add(category);
+  filterConfig.historyBestVisibleCategories = HISTORY_BEST_CATEGORIES.map(([key]) => key).filter(key => visible.has(key));
+  apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) }).catch(error => console.error('保存曲线显示设置失败:', error.message));
+  renderHistoryBestControls();
+  renderHistoricalBestPrices();
+}
+
+async function renderHistoricalBestPrices() {
+  const controls = document.getElementById('historyBestControls');
+  const canvas = document.getElementById('historyBestChart');
+  if (!historicalBestMode && !controls) return;
+  if (!historicalBestMode) {
+    if (historyBestChart) historyBestChart.destroy();
+    historyBestChart = null;
+    historyBestCharts.forEach(chart => chart.destroy());
+    historyBestCharts = [];
+    return;
+  }
+  if (!historyBestData) {
+    try {
+      const response = await apiFetch('/api/history/export');
+      if (!response.ok) throw new Error('暂无历史数据');
+      historyBestData = (await response.json()).priceHistory || {};
+    } catch (_) {
+      if (historyBestChart) historyBestChart.destroy();
+      historyBestChart = null;
+      if (canvas) canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+      return;
+    }
+  }
+  const products = getAllProducts().filter(product => !historyBestStoreId || product.storeId === historyBestStoreId);
+  const productMap = new Map(products.map(product => [product.productKey, product]));
+  const datasets = visibleHistoryBestCategories().map(([category, label], index) => {
+    const daily = new Map();
+    for (const [productKey, entries] of Object.entries(historyBestData)) {
+      const product = productMap.get(productKey);
+      const categoryMatches = product && (product.category === category || (category === 'claude_kiro' && product.category === 'ai_platform_kiro'));
+      if (!categoryMatches) continue;
+      for (const entry of entries || []) {
+        const price = Number(entry.price);
+        const date = new Date(entry.date);
+        const historicalStock = entry.stock === null || entry.stock === undefined ? null : Number(entry.stock);
+        // Legacy records have no stock snapshot; keep them visible instead of
+        // incorrectly filtering them using the product's current stock.
+        if (!(price > 0) || Number.isNaN(date.getTime()) || (historicalStock !== null && !(historicalStock > 0))) continue;
+        const hour = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:00`;
+        daily.set(hour, Math.min(daily.get(hour) ?? Infinity, price));
+      }
+    }
+    const colors = ['#1677ff', '#13c2c2', '#52c41a', '#faad14', '#722ed1', '#eb2f96', '#2f54eb', '#fa541c', '#08979c'];
+    return { label, daily, color: colors[index] };
+  });
+  const labels = [...new Set(datasets.flatMap(dataset => [...dataset.daily.keys()]))].sort();
+  const chartHost = document.getElementById('historyBestMainCharts');
+  if (!chartHost) return;
+  if (historyBestChart) historyBestChart.destroy();
+  historyBestCharts.forEach(chart => chart.destroy());
+  historyBestCharts = [];
+  chartHost.innerHTML = datasets.map((dataset, index) => `<div class="historical-mini-card"><div class="historical-mini-title"><span class="historical-mini-dot" style="background:${dataset.color}"></span>${dataset.label}</div><div class="historical-mini-canvas"><canvas id="historyMiniChart${index}"></canvas></div></div>`).join('');
+  const text2 = getComputedStyle(document.body).getPropertyValue('--text2');
+  const text3 = getComputedStyle(document.body).getPropertyValue('--text3');
+  historyBestCharts = datasets.map((dataset, index) => new globalThis.Chart(document.getElementById(`historyMiniChart${index}`).getContext('2d'), {
+    type: 'line',
+    data: { labels, datasets: [{ label: dataset.label, data: labels.map(day => dataset.daily.get(day) ?? null), borderColor: dataset.color, backgroundColor: dataset.color, borderWidth: 2.2, pointRadius: 0, pointHoverRadius: 4, tension: .35, spanGaps: true }] },
+    options: { responsive: true, maintainAspectRatio: false, interaction: { mode: 'index', intersect: false }, animation: { duration: 450, easing: 'easeOutQuart' }, plugins: { legend: { display: false }, tooltip: { backgroundColor: 'rgba(31, 35, 41, .92)', padding: 8, cornerRadius: 6, callbacks: { label: context => `¥${Number(context.parsed.y).toFixed(2)}` } } }, scales: { x: { display: true, grid: { display: false }, border: { display: false }, ticks: { maxTicksLimit: 8, color: text3, font: { size: 9 }, callback: (value, index) => labels[index] || '' } }, y: { beginAtZero: false, grid: { color: 'rgba(145, 158, 171, .16)' }, border: { display: false }, ticks: { color: text2, padding: 5, maxTicksLimit: 5, callback: value => `¥${Number(value).toFixed(2)}` } } } },
+  }))
+}
+
+function openHistoricalBestView() {
+  historicalBestMode = true;
+  historyBestStoreId = activeBrowseStoreId || '';
+  markDirty();
+  markDirty();
+  render();
+  renderHistoricalBestPrices();
+}
+
+function openHistoricalBestForStore(storeId) {
+  historyBestStoreId = storeId;
+  historicalBestMode = true;
+  activeBrowseStoreId = storeId;
+  markDirty();
+  render();
+  renderHistoricalBestPrices();
+}
+
+function openHistoricalBestGlobal() {
+  historyBestStoreId = '';
+  activeBrowseStoreId = '';
+  markDirty();
+  renderStoreList();
+  renderHistoryBestControls();
+  renderHistoricalBestPrices();
+}
+
+function selectHistoryBestCategory(category) {
+  activeHistoryBestCategory = category;
+  historicalBestMode = true;
   activeCatL1 = catL1FromFull(category);
   activeCatL2 = category;
   activeCategory = category;
+  render();
+  renderHistoricalBestPrices();
+}
+
+function goToBestPrice(storeId, category, productId) {
+  activeCatL1 = catL1FromFull(category);
+  activeCatL2 = category;
+  activeCategory = category;
+  // Render the focused store's nearby window completely so its product card
+  // can be located even when earlier cards consume the normal page limit.
+  renderLimit = Math.max(renderLimit, getFilteredProducts().length + 1);
+  renderCatBar();
   switchStore(storeId);
+  requestAnimationFrame(() => {
+    const container = document.getElementById('storesContainer');
+    const product = productId
+      ? container.querySelector(`.product-card[data-product-id="${CSS.escape(productId)}"]`)
+      : null;
+    if (!product) return;
+    const host = container.getBoundingClientRect();
+    const rect = product.getBoundingClientRect();
+    container.scrollTo({ top: container.scrollTop + rect.top - host.top - 60, behavior: 'smooth' });
+    product.classList.add('product-target');
+    setTimeout(() => product.classList.remove('product-target'), 900);
+  });
 }
 
 function renderStores() {
   const container = document.getElementById('storesContainer');
   const filtered = getFilteredProducts();
-  const ids = activeStoreId === 'all' ? storeSummaries.filter(s => s.status === 'ok').map(s => s.id) : [activeStoreId];
-  if (storeOrder.length && activeStoreId === 'all') ids.sort((a, b) => { const ai = storeOrder.indexOf(a); const bi = storeOrder.indexOf(b); if (ai === -1 && bi === -1) return 0; if (ai === -1) return 1; if (bi === -1) return -1; return ai - bi; });
+  const allIds = visibleStoreSummaries().map(s => s.id);
+  const ids = allIds.slice(storeWindowStart, storeWindowEnd + 1);
+  if (storeOrder.length) ids.sort((a, b) => { const ai = storeOrder.indexOf(a); const bi = storeOrder.indexOf(b); if (ai === -1 && bi === -1) return 0; if (ai === -1) return 1; if (bi === -1) return -1; return ai - bi; });
 
   if (!stores.length && !storeSummaries.length) { container.innerHTML = '<div class="empty-state">请添加店铺开始监控</div>'; return; }
   if (!stores.length && storeSummaries.length) { container.innerHTML = '<div class="empty-state">请选择店铺查看商品</div>'; return; }
@@ -1145,8 +1806,10 @@ function renderStores() {
     if (reachedLimit) return '';
     const s = stores.find(st => st.id === id);
     if (!s) return '';
-    if (s.status === 'pending') return `<div class="store-card"><div class="sc-name">${escapeHtml(s.name||s.id)}</div><div class="store-loading">正在获取商品数据...</div></div>`;
-    if (s.status === 'error') return `<div class="store-card"><div class="sc-name">${escapeHtml(s.name||s.id)}</div><div class="store-error">${escapeHtml(s.error||'获取失败')}</div><button class="del-btn" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div>`;
+    const storeLink = safeUrl(s.url);
+    const storeName = storeLink ? `<a class="sc-name sc-store-link" href="${storeLink}" target="_blank" rel="noopener noreferrer" title="打开店铺">${escapeHtml(s.name||s.id)}</a>` : `<span class="sc-name">${escapeHtml(s.name||s.id)}</span>`;
+    if (s.status === 'pending') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-loading">正在获取商品数据...</div></div>`;
+    if (s.status === 'error') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(s.error||'获取失败')}</div><div class="sc-actions"><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
 
     let products = filtered.filter(p => p.storeId === id);
     const storePrices = products.map(p => p.price).filter(v => v > 0);
@@ -1175,11 +1838,14 @@ function renderStores() {
     if (reachedLimit && !gridItems.length) return '';
     return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">
       <div class="sc-header">
-        <span class="sc-name">${escapeHtml(s.name||s.id)}</span>
+        ${storeName}
         <span class="sc-time">${formatTime(s.lastUpdated)}</span>
         <span class="sc-meta">${products.length} 个商品</span>
         <div class="sc-actions">
           <button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button>
+          <button class="history-store-btn" data-action="open-history-store" data-store-id="${escapeHtml(s.id)}" title="查看该店铺历史最低价">历史最低</button>
+          <button class="copy-store-btn" data-action="copy-store-link" data-store-url="${escapeHtml(s.url || '')}" title="复制店铺链接">复制链接</button>
+          <button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button>
           <button class="del-btn" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button>
         </div>
       </div>
@@ -1188,7 +1854,40 @@ function renderStores() {
   }).join('');
   const hasMore = cardCount >= renderLimit && filtered.length > cardCount;
   container.innerHTML = html + (hasMore ? '<div class="scroll-sentinel"></div>' : '');
+  container.querySelectorAll('.product-card').forEach(card => {
+    const mid = card.querySelector('.pc-mid');
+    const bot = card.querySelector('.pc-bot');
+    const trend = bot?.querySelector('.hist-btn');
+    const top = card.querySelector('.pc-top');
+    if (mid && bot && mid.parentElement !== bot) bot.prepend(mid);
+    if (trend && top && trend.parentElement !== top) top.appendChild(trend);
+  });
+  container.querySelectorAll('.hist-btn').forEach(button => {
+    button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>';
+    button.setAttribute('aria-label', '查看价格走势');
+    button.setAttribute('title', '查看价格走势');
+  });
   observeSentinel();
+}
+
+async function copyStoreLink(url) {
+  if (!url) {
+    showToast('店铺链接不可用');
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(url);
+  } catch (_) {
+    const input = document.createElement('textarea');
+    input.value = url;
+    input.style.position = 'fixed';
+    input.style.opacity = '0';
+    document.body.appendChild(input);
+    input.select();
+    document.execCommand('copy');
+    input.remove();
+  }
+  showToast('店铺链接已复制');
 }
 
 let _loadingMore = false;
@@ -1230,11 +1929,11 @@ function renderProductCard(p) {
   const confidence = Number.isFinite(Number(p.confidence)) ? Number(p.confidence) : 0;
   const confPct = confidence > 0 ? Math.round(confidence * 100) : 0;
   const category = String(p.category || 'other');
-  const categoryText = escapeHtml(category);
+  const categoryText = escapeHtml(categoryDisplayLabel(category));
   const categoryClass = safeCssToken(category);
   const price = Number.isFinite(Number(p.price)) ? Number(p.price) : 0;
 
-  return `<div class="product-card ${inStock ? 'has-stock' : 'no-stock'}" data-price="${price}">
+  return `<div class="product-card ${inStock ? 'has-stock' : 'no-stock'}" data-price="${price}" data-product-id="${escapeHtml(p.id)}">
     <div class="pc-top">
       ${category !== 'other' ? `<span class="tag tag-${categoryClass}" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="${escapeHtml(category)}" data-confidence="${confidence}" title="点击修改分类 (置信度: ${confPct}%)">${categoryText}${confPct > 0 ? `<small> ${confPct}%</small>` : ''}</span>` : `<span class="tag tag-other" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="其他" data-confidence="0" title="点击添加分类">其他</span>`}
       <span class="pc-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</span>
@@ -1262,10 +1961,10 @@ function editLabel(productKey, name, currentCat, confidence) {
   const l1 = catL1FromFull(currentCat);
   const l2 = catL2FromFull(currentCat);
   const l1Opts = CAT_L1.map(c => `<option value="${c}" ${c === l1 ? 'selected' : ''}>${c}</option>`).join('');
-  const l2List = CAT_L2_MAP[l1] || ['其他'];
-  const l2Opts = l2List.map(c => {
-    const full = categoryKey(l1, c);
-    return `<option value="${full}" ${full === currentCat || c === l2 ? 'selected' : ''}>${c}</option>`;
+  const l2List = categoryDefinitionsForParent(l1);
+  const l2Opts = l2List.map(item => {
+    const full = item.id;
+    return `<option value="${escapeHtml(full)}" ${full === currentCat || item.name === l2 ? 'selected' : ''}>${escapeHtml(item.name)}</option>`;
   }).join('');
   const div = document.createElement('div');
   div.id = 'labelOverlay';
@@ -1289,15 +1988,15 @@ function editLabel(productKey, name, currentCat, confidence) {
 function onEditL1Change() {
   const l1 = document.getElementById('labelSelectL1').value;
   const l2sel = document.getElementById('labelSelect');
-  const subs = CAT_L2_MAP[l1] || ['其他'];
-  l2sel.innerHTML = subs.map(c => `<option value="${categoryKey(l1, c)}">${c}</option>`).join('');
+  const subs = categoryDefinitionsForParent(l1);
+  l2sel.innerHTML = subs.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
 }
 
 const CAT_L1 = ['gpt','claude','gemini','grok','ai_platform','邮箱','号码','社交账号','视频会员','音乐会员','生活券','网盘','阅读会员','QQ会员','云服务','中转额度','教程服务','IP代理','卡密兑换','虚拟卡','开发工具','电商工具','企业服务','反重力','Adobe','修图剪辑','AI平台','sms','其他'];
 
 const CAT_L2_MAP = {
   'gpt': ['plus_已接码','plus_未接码','plus_质保','pro','team','k12','free','go','max','image2','cyber','其他'],
-  'claude': ['pro','max','其他'],
+  'claude': ['pro','max','kiro','其他'],
   'gemini': ['pro年卡','优惠链接','成品号','其他'],
   'grok': ['super_grok','普号','其他'],
   'ai_platform': ['cursor','perplexity','kiro','koro','其他AI平台','其他'],
@@ -1329,6 +2028,8 @@ const CAT_L2_MAP = {
 
 function catL1FromFull(full) {
   if (!full) return '其他';
+  const configured = Array.isArray(filterConfig.categoryDefinitions) ? filterConfig.categoryDefinitions.find(item => item.id === full) : null;
+  if (configured) return configured.parent;
   for (const l1 of CAT_L1) {
     if (full.startsWith(l1 + '_') || full === l1) return l1;
   }
@@ -1342,7 +2043,7 @@ function catL1Display(l1) {
   if (CAT_L1_DISPLAY.includes(l1)) return l1;
   const map = {
     '号码': '接码', '反重力': 'gemini', 'sms': '接码',
-    'ai_platform': 'gpt', '开发工具': 'gpt', '卡密兑换': 'gpt',
+    '开发工具': 'ai_platform', '卡密兑换': 'ai_platform',
     '虚拟卡': 'gpt', '电商工具': 'gpt',
     '视频会员': '其他', '音乐会员': '其他', '生活券': '其他',
     '网盘': '其他', '阅读会员': '其他', 'QQ会员': '其他',
@@ -1355,6 +2056,8 @@ function catL1Display(l1) {
 
 function catL2FromFull(full) {
   if (!full) return '其他';
+  const configured = Array.isArray(filterConfig.categoryDefinitions) ? filterConfig.categoryDefinitions.find(item => item.id === full) : null;
+  if (configured) return configured.name;
   const l1 = catL1FromFull(full);
   const prefix = l1 + '_';
   if (full.startsWith(prefix)) return full.slice(prefix.length);
@@ -1371,9 +2074,9 @@ function renderCatSelect(pk, name, currentCat) {
   const l1 = catL1FromFull(currentCat);
   const l2 = catL2FromFull(currentCat);
   const l1Opts = CAT_L1.map(c => `<option value="${c}" ${c === l1 ? 'selected' : ''}>${c}</option>`).join('');
-  const l2Opts = (CAT_L2_MAP[l1] || ['其他']).map(c => {
-    const full = categoryKey(l1, c);
-    return `<option value="${full}" ${full === currentCat || c === l2 ? 'selected' : ''}>${c}</option>`;
+  const l2Opts = categoryDefinitionsForParent(l1).map(item => {
+    const full = item.id;
+    return `<option value="${escapeHtml(full)}" ${full === currentCat || item.name === l2 ? 'selected' : ''}>${escapeHtml(item.name)}</option>`;
   }).join('');
   const epk = escapeHtml(pk), ename = escapeHtml(name);
   const previous = escapeHtml(currentCat);
@@ -1384,12 +2087,12 @@ function renderCatSelect(pk, name, currentCat) {
 function onCatL1Change(l1sel, pk, name) {
   const l2sel = l1sel.nextElementSibling;
   const l1 = l1sel.value;
-  const subs = CAT_L2_MAP[l1] || ['其他'];
+  const subs = categoryDefinitionsForParent(l1);
   const currentFull = l2sel.value;
   const currentL2 = currentFull.startsWith(l1 + '_') ? currentFull.slice(l1.length + 1) : '';
-  l2sel.innerHTML = subs.map(c => {
-    const full = categoryKey(l1, c);
-    return `<option value="${full}" ${c === currentL2 ? 'selected' : ''}>${c}</option>`;
+  l2sel.innerHTML = subs.map(item => {
+    const full = item.id;
+    return `<option value="${escapeHtml(full)}" ${item.name === currentL2 ? 'selected' : ''}>${escapeHtml(item.name)}</option>`;
   }).join('');
   saveLabelFromSettings(pk, name, l2sel.value, l1sel.dataset.previousCategory, l2sel);
 }
@@ -1888,7 +2591,8 @@ async function showHistory(storeId, productId, name, isNav) {
         borderColor: primary,
         backgroundColor: `${primary}18`,
         fill: true,
-        stepped: 'after',
+        cubicInterpolationMode: 'monotone',
+        tension: 0.38,
         borderWidth: 2,
         pointRadius: compact.length > 24 ? 0 : 3,
         pointHoverRadius: 4,

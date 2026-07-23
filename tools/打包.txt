@@ -1,0 +1,2 @@
+npm install
+powershell -ExecutionPolicy Bypass -File tools/build-portable.ps1

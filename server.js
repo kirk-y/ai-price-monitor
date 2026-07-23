@@ -235,6 +235,40 @@ app.put('/api/product-labels/:productKey', (req, res) => {
   }
 });
 
+app.post('/api/ai-classify', async (req, res) => {
+  try {
+    const url = String(req.body?.url || '').trim();
+    const key = String(req.body?.key || '').trim();
+    const model = String(req.body?.model || 'gpt-4o-mini').trim();
+    const products = Array.isArray(req.body?.products) ? req.body.products.slice(0, 500) : [];
+    const categories = Array.isArray(req.body?.categories) ? req.body.categories : [];
+    if (!/^https?:\/\//i.test(url) || !key || !products.length || !categories.length) {
+      return res.status(400).json({ error: '大模型配置或商品数据不完整' });
+    }
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
+      body: JSON.stringify({
+        model,
+        temperature: 0,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: `你是商品分类助手。只能从给定分类中选择，必须返回 JSON：{"items":[{"productKey":"...","category":"..."}]}。不得新增分类。分类集合：${categories.join(', ')}` },
+          { role: 'user', content: JSON.stringify(products.map(product => ({ productKey: product.productKey, name: product.name, currentCategory: product.category }))) },
+        ],
+      }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) return res.status(502).json({ error: payload.error?.message || '大模型请求失败' });
+    const content = payload.choices?.[0]?.message?.content;
+    const parsed = typeof content === 'string' ? JSON.parse(content.replace(/^```json\s*|\s*```$/g, '')) : content;
+    const items = Array.isArray(parsed?.items) ? parsed.items.filter(item => item && typeof item.productKey === 'string' && categories.includes(item.category)) : [];
+    res.json({ items });
+  } catch (error) {
+    res.status(502).json({ error: error.message || '大模型分类失败' });
+  }
+});
+
 app.get('/api/filter-config', (req, res) => {
   res.json(store.getFilterConfig());
 });

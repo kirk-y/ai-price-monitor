@@ -92,6 +92,7 @@ function initSchema() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       product_key TEXT NOT NULL,
       price REAL NOT NULL,
+      stock INTEGER,
       date TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_price_history_product_key ON price_history(product_key);
@@ -119,6 +120,12 @@ function initSchema() {
   `);
 
   try {
+    db.exec('ALTER TABLE price_history ADD COLUMN stock INTEGER');
+  } catch (_) {
+    // Existing databases already contain the column.
+  }
+
+  try {
     db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_price_history_unique ON price_history(product_key, price, date)');
   } catch (err) {
     if (err.code !== 'SQLITE_CONSTRAINT_UNIQUE') throw err;
@@ -141,7 +148,7 @@ function migrateFromJson() {
     const raw = fs.readFileSync(JSON_PATH, 'utf-8');
     const data = JSON.parse(raw);
     const insertStore = db.prepare('INSERT OR REPLACE INTO stores (id, url, name, addedAt, lastUpdated, status, error, products) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
-    const insertHistory = db.prepare('INSERT INTO price_history (product_key, price, date) VALUES (?, ?, ?)');
+    const insertHistory = db.prepare('INSERT INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
     const upsertConfig = db.prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)');
     const transaction = db.transaction(() => {
       for (const s of data.stores || []) {
@@ -149,7 +156,7 @@ function migrateFromJson() {
       }
       for (const [pk, entries] of Object.entries(data.priceHistory || {})) {
         for (const e of entries) {
-          insertHistory.run(pk, e.price, e.date);
+          insertHistory.run(pk, e.price, e.stock ?? null, e.date);
         }
       }
       if (data.filterConfig) {
@@ -226,12 +233,13 @@ function updateStore(storeId, updates) {
 function recordPrices(storeId, products) {
   const db = getDb();
   const now = new Date().toISOString();
-  const insert = db.prepare('INSERT INTO price_history (product_key, price, date) VALUES (?, ?, ?)');
+  const insert = db.prepare('INSERT INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
   const prune = db.prepare('DELETE FROM price_history WHERE product_key = ? AND id NOT IN (SELECT id FROM price_history WHERE product_key = ? ORDER BY date DESC LIMIT 200)');
   const transaction = db.transaction(() => {
     for (const p of products) {
       const pk = `${storeId}:${p.id}`;
-      insert.run(pk, p.price, now);
+      const stock = Number.isFinite(Number(p.stock)) ? Math.trunc(Number(p.stock)) : null;
+      insert.run(pk, p.price, stock, now);
       prune.run(pk, pk);
     }
   });
@@ -239,7 +247,7 @@ function recordPrices(storeId, products) {
 }
 
 function getPriceHistory(productKey) {
-  return getDb().prepare('SELECT price, date FROM price_history WHERE product_key = ? ORDER BY date ASC').all(productKey);
+  return getDb().prepare('SELECT price, stock, date FROM price_history WHERE product_key = ? ORDER BY date ASC').all(productKey);
 }
 
 function getFilterConfig() {
@@ -325,11 +333,11 @@ function getLabeledData() {
 function exportAllData() {
   const db = getDb();
   const stores = db.prepare('SELECT * FROM stores ORDER BY addedAt ASC').all().map(serializeStore);
-  const historyRows = db.prepare('SELECT product_key, price, date FROM price_history ORDER BY product_key, date ASC').all();
+  const historyRows = db.prepare('SELECT product_key, price, stock, date FROM price_history ORDER BY product_key, date ASC').all();
   const priceHistory = {};
   for (const r of historyRows) {
     if (!priceHistory[r.product_key]) priceHistory[r.product_key] = [];
-    priceHistory[r.product_key].push({ price: r.price, date: r.date });
+    priceHistory[r.product_key].push({ price: r.price, stock: r.stock, date: r.date });
   }
   const filterConfig = getFilterConfig();
   const refreshConfig = getRefreshConfig();
@@ -420,7 +428,13 @@ function normalizeHistory(data, allowedStoreIds, fixedStoreId = null) {
       if (!Number.isFinite(price) || price < 0 || price > 1e9 || Number.isNaN(timestamp)) {
         throw new Error('价格历史记录格式错误');
       }
-      rows.push({ productKey, price, date: new Date(timestamp).toISOString() });
+      const stock = entry?.stock === null || entry?.stock === undefined || entry?.stock === ''
+        ? null
+        : Number(entry.stock);
+      if (stock !== null && (!Number.isFinite(stock) || stock < -1e9 || stock > 1e9)) {
+        throw new Error('鍘嗗彶搴撳瓨璁板綍鏍煎紡閿欒');
+      }
+      rows.push({ productKey, price, stock: stock === null ? null : Math.trunc(stock), date: new Date(timestamp).toISOString() });
       if (rows.length > 250000) throw new Error('历史记录总数超过限制');
     }
   }
@@ -453,8 +467,8 @@ function importAllData(data) {
     for (const s of stores) {
       insertStore.run(s.id, s.url, s.name || '', s.addedAt || '', s.lastUpdated || null, s.status || 'ok', s.error || '', JSON.stringify(s.products || []));
     }
-    const insertHistory = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, date) VALUES (?, ?, ?)');
-    for (const row of historyRows) insertHistory.run(row.productKey, row.price, row.date);
+    const insertHistory = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
+    for (const row of historyRows) insertHistory.run(row.productKey, row.price, row.stock ?? null, row.date);
     if (data.filterConfig) {
       db.prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)').run('filterConfig', JSON.stringify(data.filterConfig));
     }
@@ -500,11 +514,11 @@ function exportStore(storeId) {
   if (!store) return null;
   const s = serializeStore(store);
   const prefix = `${storeId}:`;
-  const historyRows = db.prepare('SELECT product_key, price, date FROM price_history WHERE product_key LIKE ? ORDER BY date ASC').all(prefix + '%');
+  const historyRows = db.prepare('SELECT product_key, price, stock, date FROM price_history WHERE product_key LIKE ? ORDER BY date ASC').all(prefix + '%');
   const priceHistory = {};
   for (const r of historyRows) {
     if (!priceHistory[r.product_key]) priceHistory[r.product_key] = [];
-    priceHistory[r.product_key].push({ price: r.price, date: r.date });
+    priceHistory[r.product_key].push({ price: r.price, stock: r.stock, date: r.date });
   }
   return { stores: [s], priceHistory, exportedAt: new Date().toISOString() };
 }
@@ -525,8 +539,8 @@ function importSingleStore(data) {
       db.prepare('INSERT INTO stores (id, url, name, addedAt, lastUpdated, status, error, products) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
         .run(s.id, s.url, s.name, s.addedAt, s.lastUpdated, s.status, s.error, JSON.stringify(s.products));
     }
-    const insertHistory = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, date) VALUES (?, ?, ?)');
-    for (const row of historyRows) insertHistory.run(row.productKey, row.price, row.date);
+    const insertHistory = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
+    for (const row of historyRows) insertHistory.run(row.productKey, row.price, row.stock ?? null, row.date);
   });
   transaction();
   return true;
@@ -535,22 +549,22 @@ function importSingleStore(data) {
 function exportStoreHistory(storeId) {
   const db = getDb();
   const prefix = `${storeId}:`;
-  const historyRows = db.prepare('SELECT product_key, price, date FROM price_history WHERE product_key LIKE ? ORDER BY date ASC').all(prefix + '%');
+  const historyRows = db.prepare('SELECT product_key, price, stock, date FROM price_history WHERE product_key LIKE ? ORDER BY date ASC').all(prefix + '%');
   const priceHistory = {};
   for (const r of historyRows) {
     if (!priceHistory[r.product_key]) priceHistory[r.product_key] = [];
-    priceHistory[r.product_key].push({ price: r.price, date: r.date });
+    priceHistory[r.product_key].push({ price: r.price, stock: r.stock, date: r.date });
   }
   return { storeId, exportedAt: new Date().toISOString(), priceHistory };
 }
 
 function exportAllHistory() {
   const db = getDb();
-  const historyRows = db.prepare('SELECT product_key, price, date FROM price_history ORDER BY product_key, date ASC').all();
+  const historyRows = db.prepare('SELECT product_key, price, stock, date FROM price_history ORDER BY product_key, date ASC').all();
   const priceHistory = {};
   for (const r of historyRows) {
     if (!priceHistory[r.product_key]) priceHistory[r.product_key] = [];
-    priceHistory[r.product_key].push({ price: r.price, date: r.date });
+    priceHistory[r.product_key].push({ price: r.price, stock: r.stock, date: r.date });
   }
   return { exportedAt: new Date().toISOString(), priceHistory };
 }
@@ -561,10 +575,10 @@ function importStoreHistory(storeId, data) {
   const store = db.prepare('SELECT id FROM stores WHERE id = ?').get(storeId);
   if (!store) throw new Error('店铺不存在');
   const rows = normalizeHistory(data, new Set([storeId]), storeId);
-  const insert = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, date) VALUES (?, ?, ?)');
+  const insert = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
   const prune = db.prepare('DELETE FROM price_history WHERE product_key = ? AND id NOT IN (SELECT id FROM price_history WHERE product_key = ? ORDER BY date DESC LIMIT 200)');
   const transaction = db.transaction(() => {
-    for (const row of rows) insert.run(row.productKey, row.price, row.date);
+    for (const row of rows) insert.run(row.productKey, row.price, row.stock ?? null, row.date);
     for (const productKey of new Set(rows.map(row => row.productKey))) prune.run(productKey, productKey);
   });
   transaction();
@@ -575,10 +589,10 @@ function importAllHistory(data) {
   const db = getDb();
   const storeIds = new Set(db.prepare('SELECT id FROM stores').all().map(row => row.id));
   const rows = normalizeHistory(data, storeIds);
-  const insert = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, date) VALUES (?, ?, ?)');
+  const insert = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
   const prune = db.prepare('DELETE FROM price_history WHERE product_key = ? AND id NOT IN (SELECT id FROM price_history WHERE product_key = ? ORDER BY date DESC LIMIT 200)');
   const transaction = db.transaction(() => {
-    for (const row of rows) insert.run(row.productKey, row.price, row.date);
+    for (const row of rows) insert.run(row.productKey, row.price, row.stock ?? null, row.date);
     for (const productKey of new Set(rows.map(row => row.productKey))) prune.run(productKey, productKey);
   });
   transaction();
