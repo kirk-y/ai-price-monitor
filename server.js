@@ -404,8 +404,19 @@ function scrapeAndUpdate(storeId, url) {
   return task;
 }
 
+function recoverInterruptedRefreshes() {
+  for (const item of store.getAllStores()) {
+    if (item.status !== 'pending') continue;
+    store.updateStore(item.id, {
+      status: 'error',
+      error: '上次刷新未完成，已恢复，可重新尝试',
+    });
+  }
+}
+
 const server = app.listen(PORT, HOST, () => {
   console.log(`AI价格监控服务已启动: http://${HOST}:${PORT}`);
+  recoverInterruptedRefreshes();
   startAutoRefresh();
 });
 
@@ -417,6 +428,7 @@ server.on('error', (err) => {
 });
 
 let nextRefreshAt = null;
+const autoRefreshAttempts = new Map();
 
 function randomBetween(min, max) {
   return Math.floor(Math.random() * (max - min + 1) + min) * 60 * 1000;
@@ -431,16 +443,24 @@ function scheduleNextRefresh(delay) {
 async function startAutoRefresh() {
   nextRefreshAt = null;
   const all = store.getAllStores();
-  const ok = all.filter(s => s.status === 'ok');
-  if (ok.length === 0) {
-    scheduleNextRefresh(60 * 1000);
-    return;
-  }
-
-  const pick = ok[Math.floor(Math.random() * ok.length)];
-  await enqueueStoreRefresh(pick.id, pick.url, 'auto');
-
   const cfg = store.getRefreshConfig();
+  const thresholdMinutes = cfg.mode === 'fixed'
+    ? cfg.fixedMinutes
+    : Math.max(1, cfg.minMinutes || 60);
+  const thresholdMs = thresholdMinutes * 60 * 1000;
+  const now = Date.now();
+  const due = all.filter(item => {
+    if (!item.url || item.status === 'pending' || queuedRefreshes.has(item.id) || activeRefreshes.has(item.id)) return false;
+    const lastAttempt = autoRefreshAttempts.get(item.id) || 0;
+    if (lastAttempt && now - lastAttempt < thresholdMs) return false;
+    const lastUpdated = item.lastUpdated ? Date.parse(item.lastUpdated) : 0;
+    return !lastUpdated || now - lastUpdated >= thresholdMs;
+  });
+
+  for (const item of due) autoRefreshAttempts.set(item.id, now);
+  // 自动刷新批次仍使用统一队列，逐店执行；手动任务可优先插入。
+  await Promise.all(due.map(item => enqueueStoreRefresh(item.id, item.url, 'auto')));
+
   let delay;
   if (cfg.mode === 'fixed') {
     delay = cfg.fixedMinutes * 60 * 1000;

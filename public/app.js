@@ -1052,6 +1052,13 @@ function visibleCatEntries() {
   return order.filter(k => !hidden.includes(k) && CAT_LABELS[k]).map(k => [k, categoryDisplayLabel(k)]);
 }
 
+function isGptCategory(category) {
+  return catL1FromFull(category) === 'gpt'
+    || String(category).startsWith('plus_')
+    || String(category).startsWith('gpt_')
+    || category === 'gptk12';
+}
+
 const CAT_L1_DISPLAY = ['gpt', 'claude', 'gemini', 'grok', 'ai_platform', '邮箱', '接码', '中转', '其他'];
 
 const CAT_L1_LABELS = {
@@ -1605,7 +1612,8 @@ function hideStoreLoadingOverlay() {
 function renderBestPrices() {
   let pool = getAllProducts().filter(p => !isStoreHidden(p.storeId));
   if (includeWords.length || excludeWords.length) pool = pool.filter(p => matchesSearch(p.name));
-  document.getElementById('bestPriceList').innerHTML = visibleCatEntries().map(([k, label]) => {
+  const gptEntries = visibleCatEntries().filter(([k]) => isGptCategory(k));
+  document.getElementById('bestPriceList').innerHTML = gptEntries.map(([k, label]) => {
     const items = pool.filter(p => p.category === k && p.price > 0 && p.stock > 0).sort((a, b) => a.price - b.price);
     if (!items.length) return `<div class="bp-item"><div class="bp-cat">${label}</div><div class="bp-na">暂无</div></div>`;
     const item = items[0];
@@ -2408,6 +2416,7 @@ function startStoreStatusPolling() {
         for (const id of refreshedIds) await loadStoreWithProducts(id);
         markDirty();
         renderStores();
+        renderBestPrices();
       }
     } catch (_) { /* A later poll will retry. */ }
   }, 5000);
