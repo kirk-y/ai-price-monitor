@@ -233,7 +233,8 @@ function updateStore(storeId, updates) {
 function recordPrices(storeId, products) {
   const db = getDb();
   const now = new Date().toISOString();
-  const insert = db.prepare('INSERT INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
+  // Refresh results can contain the same product more than once; history writes are idempotent.
+  const insert = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
   const prune = db.prepare('DELETE FROM price_history WHERE product_key = ? AND id NOT IN (SELECT id FROM price_history WHERE product_key = ? ORDER BY date DESC LIMIT 200)');
   const transaction = db.transaction(() => {
     for (const p of products) {

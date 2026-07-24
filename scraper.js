@@ -125,7 +125,10 @@ async function scrapeShop(url) {
     await sleep(randomDelay(TYPE_DELAY_MIN, TYPE_DELAY_MAX));
   }
 
-  return { shopName, products: allProducts };
+  // Some stores expose the same goods key in more than one type/page.
+  // Keep one record per key so cards and history remain consistent.
+  const uniqueProducts = [...new Map(allProducts.map(product => [product.id, product])).values()];
+  return { shopName, products: uniqueProducts };
 }
 
 function normalizeHttpUrl(value) {
