@@ -13,6 +13,10 @@ const DB_PATH = process.env.DB_PATH
   ? path.resolve(process.env.DB_PATH)
   : path.join(__dirname, 'data', 'stores.db');
 const JSON_PATH = path.join(__dirname, 'data', 'stores.json');
+const MAX_HISTORY_IMPORT_ROWS = Number(process.env.MAX_HISTORY_IMPORT_ROWS || 1000000);
+if (!Number.isSafeInteger(MAX_HISTORY_IMPORT_ROWS) || MAX_HISTORY_IMPORT_ROWS < 1) {
+  throw new Error('MAX_HISTORY_IMPORT_ROWS must be a positive integer');
+}
 
 const DEFAULT_CONFIG = {
   filterPatterns: {
@@ -466,7 +470,7 @@ function normalizeHistory(data, allowedStoreIds, fixedStoreId = null) {
         throw new Error('鍘嗗彶搴撳瓨璁板綍鏍煎紡閿欒');
       }
       rows.push({ productKey, price, stock: stock === null ? null : Math.trunc(stock), date: new Date(timestamp).toISOString() });
-      if (rows.length > 250000) throw new Error('历史记录总数超过限制');
+      if (rows.length > MAX_HISTORY_IMPORT_ROWS) throw new Error(`历史记录总数超过限制（最多 ${MAX_HISTORY_IMPORT_ROWS} 条）`);
     }
   }
   return rows;
