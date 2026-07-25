@@ -62,18 +62,56 @@ function showAuthPrompt() {
   }
 }
 
+const THEME_ICONS = {
+  sun: '<svg viewBox="0 0 24 24" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"></circle><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"></path></g></svg>',
+  moon: '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z" fill="currentColor"></path></svg>',
+};
+
 function initTheme() {
   const saved = localStorage.getItem('theme');
   if (saved === 'dark' || (!saved && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
     document.body.classList.add('dark');
-    document.getElementById('themeToggle').textContent = '☀';
+    document.getElementById('themeToggle').innerHTML = THEME_ICONS.sun;
   }
 }
 
 function toggleTheme() {
   const isDark = document.body.classList.toggle('dark');
   localStorage.setItem('theme', isDark ? 'dark' : 'light');
-  document.getElementById('themeToggle').textContent = isDark ? '☀' : '☾';
+  document.getElementById('themeToggle').innerHTML = isDark ? THEME_ICONS.sun : THEME_ICONS.moon;
+  refreshOpenCharts();
+}
+
+// Charts read CSS variables at creation time, so rebuild any visible chart
+// after a theme switch to pick up the new palette.
+function refreshOpenCharts() {
+  if (historicalBestMode) renderHistoricalBestPrices();
+  const modalOpen = document.getElementById('historyModal').style.display === 'block';
+  if (modalOpen && navIndex >= 0 && navProducts[navIndex]) {
+    const p = navProducts[navIndex];
+    showHistory(p.storeId, p.id, p.name, true);
+  }
+}
+
+function isFilterDrawerMode() {
+  return window.matchMedia('(max-width: 1120px)').matches;
+}
+
+function openFilterDrawer() {
+  document.getElementById('rightBar').classList.add('drawer-open');
+  document.getElementById('drawerBackdrop').classList.add('visible');
+  document.getElementById('filterToggleBtn').setAttribute('aria-expanded', 'true');
+}
+
+function closeFilterDrawer() {
+  document.getElementById('rightBar').classList.remove('drawer-open');
+  document.getElementById('drawerBackdrop').classList.remove('visible');
+  document.getElementById('filterToggleBtn').setAttribute('aria-expanded', 'false');
+}
+
+function toggleFilterDrawer() {
+  if (document.getElementById('rightBar').classList.contains('drawer-open')) closeFilterDrawer();
+  else openFilterDrawer();
 }
 
 function handleActionClick(event) {
@@ -216,10 +254,21 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (e.target === document.getElementById('addStoreModal')) closeAddModal();
   });
   window.addEventListener('keydown', e => {
+    if (e.key === 'Escape') {
+      closeFilterDrawer();
+      if (document.getElementById('historyModal').style.display === 'block') { closeModal(); return; }
+      if (document.getElementById('settingsModal').style.display === 'block') { closeSettings(); return; }
+      if (document.getElementById('addStoreModal').style.display === 'block') { closeAddModal(); return; }
+      document.getElementById('labelOverlay')?.remove();
+      return;
+    }
     if (document.getElementById('historyModal').style.display !== 'block') return;
     if (e.key === 'ArrowLeft') navigateProduct(-1);
     if (e.key === 'ArrowRight') navigateProduct(1);
   });
+  document.getElementById('filterToggleBtn').addEventListener('click', toggleFilterDrawer);
+  document.getElementById('drawerBackdrop').addEventListener('click', closeFilterDrawer);
+  window.addEventListener('resize', () => { if (!isFilterDrawerMode()) closeFilterDrawer(); });
 
   setupSearch('includeInput', 'includeChips', 'includeWords', 'include');
   setupSearch('excludeInput', 'excludeChips', 'excludeWords', 'exclude');
@@ -299,6 +348,7 @@ function trackNewKeyword(key) {
 
 function initSettings() {
   document.getElementById('refreshAllBtn').addEventListener('click', refreshAllStores);
+  document.getElementById('historyBestBtn').addEventListener('click', openHistoricalBestGlobal);
   document.getElementById('settingsBtn').addEventListener('click', openSettings);
   document.querySelector('.close-settings').addEventListener('click', closeSettings);
   document.getElementById('settingsExportBtn').addEventListener('click', () => downloadBlob('/api/stores/export', 'ai-price-monitor-data.json'));
@@ -1651,7 +1701,7 @@ function renderHistoryBestControls() {
   if (!bar) return;
   const visible = new Set(visibleHistoryBestCategories().map(([key]) => key));
   const storeLabel = historyBestStoreId ? (storeSummaries.find(store => store.id === historyBestStoreId)?.name || '当前店铺') : '全部店铺';
-  bar.innerHTML = `<div class="history-view-toolbar"><button class="history-back-btn" data-action="exit-history-best" title="返回商品列表" aria-label="返回商品列表"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 19-7-7 7-7"></path><path d="M19 12H5"></path></svg></button><button class="history-global-btn" data-action="open-history-global">全局最低价</button><span class="history-scope-label">${escapeHtml(storeLabel)}</span></div><div class="cat-bar-row history-category-controls">${historyBestCategoriesInOrder().map(([key, label]) => `<button draggable="true" data-drag-type="history-category" data-category="${escapeHtml(key)}" class="cat-btn history-cat-toggle ${visible.has(key) ? 'active' : ''}" data-action="toggle-history-cat">${label}</button>`).join('')}</div>`;
+  bar.innerHTML = `<div class="history-view-toolbar"><button class="history-back-btn" data-action="exit-history-best" title="返回商品列表" aria-label="返回商品列表"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m12 19-7-7 7-7"></path><path d="M19 12H5"></path></svg></button><span class="history-scope-label">${escapeHtml(storeLabel)}</span></div><div class="cat-bar-row history-category-controls">${historyBestCategoriesInOrder().map(([key, label]) => `<button draggable="true" data-drag-type="history-category" data-category="${escapeHtml(key)}" class="cat-btn history-cat-toggle ${visible.has(key) ? 'active' : ''}" data-action="toggle-history-cat">${label}</button>`).join('')}</div>`;
 }
 
 let historyCatDragKey = null;
@@ -1772,11 +1822,11 @@ function openHistoricalBestForStore(storeId) {
 }
 
 function openHistoricalBestGlobal() {
+  historicalBestMode = true;
   historyBestStoreId = '';
   activeBrowseStoreId = '';
   markDirty();
-  renderStoreList();
-  renderHistoryBestControls();
+  render();
   renderHistoricalBestPrices();
 }
 
@@ -1791,6 +1841,7 @@ function selectHistoryBestCategory(category) {
 }
 
 function goToBestPrice(storeId, category, productId) {
+  closeFilterDrawer();
   activeCatL1 = catL1FromFull(category);
   activeCatL2 = category;
   activeCategory = category;
@@ -2386,6 +2437,7 @@ async function legacyRefreshStore(id, silent) {
 
 let _refreshingAll = false;
 let _stopRefreshAll = false;
+let _refreshBatchId = '';
 let refreshingStores = new Set();
 let _storeStatusTimer = null;
 
@@ -2439,11 +2491,12 @@ async function refreshAllStores() {
       : store);
     ids.forEach(id => refreshingStores.add(id));
     renderStoreList();
-    await apiFetch('/api/stores/refresh-all', {
+    const response = await apiFetch('/api/stores/refresh-all', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ storeIds: ids }),
     });
+    _refreshBatchId = (await response.json()).batchId || '';
     for (const summary of order) {
       if (_stopRefreshAll) break;
       try {
@@ -2512,6 +2565,13 @@ async function legacyRefreshAllStores() {
 
 function stopRefreshAll() {
   _stopRefreshAll = true;
+  if (_refreshBatchId) {
+    apiFetch('/api/stores/refresh-all/cancel', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ batchId: _refreshBatchId }),
+    }).catch(() => {});
+  }
   const btn = document.getElementById('refreshAllBtn');
   btn.textContent = '正在停止...';
   btn.disabled = true;
@@ -2519,6 +2579,7 @@ function stopRefreshAll() {
 
 function finishRefreshAll() {
   refreshingStores.clear();
+  _refreshBatchId = '';
   markDirty();
   render();
   const btn = document.getElementById('refreshAllBtn');

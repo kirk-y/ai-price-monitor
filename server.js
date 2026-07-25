@@ -131,14 +131,22 @@ app.post('/api/stores/refresh-all', requireStrictLimit, (req, res) => {
     .map(id => byId.get(id));
   if (!storesToRefresh.length) return res.status(400).json({ error: '没有可刷新的店铺' });
 
+  const batchId = `refresh_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   for (const item of storesToRefresh) store.updateStore(item.id, { status: 'pending', error: '' });
-  res.json({ status: 'pending', storeIds: storesToRefresh.map(item => item.id) });
+  res.json({ status: 'pending', batchId, storeIds: storesToRefresh.map(item => item.id) });
 
   (async () => {
     for (const item of storesToRefresh) {
-      enqueueStoreRefresh(item.id, item.url, 'global');
+      enqueueStoreRefresh(item.id, item.url, 'global', batchId);
     }
   })().catch(error => console.error('全局刷新任务失败:', error.message));
+});
+
+app.post('/api/stores/refresh-all/cancel', requireStrictLimit, (req, res) => {
+  const batchId = String(req.body?.batchId || '');
+  if (!batchId) return res.status(400).json({ error: '缺少刷新批次标识' });
+  cancelledRefreshBatches.add(batchId);
+  res.json({ success: true, batchId });
 });
 
 app.get('/api/stores/:id/export', (req, res) => {
@@ -328,6 +336,7 @@ app.put('/api/store-order', (req, res) => {
 const activeRefreshes = new Map();
 const refreshQueue = [];
 const queuedRefreshes = new Map();
+const cancelledRefreshBatches = new Set();
 let refreshQueueRunning = false;
 let refreshSequence = 0;
 let lastRefreshFinishedAt = 0;
@@ -342,13 +351,13 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function enqueueStoreRefresh(storeId, url, reason = 'manual') {
+function enqueueStoreRefresh(storeId, url, reason = 'manual', batchId = '') {
   if (activeRefreshes.has(storeId)) return activeRefreshes.get(storeId);
   if (queuedRefreshes.has(storeId)) return queuedRefreshes.get(storeId);
 
   const priority = reason === 'manual' ? 0 : reason === 'global' ? 10 : 20;
   const task = new Promise((resolve) => {
-    refreshQueue.push({ storeId, url, reason, priority, sequence: refreshSequence++, resolve });
+    refreshQueue.push({ storeId, url, reason, batchId, priority, sequence: refreshSequence++, resolve });
     refreshQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
   });
   queuedRefreshes.set(storeId, task);
@@ -363,6 +372,14 @@ async function processRefreshQueue() {
     while (refreshQueue.length) {
       const job = refreshQueue.shift();
       queuedRefreshes.delete(job.storeId);
+      if (job.batchId && cancelledRefreshBatches.has(job.batchId)) {
+        store.updateStore(job.storeId, {
+          status: 'error',
+          error: '全局刷新已取消，可重新尝试',
+        });
+        job.resolve();
+        continue;
+      }
       const sinceLast = Date.now() - lastRefreshFinishedAt;
       const minimumGap = queueDelay(2000, 6000);
       if (lastRefreshFinishedAt && sinceLast < minimumGap) await sleep(minimumGap - sinceLast);

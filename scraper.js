@@ -8,6 +8,7 @@ const PAGE_DELAY_MIN = Number(process.env.SCRAPER_PAGE_DELAY_MIN || 200);
 const PAGE_DELAY_MAX = Number(process.env.SCRAPER_PAGE_DELAY_MAX || 600);
 const TYPE_DELAY_MIN = Number(process.env.SCRAPER_TYPE_DELAY_MIN || 500);
 const TYPE_DELAY_MAX = Number(process.env.SCRAPER_TYPE_DELAY_MAX || 1500);
+const SHOP_TIMEOUT = Number(process.env.SCRAPER_SHOP_TIMEOUT || 180000);
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 function randomDelay(min, max) {
@@ -22,6 +23,7 @@ async function requestWithBackoff(config) {
     try {
       return await axios.request(config);
     } catch (err) {
+      if (config.signal?.aborted) throw err;
       const status = err.response?.status;
       const retryable = status === 429 || status === 502 || status === 503 || status === 504 || !status;
       if (!retryable || attempt >= 2) throw err;
@@ -36,10 +38,11 @@ function extractToken(url) {
   return m ? m[1] : null;
 }
 
-async function getCookies(token) {
+async function getCookies(token, signal) {
   const res = await requestWithBackoff({ method: 'get', url: `${BASE}/shop/${token}`,
     headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
     timeout: REQ_TIMEOUT,
+    signal,
   });
   return (res.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
 }
@@ -53,7 +56,7 @@ function headers(cookies) {
   };
 }
 
-async function fetchProducts(token, goodsType, cookies) {
+async function fetchProducts(token, goodsType, cookies, signal) {
   const products = [];
   let current = 1;
   const pageSize = 100;
@@ -65,6 +68,7 @@ async function fetchProducts(token, goodsType, cookies) {
       data: { token, goods_type: goodsType, current, pageSize },
       headers: headers(cookies),
       timeout: REQ_TIMEOUT,
+      signal,
     });
 
     const data = res.data;
@@ -93,10 +97,13 @@ async function fetchProducts(token, goodsType, cookies) {
 }
 
 async function scrapeShop(url) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SHOP_TIMEOUT);
+  try {
   const token = extractToken(url);
   if (!token) throw new Error(`无法从URL提取店铺标识: ${url}`);
 
-  const cookies = await getCookies(token);
+  const cookies = await getCookies(token, controller.signal);
 
   const infoRes = await requestWithBackoff({
     method: 'post',
@@ -104,6 +111,7 @@ async function scrapeShop(url) {
     data: { token },
     headers: headers(cookies),
     timeout: REQ_TIMEOUT,
+    signal: controller.signal,
   });
 
   if (!infoRes.data || infoRes.data.code !== 1) {
@@ -117,18 +125,26 @@ async function scrapeShop(url) {
     : GOODS_TYPES;
 
   const allProducts = [];
+  const failedTypes = [];
   for (const gt of goodsTypeSort) {
     try {
-      const products = await fetchProducts(token, gt, cookies);
+      const products = await fetchProducts(token, gt, cookies, controller.signal);
       allProducts.push(...products);
-    } catch (_) { }
+    } catch (err) {
+      failedTypes.push(`${gt}: ${err.message}`);
+    }
     await sleep(randomDelay(TYPE_DELAY_MIN, TYPE_DELAY_MAX));
   }
+
+  if (failedTypes.length) throw new Error(`商品类型抓取失败: ${failedTypes.join('; ')}`);
 
   // Some stores expose the same goods key in more than one type/page.
   // Keep one record per key so cards and history remain consistent.
   const uniqueProducts = [...new Map(allProducts.map(product => [product.id, product])).values()];
   return { shopName, products: uniqueProducts };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function normalizeHttpUrl(value) {
@@ -159,7 +175,8 @@ async function classifyProducts(products, storeId) {
   for (const p of products) {
     const pk = `${storeId}:${p.id}`;
     const existing = store.getProductLabel(pk);
-    if (existing) continue;
+    // Keep manual labels, but recalculate automatic labels when a store changes the product name.
+    if (existing?.manual || (existing && existing.name === p.name)) continue;
     const result = classifyProduct(p.name, filterPatterns);
     if (result && result.category) {
       store.upsertProductLabel(pk, p.name, result.category, result.confidence, 0);
