@@ -95,3 +95,87 @@ test('manual category updates keep labels and change records associated', () => 
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('full and single store backups preserve labels, history, and store order', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-backup-'));
+  const dbPath = path.join(tempDir, 'backup.db');
+  const script = `
+    const assert = require('node:assert/strict');
+    const store = require('./store');
+    const s1 = store.addStore('https://pay.ldxp.cn/shop/alpha');
+    const s2 = store.addStore('https://pay.ldxp.cn/shop/beta');
+    store.updateStore(s1.id, { products: [{ id: 'p1', name: 'Alpha', price: 12, stock: 3, purchaseUrl: 'https://pay.ldxp.cn/shop/alpha' }] });
+    store.updateStore(s2.id, { products: [{ id: 'p2', name: 'Beta', price: 22, stock: 2, purchaseUrl: 'https://pay.ldxp.cn/shop/beta' }] });
+    store.setProductLabel('alpha:p1', 'Alpha', 'plus_未接码');
+    store.setProductLabel('alpha:p1', 'Alpha', 'claude_pro', 'plus_未接码');
+    store.setProductLabel('beta:p2', 'Beta', 'gpt_team');
+    store.importAllHistory({ priceHistory: {
+      'alpha:p1': [{ price: 12, stock: 3, date: '2026-07-23T00:00:00.000Z' }],
+      'beta:p2': [{ price: 22, stock: 2, date: '2026-07-23T00:00:00.000Z' }]
+    }});
+    store.updateStoreOrder(['beta', 'alpha']);
+    const backup = store.exportAllData();
+    assert.deepEqual(backup.storeOrder, ['beta', 'alpha']);
+    assert.equal(backup.productLabels.length, 2);
+    assert.equal(backup.labelChanges.length, 1);
+
+    store.removeStore('alpha');
+    store.importAllData(backup);
+    assert.equal(store.getAllStores().length, 2);
+    assert.equal(store.getPriceHistory('alpha:p1').length, 1);
+    assert.equal(store.getProductLabel('alpha:p1').category, 'claude_pro');
+    assert.equal(store.getLabelChanges()[0].old_category, 'plus_未接码');
+    assert.deepEqual(store.getStoreOrder(), ['beta', 'alpha']);
+
+    const single = store.exportStore('alpha');
+    store.setProductLabel('beta:p2', 'Beta', 'claude_pro', 'gpt_team');
+    store.importSingleStore(single);
+    assert.equal(store.getProductLabel('alpha:p1').category, 'claude_pro');
+    assert.equal(store.getProductLabel('beta:p2').category, 'claude_pro');
+    assert.equal(store.getPriceHistory('alpha:p1').length, 1);
+
+    const before = store.getAllStores().map(item => item.id).sort();
+    assert.throws(() => store.importAllData({ ...backup, storeOrder: ['missing'] }));
+    assert.deepEqual(store.getAllStores().map(item => item.id).sort(), before);
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, DB_PATH: dbPath },
+    encoding: 'utf8',
+  });
+  try {
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test('store list import is transactional and deduplicates entries', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-store-list-'));
+  const dbPath = path.join(tempDir, 'stores.db');
+  const script = `
+    const assert = require('node:assert/strict');
+    const store = require('./store');
+    const result = store.importStoreList([
+      { url: 'https://pay.ldxp.cn/shop/one', name: 'One' },
+      { url: 'https://pay.ldxp.cn/shop/one', name: 'Duplicate' },
+      { url: 'https://pay.ldxp.cn/shop/two' },
+      { url: 'https://example.com/shop/invalid' }
+    ]);
+    assert.deepEqual(result.addedIds.sort(), ['one', 'two']);
+    assert.equal(result.skipped, 2);
+    assert.equal(store.getStore('one').status, 'pending');
+    assert.equal(store.getStore('one').name, 'One');
+    assert.equal(store.getAllStores().length, 2);
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, DB_PATH: dbPath },
+    encoding: 'utf8',
+  });
+  try {
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});

@@ -183,6 +183,19 @@ app.post('/api/stores', requireStrictLimit, async (req, res) => {
   enqueueStoreRefresh(existing.id, shop.url, 'initial');
 });
 
+app.post('/api/stores/import-list', requireStrictLimit, (req, res) => {
+  try {
+    const result = store.importStoreList(req.body?.stores ?? req.body);
+    for (const id of result.addedIds) {
+      const imported = store.getStore(id);
+      if (imported) enqueueStoreRefresh(id, imported.url, 'initial');
+    }
+    res.json({ success: true, ...result });
+  } catch (e) {
+    res.status(400).json({ error: '批量导入失败: ' + e.message });
+  }
+});
+
 app.delete('/api/stores/:id', requireStrictLimit, (req, res) => {
   res.json({ success: store.removeStore(req.params.id) });
 });

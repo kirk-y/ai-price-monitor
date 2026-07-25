@@ -702,19 +702,16 @@ async function importStoreList(e) {
     const text = await file.text();
     const list = JSON.parse(text);
     if (!Array.isArray(list)) throw new Error('数据格式错误，应为店铺数组');
-    let added = 0, skipped = 0;
-    const existing = new Set(storeSummaries.map(s => s.id));
-    const importedIds = [];
-    for (const item of list) {
-      if (!item.url || !item.url.startsWith('http')) { skipped++; continue; }
-      if (item.id && existing.has(item.id)) { skipped++; continue; }
-      try {
-        const response = await apiFetch('/api/stores', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ url: item.url }) });
-        const created = await response.json();
-        if (created.id) importedIds.push(created.id);
-        added++;
-      } catch { skipped++; }
-    }
+    const response = await apiFetch('/api/stores/import-list', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ stores: list }),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '批量导入失败');
+    const added = Number(result.addedIds?.length || 0);
+    const skipped = Number(result.skipped || 0);
+    const importedIds = result.addedIds || [];
     msg.textContent = `✓ 导入完成: 新增 ${added} 个，跳过 ${skipped} 个`;
     msg.style.color = '#43a047';
     e.target.value = '';
@@ -888,6 +885,9 @@ async function importStoreHistoryFile(e) {
     if (res.ok) {
       msg.textContent = '✓ 历史数据导入成功';
       msg.style.color = '#43a047';
+      historyBestData = null;
+      markDirty();
+      renderHistoricalBestPrices();
     } else {
       const err = await res.json();
       msg.textContent = '导入失败: ' + (err.error || '');
@@ -913,6 +913,9 @@ async function importAllHistoryFile(e) {
     if (res.ok) {
       msg.textContent = '✓ 全量历史数据导入成功';
       msg.style.color = '#43a047';
+      historyBestData = null;
+      markDirty();
+      renderHistoricalBestPrices();
     } else {
       const err = await res.json();
       msg.textContent = '导入失败: ' + (err.error || '');

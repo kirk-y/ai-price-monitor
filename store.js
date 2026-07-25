@@ -202,6 +202,36 @@ function addStore(url) {
   return store;
 }
 
+function importStoreList(list) {
+  if (!Array.isArray(list) || list.length > 500) throw new Error('store list must contain at most 500 items');
+  const normalized = [];
+  const seen = new Set();
+  let skipped = 0;
+  for (const item of list) {
+    try {
+      const shop = normalizeShopUrl(typeof item === 'string' ? item : item?.url);
+      if (seen.has(shop.id)) { skipped++; continue; }
+      seen.add(shop.id);
+      normalized.push({ ...shop, name: String(item?.name || shop.id).slice(0, 500) });
+    } catch (_) {
+      skipped++;
+    }
+  }
+  const db = getDb();
+  const insert = db.prepare('INSERT OR IGNORE INTO stores (id, url, name, addedAt, lastUpdated, status, error, products) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+  const addedIds = [];
+  const now = new Date().toISOString();
+  const transaction = db.transaction(() => {
+    for (const shop of normalized) {
+      const result = insert.run(shop.id, shop.url, shop.name, now, null, 'pending', '', '[]');
+      if (result.changes) addedIds.push(shop.id);
+      else skipped++;
+    }
+  });
+  transaction();
+  return { addedIds, skipped };
+}
+
 function removeStore(storeId) {
   const db = getDb();
   validateStoreId(storeId);
@@ -344,7 +374,7 @@ function exportAllData() {
   const refreshConfig = getRefreshConfig();
   const productLabels = db.prepare('SELECT product_key, name, category, confidence, manual, created_at FROM product_labels').all();
   const labelChanges = db.prepare('SELECT product_key, name, old_category, new_category, changed_at FROM label_changes').all();
-  return { stores, priceHistory, filterConfig, refreshConfig, productLabels, labelChanges };
+  return { stores, priceHistory, filterConfig, refreshConfig, storeOrder: getStoreOrder(), productLabels, labelChanges };
 }
 
 function normalizeProduct(product) {
@@ -452,8 +482,8 @@ function importAllData(data) {
   if (storeIds.size !== stores.length) throw new Error('店铺ID重复');
   const historyRows = normalizeHistory(data, storeIds);
   const refreshConfig = data.refreshConfig ? normalizeRefreshConfig(data.refreshConfig) : null;
-  const productLabels = data.productLabels === undefined ? null : data.productLabels;
-  if (productLabels && (!Array.isArray(productLabels) || productLabels.length > 100000)) throw new Error('商品标签格式错误');
+  const productLabels = data.productLabels === undefined ? [] : data.productLabels;
+  if (!Array.isArray(productLabels) || productLabels.length > 100000) throw new Error('商品标签格式错误');
   if (productLabels) {
     for (const label of productLabels) {
       if (!label || typeof label !== 'object') throw new Error('商品标签格式错误');
@@ -462,11 +492,25 @@ function importAllData(data) {
       if (!storeIds.has(ownerId)) throw new Error('商品标签引用了不存在的店铺');
     }
   }
+  const storeOrder = data.storeOrder === undefined ? [] : normalizeStoreOrder(data.storeOrder);
+  if (storeOrder.some(id => !storeIds.has(id))) throw new Error('storeOrder references an unknown store');
+  const labelChanges = Array.isArray(data.labelChanges) ? data.labelChanges : [];
+  if (labelChanges.length > 100000) throw new Error('鍒嗙被鍙樻洿璁板綍瓒呰繃闄愬埗');
+  for (const change of labelChanges) {
+    if (!change || typeof change !== 'object') throw new Error('鍒嗙被鍙樻洿璁板綍鏍煎紡閿欒');
+    const ownerId = String(change.product_key || '').split(':')[0];
+    if (!storeIds.has(ownerId)) throw new Error('label change references an unknown store');
+    validateCategory(change.new_category);
+    if (change.old_category) validateCategory(change.old_category);
+  }
   const transaction = db.transaction(() => {
     db.exec('DELETE FROM price_history; DELETE FROM stores; DELETE FROM config');
     const insertStore = db.prepare('INSERT INTO stores (id, url, name, addedAt, lastUpdated, status, error, products) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
     for (const s of stores) {
       insertStore.run(s.id, s.url, s.name || '', s.addedAt || '', s.lastUpdated || null, s.status || 'ok', s.error || '', JSON.stringify(s.products || []));
+    }
+    if (storeOrder.length) {
+      db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('storeOrder', ?)").run(JSON.stringify(storeOrder));
     }
     const insertHistory = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
     for (const row of historyRows) insertHistory.run(row.productKey, row.price, row.stock ?? null, row.date);
@@ -483,9 +527,7 @@ function importAllData(data) {
         insertLabel.run(label.product_key, String(label.name || '').slice(0, 1000), label.category, Number(label.confidence) || 1, label.manual ? 1 : 0, label.created_at || new Date().toISOString());
       }
       const insertChange = db.prepare('INSERT INTO label_changes (product_key, name, old_category, new_category, changed_at) VALUES (?, ?, ?, ?, ?)');
-      for (const change of Array.isArray(data.labelChanges) ? data.labelChanges.slice(0, 100000) : []) {
-        validateCategory(change.new_category);
-        if (change.old_category) validateCategory(change.old_category);
+      for (const change of labelChanges) {
         insertChange.run(change.product_key, String(change.name || '').slice(0, 1000), change.old_category || null, change.new_category, change.changed_at || new Date().toISOString());
       }
     }
@@ -521,7 +563,9 @@ function exportStore(storeId) {
     if (!priceHistory[r.product_key]) priceHistory[r.product_key] = [];
     priceHistory[r.product_key].push({ price: r.price, stock: r.stock, date: r.date });
   }
-  return { stores: [s], priceHistory, exportedAt: new Date().toISOString() };
+  const productLabels = db.prepare('SELECT product_key, name, category, confidence, manual, created_at FROM product_labels WHERE product_key LIKE ?').all(prefix + '%');
+  const labelChanges = db.prepare('SELECT product_key, name, old_category, new_category, changed_at FROM label_changes WHERE product_key LIKE ?').all(prefix + '%');
+  return { stores: [s], priceHistory, productLabels, labelChanges, exportedAt: new Date().toISOString() };
 }
 
 function importSingleStore(data) {
@@ -530,6 +574,19 @@ function importSingleStore(data) {
   if (!Array.isArray(data.stores) || data.stores.length !== 1) throw new Error('单店铺导入必须包含一个店铺');
   const s = normalizeStoreRecord(data.stores[0]);
   const historyRows = normalizeHistory(data, new Set([s.id]), s.id);
+  const productLabels = data.productLabels === undefined ? [] : data.productLabels;
+  if (!Array.isArray(productLabels) || productLabels.length > 100000) throw new Error('鍟嗗搧鏍囩鏍煎紡閿欒');
+  for (const label of productLabels) {
+    if (!label || typeof label !== 'object' || !String(label.product_key || '').startsWith(`${s.id}:`)) throw new Error('label references another store');
+    validateCategory(label.category);
+  }
+  const labelChanges = Array.isArray(data.labelChanges) ? data.labelChanges : [];
+  if (labelChanges.length > 100000) throw new Error('鍒嗙被鍙樻洿璁板綍瓒呰繃闄愬埗');
+  for (const change of labelChanges) {
+    if (!change || typeof change !== 'object' || !String(change.product_key || '').startsWith(`${s.id}:`)) throw new Error('label change references another store');
+    validateCategory(change.new_category);
+    if (change.old_category) validateCategory(change.old_category);
+  }
   const transaction = db.transaction(() => {
     const existing = db.prepare('SELECT id FROM stores WHERE id = ?').get(s.id);
     if (existing) {
@@ -542,6 +599,21 @@ function importSingleStore(data) {
     }
     const insertHistory = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
     for (const row of historyRows) insertHistory.run(row.productKey, row.price, row.stock ?? null, row.date);
+    const productKeys = new Set(s.products.map(product => `${s.id}:${product.id}`));
+    const deleteLabels = db.prepare('DELETE FROM product_labels WHERE product_key = ?');
+    const deleteChanges = db.prepare('DELETE FROM label_changes WHERE product_key = ?');
+    for (const productKey of productKeys) {
+      deleteLabels.run(productKey);
+      deleteChanges.run(productKey);
+    }
+    const insertLabel = db.prepare('INSERT INTO product_labels (product_key, name, category, confidence, manual, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+    for (const label of productLabels) {
+      insertLabel.run(label.product_key, String(label.name || '').slice(0, 1000), label.category, Number(label.confidence) || 1, label.manual ? 1 : 0, label.created_at || new Date().toISOString());
+    }
+    const insertChange = db.prepare('INSERT INTO label_changes (product_key, name, old_category, new_category, changed_at) VALUES (?, ?, ?, ?, ?)');
+    for (const change of labelChanges) {
+      insertChange.run(change.product_key, String(change.name || '').slice(0, 1000), change.old_category || null, change.new_category, change.changed_at || new Date().toISOString());
+    }
   });
   transaction();
   return true;
@@ -601,7 +673,7 @@ function importAllHistory(data) {
 }
 
 module.exports = {
-  getAllStores, getStoreSummaries, getStore, addStore, removeStore, updateStore,
+  getAllStores, getStoreSummaries, getStore, addStore, importStoreList, removeStore, updateStore,
   recordPrices, getPriceHistory,
   getFilterConfig, updateFilterConfig,
   getRefreshConfig, updateRefreshConfig,
