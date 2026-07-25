@@ -1157,9 +1157,10 @@ function canonicalLegacyCategory(category, name = '') {
     const inferred = categorize(name);
     return inferred && inferred !== category && inferred !== 'other' ? canonicalLegacyCategory(inferred, name) : 'gpt_other';
   }
+  if (definition?.parent === 'gpt' && (definition.name === '其他' || definition.name === '其他GPT')) return 'gpt_other';
   const map = {
     'plus_已接码': 'gpt_plus', 'plus_未接码': 'gpt_plus', 'plus_质保': 'gpt_plus',
-    gpt_business: 'gpt_team', gpt_edu: 'gpt_k12', gptk12: 'gpt_k12', gemini: 'gemini_other',
+    gpt_business: 'gpt_team', gpt_edu: 'gpt_k12', gptk12: 'gpt_k12', gpt_其他: 'gpt_other', gpt其他: 'gpt_other', gemini: 'gemini_other',
     claude: 'claude_other', grok: 'grok_other', sms: 'sms_sms', gpt_image2: 'gpt_other', gpt_cyber: 'gpt_other',
     ai_platform_cursor: 'developer_tools_cursor', ai_platform_kiro: 'developer_tools_kiro',
     ai_platform_perplexity: 'other_ai_perplexity', 开发工具_codex: 'developer_tools_codex',
@@ -1197,6 +1198,16 @@ function definitionNameForCategory(category) {
   return filterConfig.categoryDefinitions?.find(item => item.id === category)?.name || '';
 }
 
+function normalizeStoredClassification(classification, fallbackCategory, name) {
+  if (!classification?.category) return legacyClassification(fallbackCategory, name);
+  const legacy = legacyClassification(classification.category, name);
+  return {
+    ...classification,
+    category: legacy.category,
+    attributes: { ...legacy.attributes, ...(classification.attributes || {}) },
+  };
+}
+
 function getAllProducts() {
   if (!productsDirty) return cachedProducts;
   const all = [];
@@ -1205,7 +1216,7 @@ function getAllProducts() {
       const pk = `${s.id}:${p.id}`;
       const label = productLabels[pk];
       const legacyCategory = resolveProductCategory(p.name, label ? label.category : '');
-      const classification = label?.classification?.category ? label.classification : legacyClassification(legacyCategory, p.name);
+      const classification = normalizeStoredClassification(label?.classification, legacyCategory, p.name);
       const cat = classification.category || canonicalLegacyCategory(legacyCategory, p.name);
       const conf = label ? label.confidence : 0;
       all.push({ ...p, category: cat, legacyCategory, confidence: conf, classification, productKey: pk, storeName: s.name, storeId: s.id });
