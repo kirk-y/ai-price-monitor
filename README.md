@@ -134,6 +134,10 @@ npm test
 - 数据采集：Axios、Cheerio
 - 数据存储：SQLite
 
+## 致谢
+
+感谢 [PriceAI.cc](https://priceai.cc) 及其开源项目 [physics-dimension/PriceAI](https://github.com/physics-dimension/PriceAI) 为本项目提供参考与启发。
+
 ## 项目地址
 
 [github.com/kirk-y/ai-price-monitor](https://github.com/kirk-y/ai-price-monitor)
