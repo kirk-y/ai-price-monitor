@@ -15,6 +15,7 @@ const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
 
 const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '100mb';
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
   throw new Error('PORT 必须是 1 到 65535 之间的整数');
@@ -72,7 +73,14 @@ function safeDownloadName(value, fallback = 'export') {
   return name || fallback;
 }
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
+
+app.use((err, req, res, next) => {
+  if (err?.type === 'entity.too.large') {
+    return res.status(413).json({ error: `导入文件过大，当前上限为 ${JSON_BODY_LIMIT}` });
+  }
+  return next(err);
+});
 
 process.on('unhandledRejection', (err) => {
   console.error('未处理的Promise拒绝:', err.message);
