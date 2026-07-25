@@ -46,6 +46,12 @@ test('does not confuse Kiro with Claude', () => {
   assert.equal(result.category, 'developer_tools_kiro');
 });
 
+test('K12 wins over Team wording in marketplace titles', () => {
+  const result = classifyProduct('GPT K12 Team 子号成品');
+  assert.equal(result.category, 'gpt_k12');
+  assert.equal(result.attributes.qualification, 'k12');
+});
+
 test('rejects duplicate rules in one dimension', () => {
   assert.throws(() => validateClassificationConfig({ rules: [
     { id: 'plus', dimension: 'tier', any: ['plus'] },

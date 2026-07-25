@@ -12,6 +12,8 @@ let storeWindowBusy = false;
 let activeCategory = 'gpt_plus';
 let activeCatL1 = 'gpt';
 let activeCatL2 = 'gpt_plus';
+let plusDetailsExpanded = activeCatL2 === 'gpt_plus';
+let activePlusDetail = localStorage.getItem('activePlusDetail') || 'all';
 let renderLimit = 30;
 let expandedNoStock = {};
 let includeWords = [];
@@ -125,6 +127,7 @@ function handleActionClick(event) {
     'remove-word': () => removeWord(target.dataset.word, target.dataset.type),
     'set-cat-l1': () => setCatL1(target.dataset.category),
     'set-cat-l2': () => setCatL2(target.dataset.category),
+    'set-plus-detail': () => setPlusDetail(target.dataset.detail),
     'set-cat-all': () => setAllCategories(),
     'switch-store': () => switchStore(target.dataset.storeId),
     'go-best-price': () => goToBestPrice(target.dataset.storeId, target.dataset.category, target.dataset.productId),
@@ -473,12 +476,15 @@ function categoryDefinitionsForParent(parent) {
 
 function syncCategoryDefinitions() {
   const definitions = getCategoryDefinitions();
-  if (Number(filterConfig.classificationCatalogVersion || 0) < 2) {
+  if (Number(filterConfig.classificationCatalogVersion || 0) < 3) {
     const known = new Set(definitions.map(item => item.id));
     for (const item of categoryDefinitionSeed()) {
       if (!known.has(item.id)) definitions.push(item);
     }
-    filterConfig.classificationCatalogVersion = 2;
+    const preferredGptOrder = ['gpt_plus', 'gpt_pro', 'gpt_team', 'gpt_k12', 'gpt_free', 'gpt_go', 'gpt_other'];
+    const existingOrder = Array.isArray(filterConfig.categoryOrder) ? filterConfig.categoryOrder : [];
+    filterConfig.categoryOrder = [...preferredGptOrder, ...existingOrder.filter(id => !preferredGptOrder.includes(id))];
+    filterConfig.classificationCatalogVersion = 3;
   }
   for (const item of definitions) {
     CAT_LABELS[item.id] = item.name;
@@ -1139,7 +1145,7 @@ function resolveProductCategory(name, labelCategory) {
   const category = labelCategory || categorize(name);
   // Explicit free-account wording is stronger than a stale Plus subcategory label.
   if (/free\s*号|free\s*账号|普号|普通号|白号/i.test(String(name)) && /^plus_/.test(category)) return 'gpt_free';
-  if (!labelCategory && /\bk12\b/i.test(String(name))) return 'gptk12';
+  if (!labelCategory && /\bk12\b/i.test(String(name))) return 'gpt_k12';
   return category;
 }
 
@@ -1153,7 +1159,7 @@ function canonicalLegacyCategory(category, name = '') {
   }
   const map = {
     'plus_已接码': 'gpt_plus', 'plus_未接码': 'gpt_plus', 'plus_质保': 'gpt_plus',
-    gpt_team: 'gpt_business', gptk12: 'gpt_other', gemini: 'gemini_other',
+    gpt_business: 'gpt_team', gpt_edu: 'gpt_k12', gptk12: 'gpt_k12', gemini: 'gemini_other',
     claude: 'claude_other', grok: 'grok_other', sms: 'sms_sms', gpt_image2: 'gpt_other', gpt_cyber: 'gpt_other',
     ai_platform_cursor: 'developer_tools_cursor', ai_platform_kiro: 'developer_tools_kiro',
     ai_platform_perplexity: 'other_ai_perplexity', 开发工具_codex: 'developer_tools_codex',
@@ -1182,7 +1188,7 @@ function legacyClassification(category, name = '') {
   if (category === 'plus_未接码') attributes.verification = 'unverified';
   if (category === 'plus_已接码') attributes.verification = 'verified';
   if (category === 'plus_质保') attributes.warranty = 'warranty';
-  if (category === 'gptk12') attributes.qualification = 'k12';
+  if (category === 'gptk12' || category === 'gpt_k12') attributes.qualification = 'k12';
   if (definitionNameForCategory(category) === '自助充值') attributes.activation = 'self_service';
   return { category: canonicalLegacyCategory(category, name), attributes, legacy: true };
 }
@@ -1233,6 +1239,9 @@ function getFilteredProducts() {
   } else if (activeCatL1) {
     all = all.filter(p => catL1Display(catL1FromFull(p.category)) === activeCatL1);
   }
+  if (activeCatL2 === 'gpt_plus' && activePlusDetail !== 'all') {
+    all = all.filter(product => matchesPlusDetail(product, activePlusDetail));
+  }
   if (includeWords.length || excludeWords.length) all = all.filter(p => matchesSearch(p.name));
   all.sort((a, b) => {
     if ((a.stock > 0) !== (b.stock > 0)) return a.stock > 0 ? -1 : 1;
@@ -1256,7 +1265,7 @@ function computeBestPrices() {
 }
 
 const CAT_LABELS = {
-  gpt_plus: 'GPT Plus', gpt_business: 'GPT Business/Team', gpt_edu: 'GPT Edu', gpt_other: '其他GPT',
+  gpt_plus: 'GPT Plus', gpt_team: 'GPT Team', gpt_k12: 'GPT K12', gpt_business: 'GPT Team', gpt_edu: 'GPT K12', gpt_other: '其他GPT',
   claude_free: 'Claude Free', claude_team: 'Claude Team', claude_enterprise: 'Claude Enterprise', claude_other: '其他Claude',
   gemini_free: 'Gemini Free', gemini_ai_pro: 'Google AI Pro', gemini_ai_ultra: 'Google AI Ultra', gemini_workspace: 'Gemini Workspace', gemini_other: '其他Gemini',
   grok_free: 'Grok Free', grok_supergrok: 'SuperGrok', grok_other: '其他Grok',
@@ -1405,7 +1414,8 @@ function renderCatBar() {
       return definition && counts[full] && catL1Display(definition.parent) === activeCatL1;
     });
     l2Buttons = sorted.map(full => {
-      return `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" data-action="set-cat-l2" data-category="${escapeHtml(full)}">${escapeHtml(categoryDisplayLabel(full))} <span class="cat-cnt">${counts[full]||0}</span></button>`;
+      const button = `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" data-action="set-cat-l2" data-category="${escapeHtml(full)}">${escapeHtml(categoryDisplayLabel(full))} <span class="cat-cnt">${counts[full]||0}</span></button>`;
+      return full === 'gpt_plus' && plusDetailsExpanded ? button + renderPlusDetails(all) : button;
     }).join('');
   }
 
@@ -1419,6 +1429,7 @@ function setCatL1(l1) {
   activeCatL1 = l1;
   activeCatL2 = '';
   activeCategory = '';
+  plusDetailsExpanded = false;
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
   render();
@@ -1430,6 +1441,7 @@ function setAllCategories() {
   activeCatL1 = '';
   activeCatL2 = '';
   activeCategory = '';
+  plusDetailsExpanded = false;
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
   render();
@@ -1438,6 +1450,11 @@ function setAllCategories() {
 function setCatL2(full) {
   historicalBestMode = false;
   historyBestStoreId = '';
+  if (full === 'gpt_plus') {
+    plusDetailsExpanded = activeCatL2 === 'gpt_plus' ? !plusDetailsExpanded : true;
+  } else {
+    plusDetailsExpanded = false;
+  }
   activeCatL2 = full;
   activeCategory = full;
   renderLimit = 30;
@@ -1445,11 +1462,61 @@ function setCatL2(full) {
   render();
 }
 
+const PLUS_DETAIL_OPTIONS = [
+  ['all', '全部Plus'],
+  ['unverified', '未接码'],
+  ['verified', '已接码'],
+  ['self_service', '自助开通'],
+  ['warranty', '有质保'],
+];
+if (!PLUS_DETAIL_OPTIONS.some(([key]) => key === activePlusDetail)) activePlusDetail = 'all';
+
+function matchesPlusDetail(product, detail) {
+  const attributes = product.classification?.attributes || {};
+  if (detail === 'unverified' || detail === 'verified') return attributes.verification === detail;
+  if (detail === 'self_service') return attributes.activation === detail;
+  if (detail === 'warranty') return attributes.warranty === detail;
+  return true;
+}
+
+function renderPlusDetails(products) {
+  const plusProducts = products.filter(product => product.category === 'gpt_plus');
+  return `<span class="plus-detail-group">${PLUS_DETAIL_OPTIONS.map(([key, label]) => {
+    const count = key === 'all' ? plusProducts.length : plusProducts.filter(product => matchesPlusDetail(product, key)).length;
+    return `<button class="cat-btn plus-detail-btn ${activePlusDetail === key ? 'active' : ''}" data-action="set-plus-detail" data-detail="${key}">${label} <span class="cat-cnt">${count}</span></button>`;
+  }).join('')}</span>`;
+}
+
+function setPlusDetail(detail) {
+  if (!PLUS_DETAIL_OPTIONS.some(([key]) => key === detail)) return;
+  activeCatL1 = 'gpt';
+  activeCatL2 = 'gpt_plus';
+  activeCategory = 'gpt_plus';
+  plusDetailsExpanded = true;
+  activePlusDetail = detail;
+  localStorage.setItem('activePlusDetail', detail);
+  renderLimit = 30;
+  priceRange = { min: 0, max: 0 };
+  render();
+  requestAnimationFrame(ensurePlusDetailsVisible);
+}
+
 function setCategory(cat) {
   activeCategory = cat;
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
   render();
+  if (full === 'gpt_plus' && plusDetailsExpanded) requestAnimationFrame(ensurePlusDetailsVisible);
+}
+
+function ensurePlusDetailsVisible() {
+  const group = document.querySelector('.plus-detail-group');
+  const row = group?.closest('.cat-bar-row-l2');
+  if (!group || !row) return;
+  const groupBox = group.getBoundingClientRect();
+  const rowBox = row.getBoundingClientRect();
+  if (groupBox.right > rowBox.right) row.scrollBy({ left: groupBox.right - rowBox.right + 16, behavior: 'smooth' });
+  else if (groupBox.left < rowBox.left) row.scrollBy({ left: groupBox.left - rowBox.left - 16, behavior: 'smooth' });
 }
 
 function render() {
@@ -1893,7 +1960,7 @@ function matchesHistoricalCategory(product, category) {
   if (category === 'plus_已接码') return product.category === 'gpt_plus' && attributes.verification === 'verified';
   if (category === 'plus_质保') return product.category === 'gpt_plus' && attributes.warranty === 'warranty';
   if (category === 'gptk12') return product.category.startsWith('gpt_') && attributes.qualification === 'k12';
-  if (category === 'gpt_team') return product.category === 'gpt_business';
+  if (category === 'gpt_team') return product.category === 'gpt_team';
   return product.category === canonicalLegacyCategory(category) || product.legacyCategory === category;
 }
 
@@ -2258,7 +2325,7 @@ function classificationAttributeLabels(attributes) {
 function categoryKey(l1, l2) {
   if (l1 === '其他') return '其他';
   if (l1 === 'gpt' && l2.startsWith('plus_')) return l2;
-  if (l1 === 'gpt' && l2 === 'k12') return 'gptk12';
+  if (l1 === 'gpt' && l2 === 'k12') return 'gpt_k12';
   if (l1 === 'sms' && l2 === '接码') return 'sms';
   return `${l1}_${l2}`;
 }
@@ -2323,7 +2390,7 @@ const CAT_L2_MAP = {
   'network_cloud': ['proxy','vpn','cloud_server','domain','virtual_card','other'],
   'recharge_life': ['game','platform','redeem_code','ecommerce','coupon','other'],
   'other': ['tutorial','enterprise_service','review','other'],
-  'gpt': ['plus','pro','business','free','edu','other','plus_已接码','plus_未接码','plus_质保','team','k12','go','max','image2','cyber','其他'],
+  'gpt': ['plus','pro','team','k12','free','go','other','plus_已接码','plus_未接码','plus_质保','business','edu','max','image2','cyber','其他'],
   'claude': ['free','pro','max','team','enterprise','other','kiro','其他'],
   'gemini': ['free','ai_pro','ai_ultra','workspace','other','pro年卡','优惠链接','成品号','其他'],
   'grok': ['free','supergrok','other','super_grok','普号','其他'],

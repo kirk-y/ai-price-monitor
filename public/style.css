@@ -633,6 +633,42 @@ button:disabled {
   color: #fff;
 }
 
+.plus-detail-group {
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 2px;
+  margin: 0 8px 0 2px;
+  padding: 2px 3px;
+  border-left: 2px solid color-mix(in srgb, var(--primary) 35%, var(--border));
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--primary-light) 32%, transparent);
+}
+
+.plus-detail-btn {
+  flex-shrink: 0;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text3);
+  cursor: pointer;
+  padding: 3px 7px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.plus-detail-btn:hover {
+  color: var(--text);
+  background: var(--card-bg);
+}
+
+.plus-detail-btn.active {
+  border-color: color-mix(in srgb, var(--primary) 24%, var(--border));
+  background: color-mix(in srgb, var(--primary-light) 72%, var(--card-bg));
+  color: var(--primary);
+  font-weight: 600;
+}
+
 .cat-cnt {
   margin-left: 2px;
   font-size: 9px;

@@ -143,7 +143,7 @@ function classifyProduct(name, config = DEFAULT_CLASSIFICATION_CONFIG) {
 const DEFAULT_CLASSIFICATION_CONFIG = {
   version: RULE_VERSION,
   taxonomy: [
-    { id: 'gpt', label: 'GPT', children: ['free', 'plus', 'pro', 'business', 'edu', 'go', 'other'] },
+    { id: 'gpt', label: 'GPT', children: ['free', 'plus', 'pro', 'team', 'k12', 'go', 'other'] },
     { id: 'claude', label: 'Claude', children: ['free', 'pro', 'max', 'team', 'enterprise', 'other'] },
     { id: 'gemini', label: 'Gemini', children: ['free', 'ai_pro', 'ai_ultra', 'workspace', 'other'] },
     { id: 'grok', label: 'Grok', children: ['free', 'supergrok', 'other'] },
@@ -172,7 +172,8 @@ const DEFAULT_CLASSIFICATION_CONFIG = {
     { id: 'recharge_life', dimension: 'product', label: '充值与生活', priority: 20, any: ['充值卡', '兑换码', '生活券', '优惠券'] },
     { id: 'plus', dimension: 'tier', label: 'Plus', products: ['gpt'], priority: 30, any: ['plus'], exclude: ['pro', 'business', 'team', 'free', '普通号', '普号', '白号'] },
     { id: 'pro', dimension: 'tier', label: 'Pro', products: ['gpt', 'claude'], priority: 35, any: ['pro', 'pro账号'], exclude: ['claude max', 'supergrok'] },
-    { id: 'business', dimension: 'tier', label: 'Business/Team', products: ['gpt'], priority: 45, any: ['business', 'team', '团队版'] },
+    { id: 'k12', dimension: 'tier', label: 'K12', products: ['gpt'], priority: 100, any: ['k12', 'chatgpt edu', 'gpt edu'] },
+    { id: 'team', dimension: 'tier', label: 'Team', products: ['gpt'], priority: 50, any: ['business', 'team', '团队版'], exclude: ['k12'] },
     { id: 'go', dimension: 'tier', label: 'Go', products: ['gpt'], priority: 55, any: ['gpt go', 'go会员'] },
     { id: 'free', dimension: 'tier', label: 'Free', products: ['gpt', 'claude', 'gemini', 'grok'], priority: 50, any: ['free', '普通号', '普号', '白号'], exclude: ['plus', 'pro'] },
     { id: 'max', dimension: 'tier', label: 'Max', products: ['claude'], priority: 40, any: ['max'] },
