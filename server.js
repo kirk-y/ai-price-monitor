@@ -3,6 +3,7 @@ const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { scrapeShop, classifyProducts } = require('./scraper');
+const { buildFeedbackSuggestions, classifyProduct, validateClassificationConfig } = require('./classification');
 const store = require('./store');
 const {
   isLoopbackHost,
@@ -270,12 +271,20 @@ app.put('/api/product-labels/:productKey', (req, res) => {
     const previousCategory = req.body?.previousCategory
       ? validateCategory(req.body.previousCategory)
       : null;
-    const result = store.setProductLabel(
+    let result = store.setProductLabel(
       req.params.productKey,
       String(req.body?.name || '').slice(0, 1000),
       category,
       previousCategory,
     );
+    if (req.body?.attributes && typeof req.body.attributes === 'object') {
+      const attributeResult = store.setProductClassificationAttributes(
+        req.params.productKey,
+        String(req.body?.name || '').slice(0, 1000),
+        req.body.attributes,
+      );
+      result = { ...result, label: attributeResult.label, attributeChanges: attributeResult.changes };
+    }
     res.json({ success: true, ...result });
   } catch (err) {
     res.status(400).json({ error: err.message });
@@ -323,6 +332,108 @@ app.get('/api/filter-config', (req, res) => {
 app.put('/api/filter-config', (req, res) => {
   try {
     res.json(store.updateFilterConfig(req.body));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/api/classification/config', (req, res) => {
+  res.json(store.getClassificationConfig());
+});
+
+app.put('/api/classification/config', (req, res) => {
+  try {
+    res.json(store.updateClassificationConfig(req.body));
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+function classificationCandidates(requestedProducts) {
+  if (Array.isArray(requestedProducts)) {
+    return requestedProducts.slice(0, 5000).map(item => ({
+      productKey: String(item?.productKey || '').slice(0, 500),
+      name: String(item?.name || '').slice(0, 1000),
+      currentCategory: item?.currentCategory ? String(item.currentCategory).slice(0, 80) : null,
+    })).filter(item => item.productKey && item.name);
+  }
+  const labels = new Map(store.getLabeledData().map(label => [label.product_key, label]));
+  const products = [];
+  for (const shop of store.getAllStores()) {
+    for (const product of shop.products || []) {
+      const productKey = `${shop.id}:${product.id}`;
+      products.push({ productKey, name: product.name, currentCategory: labels.get(productKey)?.category || null });
+      if (products.length >= 5000) return products;
+    }
+  }
+  return products;
+}
+
+app.post('/api/classification/preview', requireStrictLimit, (req, res) => {
+  try {
+    const config = req.body?.config
+      ? validateClassificationConfig(req.body.config)
+      : store.getClassificationConfig();
+    const candidates = classificationCandidates(req.body?.products);
+    const items = candidates.map(product => ({
+      ...product,
+      result: classifyProduct(product.name, config),
+    }));
+    const summary = items.reduce((acc, item) => {
+      acc.total++;
+      if (item.result.needsReview) acc.needsReview++;
+      if (item.currentCategory && item.currentCategory === item.result.category) acc.unchanged++;
+      else if (item.currentCategory) acc.changed++;
+      else acc.unclassified++;
+      return acc;
+    }, { total: 0, unchanged: 0, changed: 0, unclassified: 0, needsReview: 0 });
+    res.json({ summary, items });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/classification/apply', requireStrictLimit, (req, res) => {
+  try {
+    const config = store.getClassificationConfig();
+    const candidates = classificationCandidates(req.body?.products);
+    let saved = 0;
+    let skipped = 0;
+    let needsReview = 0;
+    for (const product of candidates) {
+      const result = classifyProduct(product.name, config);
+      if (result.needsReview && req.body?.includeNeedsReview !== true) {
+        needsReview++;
+        continue;
+      }
+      const outcome = store.saveClassificationResult(product.productKey, product.name, result);
+      if (outcome.skipped) skipped++; else saved++;
+    }
+    res.json({ success: true, total: candidates.length, saved, skippedManual: skipped, needsReview });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/api/classification/feedback', (req, res) => {
+  res.json(store.getClassificationFeedback(req.query.limit));
+});
+
+app.get('/api/classification/suggestions', (req, res) => {
+  const feedback = store.getClassificationFeedback(1000);
+  res.json({ suggestions: buildFeedbackSuggestions(feedback) });
+});
+
+app.post('/api/classification/feedback', requireStrictLimit, (req, res) => {
+  try {
+    store.recordClassificationFeedback(
+      String(req.body?.productKey || '').slice(0, 500),
+      String(req.body?.name || '').slice(0, 1000),
+      String(req.body?.dimension || ''),
+      req.body?.oldValue ? String(req.body.oldValue).slice(0, 80) : null,
+      String(req.body?.newValue || ''),
+    );
+    res.json({ success: true });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

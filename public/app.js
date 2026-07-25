@@ -1,4 +1,5 @@
 let filterConfig = {};
+let classificationConfig = { version: 2, taxonomy: [], rules: [] };
 let refreshConfig = {};
 let storeSummaries = [];
 let stores = [];
@@ -8,9 +9,11 @@ let hiddenStoreIds = [];
 let storeWindowStart = 0;
 let storeWindowEnd = 4;
 let storeWindowBusy = false;
-let activeCategory = 'plus_未接码';
+let activeCategory = 'gpt_plus';
 let activeCatL1 = 'gpt';
-let activeCatL2 = 'plus_未接码';
+let activeCatL2 = 'gpt_plus';
+let plusDetailsExpanded = activeCatL2 === 'gpt_plus';
+let activePlusDetail = localStorage.getItem('activePlusDetail') || 'all';
 let renderLimit = 30;
 let expandedNoStock = {};
 let includeWords = [];
@@ -124,6 +127,7 @@ function handleActionClick(event) {
     'remove-word': () => removeWord(target.dataset.word, target.dataset.type),
     'set-cat-l1': () => setCatL1(target.dataset.category),
     'set-cat-l2': () => setCatL2(target.dataset.category),
+    'set-plus-detail': () => setPlusDetail(target.dataset.detail),
     'set-cat-all': () => setAllCategories(),
     'switch-store': () => switchStore(target.dataset.storeId),
     'go-best-price': () => goToBestPrice(target.dataset.storeId, target.dataset.category, target.dataset.productId),
@@ -224,6 +228,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.addEventListener(type, handleActionDrag);
   });
   filterConfig = await (await apiFetch('/api/filter-config')).json();
+  classificationConfig = await (await apiFetch('/api/classification/config')).json();
   syncCategoryDefinitions();
   hiddenStoreIds = Array.isArray(filterConfig.hiddenStoreIds) ? filterConfig.hiddenStoreIds : [];
   suggestedKeywords = filterConfig.suggestedKeywords || ['GPT', 'Plus', 'Pro', 'Team', '接码', '直充', '成品', '账号', 'Claude', 'Gemini', 'OpenAI', 'SMS', '谷歌', '微软', '邮箱', 'API', '订阅', '会员', 'Access'];
@@ -371,6 +376,10 @@ function initSettings() {
   document.getElementById('categoryManagerAdd').addEventListener('click', addCategoryDefinition);
   document.getElementById('categoryManagerFilter').addEventListener('change', renderCategoryManager);
   document.getElementById('categoryManagerSearch').addEventListener('input', renderCategoryManager);
+  document.getElementById('classificationDimensionFilter').addEventListener('change', renderClassificationRules);
+  document.getElementById('classificationSaveBtn').addEventListener('click', saveClassificationRules);
+  document.getElementById('classificationPreviewBtn').addEventListener('click', previewClassificationRules);
+  document.getElementById('classificationApplyBtn').addEventListener('click', applyClassificationRules);
   document.querySelectorAll('.settings-option').forEach(el => {
     el.addEventListener('click', () => switchSettingsOption(el.dataset.option));
   });
@@ -467,6 +476,16 @@ function categoryDefinitionsForParent(parent) {
 
 function syncCategoryDefinitions() {
   const definitions = getCategoryDefinitions();
+  if (Number(filterConfig.classificationCatalogVersion || 0) < 3) {
+    const known = new Set(definitions.map(item => item.id));
+    for (const item of categoryDefinitionSeed()) {
+      if (!known.has(item.id)) definitions.push(item);
+    }
+    const preferredGptOrder = ['gpt_plus', 'gpt_pro', 'gpt_team', 'gpt_k12', 'gpt_free', 'gpt_go', 'gpt_other'];
+    const existingOrder = Array.isArray(filterConfig.categoryOrder) ? filterConfig.categoryOrder : [];
+    filterConfig.categoryOrder = [...preferredGptOrder, ...existingOrder.filter(id => !preferredGptOrder.includes(id))];
+    filterConfig.classificationCatalogVersion = 3;
+  }
   for (const item of definitions) {
     CAT_LABELS[item.id] = item.name;
   }
@@ -633,6 +652,128 @@ function switchSettingsOption(option) {
   const panel = document.getElementById('settingsPanel' + option.charAt(0).toUpperCase() + option.slice(1));
   if (panel) panel.classList.add('active');
   if (option === 'labels') setTimeout(loadLabelManager, 50);
+  if (option === 'classification') setTimeout(renderClassificationRules, 0);
+}
+
+const CLASSIFICATION_DIMENSION_LABELS = {
+  product: '主产品', tier: '套餐', subtype: '二级分类', verification: '接码状态',
+  activation: '开通方式', warranty: '质保', usage: '使用方式', qualification: '账号资格',
+};
+
+function renderClassificationRules() {
+  const container = document.getElementById('classificationRuleList');
+  if (!container) return;
+  const selected = document.getElementById('classificationDimensionFilter')?.value || '';
+  const rules = (classificationConfig.rules || []).filter(rule => !selected || rule.dimension === selected);
+  container.innerHTML = rules.map((rule, index) => `
+    <div class="classification-rule" data-rule-id="${escapeHtml(rule.id)}" data-rule-dimension="${escapeHtml(rule.dimension)}">
+      <div class="classification-rule-head">
+        <label><input type="checkbox" data-rule-field="enabled" ${rule.enabled !== false ? 'checked' : ''}>启用</label>
+        <strong>${escapeHtml(rule.label || rule.id)}</strong>
+        <span>${escapeHtml(CLASSIFICATION_DIMENSION_LABELS[rule.dimension] || rule.dimension)}</span>
+        <label>优先级 <input type="number" data-rule-field="priority" value="${Number(rule.priority) || 0}" min="-1000" max="1000"></label>
+      </div>
+      <div class="classification-rule-fields">
+        <label>适用产品<input data-rule-field="products" value="${escapeHtml((rule.products || []).join(', '))}" placeholder="gpt, claude"></label>
+        <label>必须包含<input data-rule-field="all" value="${escapeHtml((rule.all || []).join(', '))}" placeholder="所有词都要命中"></label>
+        <label>任一包含<input data-rule-field="any" value="${escapeHtml((rule.any || []).join(', '))}" placeholder="命中任意一个"></label>
+        <label>必须排除<input data-rule-field="exclude" value="${escapeHtml((rule.exclude || []).join(', '))}" placeholder="命中后立即排除"></label>
+        <label>降低权重<input data-rule-field="negative" value="${escapeHtml((rule.negative || []).join(', '))}" placeholder="命中后扣分"></label>
+      </div>
+    </div>`).join('') || '<div class="empty-grid">该维度暂无规则</div>';
+}
+
+function splitRuleTerms(value) {
+  return String(value || '').split(/[,，\n]/).map(term => term.trim()).filter(Boolean);
+}
+
+function collectClassificationRules() {
+  const edited = new Map();
+  document.querySelectorAll('.classification-rule').forEach(row => {
+    const key = `${row.dataset.ruleDimension}:${row.dataset.ruleId}`;
+    const current = (classificationConfig.rules || []).find(rule => `${rule.dimension}:${rule.id}` === key);
+    if (!current) return;
+    const read = field => row.querySelector(`[data-rule-field="${field}"]`);
+    edited.set(key, {
+      ...current,
+      enabled: read('enabled').checked,
+      priority: Number(read('priority').value) || 0,
+      products: splitRuleTerms(read('products').value),
+      all: splitRuleTerms(read('all').value),
+      any: splitRuleTerms(read('any').value),
+      exclude: splitRuleTerms(read('exclude').value),
+      negative: splitRuleTerms(read('negative').value),
+    });
+  });
+  return {
+    ...classificationConfig,
+    rules: (classificationConfig.rules || []).map(rule => edited.get(`${rule.dimension}:${rule.id}`) || rule),
+  };
+}
+
+async function saveClassificationRules() {
+  const msg = document.getElementById('classificationMsg');
+  try {
+    const response = await apiFetch('/api/classification/config', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(collectClassificationRules()),
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '保存失败');
+    classificationConfig = result;
+    msg.textContent = '规则已保存';
+    renderClassificationRules();
+    return true;
+  } catch (error) {
+    msg.textContent = `保存失败：${error.message}`;
+    return false;
+  }
+}
+
+async function previewClassificationRules() {
+  const msg = document.getElementById('classificationMsg');
+  const output = document.getElementById('classificationPreview');
+  msg.textContent = '正在对现有商品进行影子分类...';
+  try {
+    const [response, suggestionResponse] = await Promise.all([apiFetch('/api/classification/preview', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: collectClassificationRules() }),
+    }), apiFetch('/api/classification/suggestions')]);
+    const data = await response.json();
+    const suggestionData = suggestionResponse.ok ? await suggestionResponse.json() : { suggestions: [] };
+    if (!response.ok) throw new Error(data.error || '预览失败');
+    const summary = data.summary;
+    msg.textContent = `预览完成：${summary.total} 件商品`;
+    const examples = data.items.filter(item => item.result.needsReview || (item.currentCategory && item.currentCategory !== item.result.category)).slice(0, 30);
+    const suggestions = (suggestionData.suggestions || []).slice(0, 12);
+    output.innerHTML = `<div class="classification-summary">
+      <span>保持 ${summary.unchanged}</span><span>可能变化 ${summary.changed}</span><span>未分类 ${summary.unclassified}</span><span>待确认 ${summary.needsReview}</span>
+    </div>${suggestions.length ? `<div class="classification-suggestions"><strong>根据人工反馈生成的建议</strong>${suggestions.map(item => `<span>${item.type === 'exclude' ? '排除' : '包含'} · ${escapeHtml(item.dimension)} / ${escapeHtml(item.value)}：${escapeHtml(item.term)}（${item.support}次）</span>`).join('')}</div>` : ''}${examples.map(item => `<div class="classification-preview-row"><span title="${escapeHtml(item.name)}">${escapeHtml(item.name)}</span><code>${escapeHtml(item.currentCategory || '未分类')}</code><span>→</span><code>${escapeHtml(item.result.category)}</code>${item.result.needsReview ? '<em>待确认</em>' : ''}</div>`).join('')}`;
+  } catch (error) {
+    msg.textContent = `预览失败：${error.message}`;
+  }
+}
+
+async function applyClassificationRules() {
+  const msg = document.getElementById('classificationMsg');
+  if (!confirm('将使用当前规则更新非人工标签。人工确认过的分类不会被覆盖，是否继续？')) return;
+  if (!await saveClassificationRules()) return;
+  msg.textContent = '正在应用可靠分类结果...';
+  try {
+    const response = await apiFetch('/api/classification/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+    });
+    const result = await response.json();
+    if (!response.ok) throw new Error(result.error || '应用失败');
+    msg.textContent = `已更新 ${result.saved} 件，跳过人工标签 ${result.skippedManual} 件，待确认 ${result.needsReview} 件`;
+    productLabels = {};
+    const labels = await (await apiFetch('/api/product-labels')).json();
+    for (const label of labels) productLabels[label.product_key] = label;
+    markDirty();
+    render();
+  } catch (error) {
+    msg.textContent = `应用失败：${error.message}`;
+  }
 }
 
 async function saveRefreshConfig() {
@@ -1004,8 +1145,67 @@ function resolveProductCategory(name, labelCategory) {
   const category = labelCategory || categorize(name);
   // Explicit free-account wording is stronger than a stale Plus subcategory label.
   if (/free\s*号|free\s*账号|普号|普通号|白号/i.test(String(name)) && /^plus_/.test(category)) return 'gpt_free';
-  if (!labelCategory && /\bk12\b/i.test(String(name))) return 'gptk12';
+  if (!labelCategory && /\bk12\b/i.test(String(name))) return 'gpt_k12';
   return category;
+}
+
+function canonicalLegacyCategory(category, name = '') {
+  const definition = Array.isArray(filterConfig.categoryDefinitions)
+    ? filterConfig.categoryDefinitions.find(item => item.id === category)
+    : null;
+  if (definition?.name === '自助充值') {
+    const inferred = categorize(name);
+    return inferred && inferred !== category && inferred !== 'other' ? canonicalLegacyCategory(inferred, name) : 'gpt_other';
+  }
+  if (definition?.parent === 'gpt' && (definition.name === '其他' || definition.name === '其他GPT')) return 'gpt_other';
+  const map = {
+    'plus_已接码': 'gpt_plus', 'plus_未接码': 'gpt_plus', 'plus_质保': 'gpt_plus',
+    gpt_business: 'gpt_team', gpt_edu: 'gpt_k12', gptk12: 'gpt_k12', gpt_其他: 'gpt_other', gpt其他: 'gpt_other', gemini: 'gemini_other',
+    claude: 'claude_other', grok: 'grok_other', sms: 'sms_sms', gpt_image2: 'gpt_other', gpt_cyber: 'gpt_other',
+    ai_platform_cursor: 'developer_tools_cursor', ai_platform_kiro: 'developer_tools_kiro',
+    ai_platform_perplexity: 'other_ai_perplexity', 开发工具_codex: 'developer_tools_codex',
+    邮箱_gmail: 'email_gmail', 邮箱_outlook: 'email_outlook', 邮箱_icloud: 'email_icloud',
+    中转额度: 'relay_api_relay', 中转额度_额度充值: 'relay_api_relay', 中转额度_中转券: 'relay_api_relay',
+  };
+  if (map[category]) return map[category];
+  if (category.startsWith('视频会员_')) return 'digital_membership_video';
+  if (category.startsWith('音乐会员_')) return 'digital_membership_music';
+  if (category.startsWith('网盘_')) return 'digital_membership_cloud_drive';
+  if (category.startsWith('阅读会员_')) return 'digital_membership_reading';
+  if (category.startsWith('Adobe_') || category.startsWith('修图剪辑_')) return 'digital_membership_software';
+  if (category.startsWith('生活券_')) return 'recharge_life_coupon';
+  if (category.startsWith('卡密兑换_')) return 'recharge_life_redeem_code';
+  if (category.startsWith('电商工具_')) return 'recharge_life_ecommerce';
+  if (category.startsWith('虚拟卡_')) return 'network_cloud_virtual_card';
+  if (category.startsWith('IP代理_')) return category.toLowerCase().includes('vpn') ? 'network_cloud_vpn' : 'network_cloud_proxy';
+  if (category.startsWith('云服务_')) return 'network_cloud_cloud_server';
+  if (category.startsWith('号码_')) return 'sms_number_rental';
+  if (category.startsWith('开发工具_')) return `developer_tools_${category.slice('开发工具_'.length)}`;
+  return category;
+}
+
+function legacyClassification(category, name = '') {
+  const attributes = {};
+  if (category === 'plus_未接码') attributes.verification = 'unverified';
+  if (category === 'plus_已接码') attributes.verification = 'verified';
+  if (category === 'plus_质保') attributes.warranty = 'warranty';
+  if (category === 'gptk12' || category === 'gpt_k12') attributes.qualification = 'k12';
+  if (definitionNameForCategory(category) === '自助充值') attributes.activation = 'self_service';
+  return { category: canonicalLegacyCategory(category, name), attributes, legacy: true };
+}
+
+function definitionNameForCategory(category) {
+  return filterConfig.categoryDefinitions?.find(item => item.id === category)?.name || '';
+}
+
+function normalizeStoredClassification(classification, fallbackCategory, name) {
+  if (!classification?.category) return legacyClassification(fallbackCategory, name);
+  const legacy = legacyClassification(classification.category, name);
+  return {
+    ...classification,
+    category: legacy.category,
+    attributes: { ...legacy.attributes, ...(classification.attributes || {}) },
+  };
 }
 
 function getAllProducts() {
@@ -1015,9 +1215,11 @@ function getAllProducts() {
     for (const p of (s.products || [])) {
       const pk = `${s.id}:${p.id}`;
       const label = productLabels[pk];
-      const cat = resolveProductCategory(p.name, label ? label.category : '');
+      const legacyCategory = resolveProductCategory(p.name, label ? label.category : '');
+      const classification = normalizeStoredClassification(label?.classification, legacyCategory, p.name);
+      const cat = classification.category || canonicalLegacyCategory(legacyCategory, p.name);
       const conf = label ? label.confidence : 0;
-      all.push({ ...p, category: cat, confidence: conf, productKey: pk, storeName: s.name, storeId: s.id });
+      all.push({ ...p, category: cat, legacyCategory, confidence: conf, classification, productKey: pk, storeName: s.name, storeId: s.id });
     }
   }
   cachedProducts = all;
@@ -1048,6 +1250,9 @@ function getFilteredProducts() {
   } else if (activeCatL1) {
     all = all.filter(p => catL1Display(catL1FromFull(p.category)) === activeCatL1);
   }
+  if (activeCatL2 === 'gpt_plus' && activePlusDetail !== 'all') {
+    all = all.filter(product => matchesPlusDetail(product, activePlusDetail));
+  }
   if (includeWords.length || excludeWords.length) all = all.filter(p => matchesSearch(p.name));
   all.sort((a, b) => {
     if ((a.stock > 0) !== (b.stock > 0)) return a.stock > 0 ? -1 : 1;
@@ -1071,6 +1276,10 @@ function computeBestPrices() {
 }
 
 const CAT_LABELS = {
+  gpt_plus: 'GPT Plus', gpt_team: 'GPT Team', gpt_k12: 'GPT K12', gpt_business: 'GPT Team', gpt_edu: 'GPT K12', gpt_other: '其他GPT',
+  claude_free: 'Claude Free', claude_team: 'Claude Team', claude_enterprise: 'Claude Enterprise', claude_other: '其他Claude',
+  gemini_free: 'Gemini Free', gemini_ai_pro: 'Google AI Pro', gemini_ai_ultra: 'Google AI Ultra', gemini_workspace: 'Gemini Workspace', gemini_other: '其他Gemini',
+  grok_free: 'Grok Free', grok_supergrok: 'SuperGrok', grok_other: '其他Grok',
   plus_已接码: 'Plus已接码', plus_未接码: 'Plus未接码', plus_质保: 'Plus质保',
   gpt_pro: 'GPT Pro', gpt_team: 'GPT Team', gemini: 'Gemini', claude: 'Claude',
   grok: 'Grok', sms: '接码', gptk12: 'K12', gpt_free: 'GPT Free', gpt_go: 'GPT GO',
@@ -1079,6 +1288,14 @@ const CAT_LABELS = {
   gemini_优惠链接: 'Gemini优惠', gemini_成品号: 'Gemini成品',
   ai_platform_cursor: 'Cursor', ai_platform_perplexity: 'Perplexity',
   ai_platform_kiro: 'KIRO',
+  developer_tools_cursor: 'Cursor', developer_tools_codex: 'Codex', developer_tools_kiro: 'Kiro', developer_tools_copilot: 'GitHub Copilot',
+  other_ai_perplexity: 'Perplexity', other_ai_poe: 'Poe', other_ai_midjourney: 'Midjourney', other_ai_suno: 'Suno',
+  email_gmail: 'Gmail', email_outlook: 'Outlook', email_icloud: 'iCloud', email_enterprise: '企业邮箱',
+  sms_sms: '短信接码', sms_number_rental: '号码租用', sms_esim: '实体卡/eSIM',
+  relay_api_relay: 'API中转', relay_official_api: '官方API额度', relay_web_mirror: '网页镜像', relay_shared_gateway: '共享网关',
+  digital_membership_video: '视频会员', digital_membership_music: '音乐会员', digital_membership_cloud_drive: '网盘会员',
+  network_cloud_proxy: 'IP代理', network_cloud_vpn: 'VPN/加速', network_cloud_cloud_server: '云服务器', network_cloud_virtual_card: '虚拟卡',
+  recharge_life_game: '游戏充值', recharge_life_platform: '平台充值', recharge_life_redeem_code: '卡密兑换', recharge_life_coupon: '生活券',
   邮箱_gmail: 'Gmail', 邮箱_outlook: 'Outlook', 邮箱_icloud: 'iCloud',
   邮箱_hotmail: 'Hotmail', 邮箱_教育邮箱: '教育邮箱', 邮箱_企业邮箱: '企业邮箱',
   号码_美国: '美国号码', 号码_印度: '印度号码', 号码_英国: '英国号码',
@@ -1112,10 +1329,12 @@ function isGptCategory(category) {
     || category === 'gptk12';
 }
 
-const CAT_L1_DISPLAY = ['gpt', 'claude', 'gemini', 'grok', 'ai_platform', '邮箱', '接码', '中转', '其他'];
+const CAT_L1_DISPLAY = ['gpt', 'claude', 'gemini', 'grok', 'other_ai', 'developer_tools', 'sms', 'email', 'relay', 'digital_membership', 'network_cloud', 'recharge_life', 'other'];
 
 const CAT_L1_LABELS = {
   gpt: 'GPT', claude: 'Claude', gemini: 'Gemini', grok: 'Grok',
+  other_ai: '其他 AI', developer_tools: 'AI开发工具', sms: '接码', email: '邮箱', relay: '中转/镜像',
+  digital_membership: '数字会员', network_cloud: '网络与云服务', recharge_life: '充值与生活', other: '其他',
   ai_platform: 'AI平台', 邮箱: '邮箱', 号码: '号码', 社交账号: '社交',
   视频会员: '视频', 音乐会员: '音乐', 生活券: '生活券', 网盘: '网盘',
   阅读会员: '阅读', QQ会员: 'QQ', 云服务: '云服务', 中转额度: '中转',
@@ -1203,10 +1422,11 @@ function renderCatBar() {
     const configuredIds = categoryOrderWithDefinitions().filter(id => !hidden.has(id));
     const sorted = configuredIds.filter(full => {
       const definition = definitions.find(item => item.id === full);
-      return definition && catL1Display(definition.parent) === activeCatL1;
+      return definition && counts[full] && catL1Display(definition.parent) === activeCatL1;
     });
     l2Buttons = sorted.map(full => {
-      return `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" data-action="set-cat-l2" data-category="${escapeHtml(full)}">${escapeHtml(categoryDisplayLabel(full))} <span class="cat-cnt">${counts[full]||0}</span></button>`;
+      const button = `<button class="cat-btn cat-btn-l2 ${activeCatL2 === full ? 'active' : ''}" data-action="set-cat-l2" data-category="${escapeHtml(full)}">${escapeHtml(categoryDisplayLabel(full))} <span class="cat-cnt">${counts[full]||0}</span></button>`;
+      return full === 'gpt_plus' && plusDetailsExpanded ? button + renderPlusDetails(all) : button;
     }).join('');
   }
 
@@ -1220,6 +1440,7 @@ function setCatL1(l1) {
   activeCatL1 = l1;
   activeCatL2 = '';
   activeCategory = '';
+  plusDetailsExpanded = false;
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
   render();
@@ -1231,6 +1452,7 @@ function setAllCategories() {
   activeCatL1 = '';
   activeCatL2 = '';
   activeCategory = '';
+  plusDetailsExpanded = false;
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
   render();
@@ -1239,6 +1461,11 @@ function setAllCategories() {
 function setCatL2(full) {
   historicalBestMode = false;
   historyBestStoreId = '';
+  if (full === 'gpt_plus') {
+    plusDetailsExpanded = activeCatL2 === 'gpt_plus' ? !plusDetailsExpanded : true;
+  } else {
+    plusDetailsExpanded = false;
+  }
   activeCatL2 = full;
   activeCategory = full;
   renderLimit = 30;
@@ -1246,11 +1473,61 @@ function setCatL2(full) {
   render();
 }
 
+const PLUS_DETAIL_OPTIONS = [
+  ['all', '全部Plus'],
+  ['unverified', '未接码'],
+  ['verified', '已接码'],
+  ['self_service', '自助开通'],
+  ['warranty', '有质保'],
+];
+if (!PLUS_DETAIL_OPTIONS.some(([key]) => key === activePlusDetail)) activePlusDetail = 'all';
+
+function matchesPlusDetail(product, detail) {
+  const attributes = product.classification?.attributes || {};
+  if (detail === 'unverified' || detail === 'verified') return attributes.verification === detail;
+  if (detail === 'self_service') return attributes.activation === detail;
+  if (detail === 'warranty') return attributes.warranty === detail;
+  return true;
+}
+
+function renderPlusDetails(products) {
+  const plusProducts = products.filter(product => product.category === 'gpt_plus');
+  return `<span class="plus-detail-group">${PLUS_DETAIL_OPTIONS.map(([key, label]) => {
+    const count = key === 'all' ? plusProducts.length : plusProducts.filter(product => matchesPlusDetail(product, key)).length;
+    return `<button class="cat-btn plus-detail-btn ${activePlusDetail === key ? 'active' : ''}" data-action="set-plus-detail" data-detail="${key}">${label} <span class="cat-cnt">${count}</span></button>`;
+  }).join('')}</span>`;
+}
+
+function setPlusDetail(detail) {
+  if (!PLUS_DETAIL_OPTIONS.some(([key]) => key === detail)) return;
+  activeCatL1 = 'gpt';
+  activeCatL2 = 'gpt_plus';
+  activeCategory = 'gpt_plus';
+  plusDetailsExpanded = true;
+  activePlusDetail = detail;
+  localStorage.setItem('activePlusDetail', detail);
+  renderLimit = 30;
+  priceRange = { min: 0, max: 0 };
+  render();
+  requestAnimationFrame(ensurePlusDetailsVisible);
+}
+
 function setCategory(cat) {
   activeCategory = cat;
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
   render();
+  if (full === 'gpt_plus' && plusDetailsExpanded) requestAnimationFrame(ensurePlusDetailsVisible);
+}
+
+function ensurePlusDetailsVisible() {
+  const group = document.querySelector('.plus-detail-group');
+  const row = group?.closest('.cat-bar-row-l2');
+  if (!group || !row) return;
+  const groupBox = group.getBoundingClientRect();
+  const rowBox = row.getBoundingClientRect();
+  if (groupBox.right > rowBox.right) row.scrollBy({ left: groupBox.right - rowBox.right + 16, behavior: 'smooth' });
+  else if (groupBox.left < rowBox.left) row.scrollBy({ left: groupBox.left - rowBox.left - 16, behavior: 'smooth' });
 }
 
 function render() {
@@ -1665,7 +1942,7 @@ function hideStoreLoadingOverlay() {
 function renderBestPrices() {
   let pool = getAllProducts().filter(p => !isStoreHidden(p.storeId));
   if (includeWords.length || excludeWords.length) pool = pool.filter(p => matchesSearch(p.name));
-  const gptEntries = visibleCatEntries().filter(([k]) => isGptCategory(k));
+  const gptEntries = visibleCatEntries().filter(([k]) => isGptCategory(k) && pool.some(product => product.category === k));
   document.getElementById('bestPriceList').innerHTML = gptEntries.map(([k, label]) => {
     const items = pool.filter(p => p.category === k && p.price > 0 && p.stock > 0).sort((a, b) => a.price - b.price);
     if (!items.length) return `<div class="bp-item"><div class="bp-cat">${label}</div><div class="bp-na">暂无</div></div>`;
@@ -1684,8 +1961,19 @@ const HISTORY_BEST_CATEGORIES = [
   ['plus_质保', 'GPT Plus 质保'], ['gpt_free', 'GPT Free'],
   ['gptk12', 'GPT K12'], ['gpt_team', 'GPT Team'],
   ['claude_pro', 'Claude Pro'], ['claude_max', 'Claude MAX'],
-  ['claude_kiro', 'Claude Kiro'],
+  ['developer_tools_kiro', 'Kiro'],
 ];
+
+function matchesHistoricalCategory(product, category) {
+  if (!product) return false;
+  const attributes = product.classification?.attributes || {};
+  if (category === 'plus_未接码') return product.category === 'gpt_plus' && attributes.verification === 'unverified';
+  if (category === 'plus_已接码') return product.category === 'gpt_plus' && attributes.verification === 'verified';
+  if (category === 'plus_质保') return product.category === 'gpt_plus' && attributes.warranty === 'warranty';
+  if (category === 'gptk12') return product.category.startsWith('gpt_') && attributes.qualification === 'k12';
+  if (category === 'gpt_team') return product.category === 'gpt_team';
+  return product.category === canonicalLegacyCategory(category) || product.legacyCategory === category;
+}
 
 function visibleHistoryBestCategories() {
   const saved = filterConfig.historyBestVisibleCategories;
@@ -1774,7 +2062,7 @@ async function renderHistoricalBestPrices() {
     const daily = new Map();
     for (const [productKey, entries] of Object.entries(historyBestData)) {
       const product = productMap.get(productKey);
-      const categoryMatches = product && (product.category === category || (category === 'claude_kiro' && product.category === 'ai_platform_kiro'));
+      const categoryMatches = matchesHistoricalCategory(product, category);
       if (!categoryMatches) continue;
       for (const entry of entries || []) {
         const price = Number(entry.price);
@@ -2010,10 +2298,11 @@ function renderProductCard(p) {
   const categoryText = escapeHtml(categoryDisplayLabel(category));
   const categoryClass = safeCssToken(category);
   const price = Number.isFinite(Number(p.price)) ? Number(p.price) : 0;
+  const attributeLabels = classificationAttributeLabels(p.classification?.attributes);
 
   return `<div class="product-card ${inStock ? 'has-stock' : 'no-stock'}" data-price="${price}" data-product-id="${escapeHtml(p.id)}">
     <div class="pc-top">
-      ${category !== 'other' ? `<span class="tag tag-${categoryClass}" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="${escapeHtml(category)}" data-confidence="${confidence}" title="点击修改分类 (置信度: ${confPct}%)">${categoryText}${confPct > 0 ? `<small> ${confPct}%</small>` : ''}</span>` : `<span class="tag tag-other" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="其他" data-confidence="0" title="点击添加分类">其他</span>`}
+      <div class="pc-tags">${category !== 'other' ? `<span class="tag tag-${categoryClass}" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="${escapeHtml(category)}" data-confidence="${confidence}" title="点击修改分类">${categoryText}</span>` : `<span class="tag tag-other" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="其他" data-confidence="0" title="点击添加分类">其他</span>`}${attributeLabels.map(label => `<span class="tag tag-attribute">${escapeHtml(label)}</span>`).join('')}</div>
       <span class="pc-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</span>
     </div>
     <div class="pc-mid">
@@ -2027,10 +2316,27 @@ function renderProductCard(p) {
   </div>`;
 }
 
+function classificationAttributeLabels(attributes) {
+  if (!attributes || typeof attributes !== 'object') return [];
+  const labels = {
+    unverified: '未接码', verified: '已接码', not_required: '无需接码',
+    self_service: '自助开通', ready_account: '成品号', top_up: '代充',
+    no_warranty: '无质保', warranty: '有质保', exclusive: '独享', shared: '共享',
+    k12: 'K12', higher_education: '高校',
+  };
+  const ordered = ['verification', 'activation', 'warranty', 'usage', 'qualification'];
+  const result = ordered.map(key => labels[attributes[key]]).filter(Boolean);
+  if (attributes.warrantyDays) {
+    const index = result.indexOf('有质保');
+    if (index >= 0) result[index] = `质保${attributes.warrantyDays}天`;
+  }
+  return result.slice(0, 5);
+}
+
 function categoryKey(l1, l2) {
   if (l1 === '其他') return '其他';
   if (l1 === 'gpt' && l2.startsWith('plus_')) return l2;
-  if (l1 === 'gpt' && l2 === 'k12') return 'gptk12';
+  if (l1 === 'gpt' && l2 === 'k12') return 'gpt_k12';
   if (l1 === 'sms' && l2 === '接码') return 'sms';
   return `${l1}_${l2}`;
 }
@@ -2044,6 +2350,19 @@ function editLabel(productKey, name, currentCat, confidence) {
     const full = item.id;
     return `<option value="${escapeHtml(full)}" ${full === currentCat || item.name === l2 ? 'selected' : ''}>${escapeHtml(item.name)}</option>`;
   }).join('');
+  const storedClassification = productLabels[productKey]?.classification;
+  const currentClassification = storedClassification?.category
+    ? storedClassification
+    : legacyClassification(productLabels[productKey]?.category || currentCat, name);
+  const attributes = currentClassification.attributes || {};
+  const attributeSelect = (id, label, options, value) => `<label class="label-attribute-field">${label}<select id="${id}">${options.map(([key, text]) => `<option value="${key}" ${key === (value || 'unknown') ? 'selected' : ''}>${text}</option>`).join('')}</select></label>`;
+  const attributeFields = [
+    attributeSelect('labelVerification', '接码', [['unknown','未知'],['unverified','未接码'],['verified','已接码'],['not_required','无需接码']], attributes.verification),
+    attributeSelect('labelActivation', '开通', [['unknown','未知'],['self_service','自助开通'],['ready_account','成品号'],['top_up','代充'],['invite_link','邀请链接'],['redeem_code','兑换码']], attributes.activation),
+    attributeSelect('labelWarranty', '质保', [['unknown','未知'],['warranty','有质保'],['no_warranty','无质保']], attributes.warranty),
+    attributeSelect('labelUsage', '使用', [['unknown','未知'],['exclusive','独享'],['shared','共享']], attributes.usage),
+    attributeSelect('labelQualification', '资格', [['unknown','未知'],['k12','K12'],['higher_education','高校'],['teacher','教师'],['student','学生'],['enterprise','企业']], attributes.qualification),
+  ].join('');
   const div = document.createElement('div');
   div.id = 'labelOverlay';
   div.style.cssText = 'position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.4);z-index:9999;display:flex;align-items:center;justify-content:center';
@@ -2055,6 +2374,7 @@ function editLabel(productKey, name, currentCat, confidence) {
       <select id="labelSelectL1" data-change-action="edit-label-l1" style="flex:1;padding:8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)">${l1Opts}</select>
       <select id="labelSelect" style="flex:1;padding:8px;border:1px solid var(--border2);border-radius:6px;font-size:13px;background:var(--card-bg);color:var(--text)">${l2Opts}</select>
     </div>
+    <div class="label-attribute-grid">${attributeFields}</div>
     <div style="display:flex;gap:8px;justify-content:flex-end">
       <button data-action="close-label-editor" style="padding:8px 16px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;cursor:pointer;font-size:13px">取消</button>
       <button data-action="save-label" data-product-key="${escapeHtml(productKey)}" data-product-name="${escapeHtml(name)}" data-previous-category="${escapeHtml(currentCat)}" style="padding:8px 16px;background:var(--primary);color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:13px;font-weight:600">保存</button>
@@ -2070,13 +2390,21 @@ function onEditL1Change() {
   l2sel.innerHTML = subs.map(item => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join('');
 }
 
-const CAT_L1 = ['gpt','claude','gemini','grok','ai_platform','邮箱','号码','社交账号','视频会员','音乐会员','生活券','网盘','阅读会员','QQ会员','云服务','中转额度','教程服务','IP代理','卡密兑换','虚拟卡','开发工具','电商工具','企业服务','反重力','Adobe','修图剪辑','AI平台','sms','其他'];
+const CAT_L1 = ['gpt','claude','gemini','grok','other_ai','developer_tools','sms','email','relay','digital_membership','network_cloud','recharge_life','other','ai_platform','邮箱','号码','社交账号','视频会员','音乐会员','生活券','网盘','阅读会员','QQ会员','云服务','中转额度','教程服务','IP代理','卡密兑换','虚拟卡','开发工具','电商工具','企业服务','反重力','Adobe','修图剪辑','AI平台','其他'];
 
 const CAT_L2_MAP = {
-  'gpt': ['plus_已接码','plus_未接码','plus_质保','pro','team','k12','free','go','max','image2','cyber','其他'],
-  'claude': ['pro','max','kiro','其他'],
-  'gemini': ['pro年卡','优惠链接','成品号','其他'],
-  'grok': ['super_grok','普号','其他'],
+  'other_ai': ['perplexity','poe','midjourney','suno','other'],
+  'developer_tools': ['cursor','codex','kiro','copilot','other'],
+  'email': ['gmail','outlook','icloud','enterprise','other'],
+  'relay': ['api_relay','official_api','web_mirror','shared_gateway','other'],
+  'digital_membership': ['video','music','cloud_drive','reading','software','other'],
+  'network_cloud': ['proxy','vpn','cloud_server','domain','virtual_card','other'],
+  'recharge_life': ['game','platform','redeem_code','ecommerce','coupon','other'],
+  'other': ['tutorial','enterprise_service','review','other'],
+  'gpt': ['plus','pro','team','k12','free','go','other','plus_已接码','plus_未接码','plus_质保','business','edu','max','image2','cyber','其他'],
+  'claude': ['free','pro','max','team','enterprise','other','kiro','其他'],
+  'gemini': ['free','ai_pro','ai_ultra','workspace','other','pro年卡','优惠链接','成品号','其他'],
+  'grok': ['free','supergrok','other','super_grok','普号','其他'],
   'ai_platform': ['cursor','perplexity','kiro','koro','其他AI平台','其他'],
   '邮箱': ['gmail','outlook','icloud','hotmail','教育邮箱','企业邮箱','其他邮箱','其他'],
   '号码': ['美国','印度','英国','巴西','印尼','随机国家','香港','其他号码','其他'],
@@ -2100,7 +2428,7 @@ const CAT_L2_MAP = {
   'Adobe': ['Firefly','其他'],
   '修图剪辑': ['剪映','醒图','其他'],
   'AI平台': ['云梦AI','咕噜咕噜AI','其他'],
-  'sms': ['接码','其他'],
+  'sms': ['sms','number_rental','esim','other','接码','其他'],
   '其他': ['其他'],
 };
 
@@ -2253,7 +2581,13 @@ async function saveLabel(productKey, name, previousCategory) {
   const res = await apiFetch(`/api/product-labels/${encodeURIComponent(productKey)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ category, name, previousCategory }),
+    body: JSON.stringify({ category, name, previousCategory, attributes: {
+      verification: document.getElementById('labelVerification')?.value || 'unknown',
+      activation: document.getElementById('labelActivation')?.value || 'unknown',
+      warranty: document.getElementById('labelWarranty')?.value || 'unknown',
+      usage: document.getElementById('labelUsage')?.value || 'unknown',
+      qualification: document.getElementById('labelQualification')?.value || 'unknown',
+    } }),
   });
   if (res.ok) {
     const result = await res.json();

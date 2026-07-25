@@ -96,6 +96,48 @@ test('manual category updates keep labels and change records associated', () => 
   }
 });
 
+test('structured classifications and per-dimension feedback survive backups', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-classification-'));
+  const dbPath = path.join(tempDir, 'classification.db');
+  const script = `
+    const assert = require('node:assert/strict');
+    const store = require('./store');
+    const { classifyProduct } = require('./classification');
+    const shop = store.addStore('https://pay.ldxp.cn/shop/rules');
+    store.updateStore(shop.id, { products: [{ id: 'p1', name: 'GPT Plus 未接码 自助开通 质保30天', price: 10, stock: 1 }] });
+    const classified = classifyProduct('GPT Plus 未接码 自助开通 质保30天');
+    store.saveClassificationResult('rules:p1', classified.name, classified);
+    let label = store.getProductLabel('rules:p1');
+    assert.equal(label.category, 'gpt_plus');
+    assert.equal(label.classification.attributes.verification, 'unverified');
+    store.setProductLabel('rules:p1', classified.name, 'gpt_plus', 'gpt_plus');
+    store.setProductClassificationAttributes('rules:p1', classified.name, { verification: 'verified', warranty: 'warranty' });
+    label = store.getProductLabel('rules:p1');
+    assert.equal(label.classification.attributes.verification, 'verified');
+    assert.equal(store.getClassificationFeedback()[0].new_value, 'verified');
+    const backup = store.exportAllData();
+    assert.equal(backup.classificationConfig.version, 2);
+    assert.equal(backup.classificationFeedback.length, 1);
+    store.importAllData(backup);
+    assert.equal(store.getProductLabel('rules:p1').classification.attributes.verification, 'verified');
+    assert.equal(store.getClassificationFeedback()[0].dimension, 'verification');
+    const single = store.exportStore('rules');
+    store.importSingleStore(single);
+    assert.equal(store.getProductLabel('rules:p1').classification.attributes.warranty, 'warranty');
+    assert.equal(store.getClassificationFeedback().length, 1);
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, DB_PATH: dbPath },
+    encoding: 'utf8',
+  });
+  try {
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('full and single store backups preserve labels, history, and store order', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-backup-'));
   const dbPath = path.join(tempDir, 'backup.db');

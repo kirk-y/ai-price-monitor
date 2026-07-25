@@ -1,6 +1,7 @@
 const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const { DEFAULT_CLASSIFICATION_CONFIG, validateClassificationConfig } = require('./classification');
 const {
   normalizeRefreshConfig,
   normalizeShopUrl,
@@ -121,7 +122,27 @@ function initSchema() {
       new_category TEXT NOT NULL,
       changed_at TEXT DEFAULT (datetime('now','localtime'))
     );
+    CREATE TABLE IF NOT EXISTS classification_feedback (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      product_key TEXT NOT NULL,
+      name TEXT NOT NULL,
+      dimension TEXT NOT NULL,
+      old_value TEXT,
+      new_value TEXT NOT NULL,
+      classification_version INTEGER DEFAULT 2,
+      created_at TEXT DEFAULT (datetime('now','localtime'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_classification_feedback_product
+    ON classification_feedback(product_key, created_at DESC);
   `);
+
+  for (const statement of [
+    "ALTER TABLE product_labels ADD COLUMN classification_json TEXT DEFAULT '{}'",
+    "ALTER TABLE product_labels ADD COLUMN classification_version INTEGER DEFAULT 1",
+    "ALTER TABLE product_labels ADD COLUMN classification_source TEXT DEFAULT 'legacy'",
+  ]) {
+    try { db.exec(statement); } catch (_) { /* Existing databases already contain the column. */ }
+  }
 
   try {
     db.exec('ALTER TABLE price_history ADD COLUMN stock INTEGER');
@@ -245,6 +266,7 @@ function removeStore(storeId) {
     db.prepare('DELETE FROM price_history WHERE product_key LIKE ?').run(storeId + ':%');
     db.prepare('DELETE FROM product_labels WHERE product_key LIKE ?').run(storeId + ':%');
     db.prepare('DELETE FROM label_changes WHERE product_key LIKE ?').run(storeId + ':%');
+    db.prepare('DELETE FROM classification_feedback WHERE product_key LIKE ?').run(storeId + ':%');
   });
   transaction();
   return true;
@@ -296,6 +318,23 @@ function updateFilterConfig(config) {
   return config;
 }
 
+function getClassificationConfig() {
+  const row = getDb().prepare('SELECT value FROM config WHERE key = ?').get('classificationConfig');
+  if (!row) return validateClassificationConfig(DEFAULT_CLASSIFICATION_CONFIG);
+  try {
+    return validateClassificationConfig(JSON.parse(row.value));
+  } catch (_) {
+    return validateClassificationConfig(DEFAULT_CLASSIFICATION_CONFIG);
+  }
+}
+
+function updateClassificationConfig(config) {
+  const normalized = validateClassificationConfig(config);
+  getDb().prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)')
+    .run('classificationConfig', JSON.stringify(normalized));
+  return normalized;
+}
+
 const DEFAULT_REFRESH_CONFIG = {
   mode: 'random',
   minMinutes: 60,
@@ -320,7 +359,15 @@ function updateRefreshConfig(config) {
 }
 
 function getProductLabel(productKey) {
-  return getDb().prepare('SELECT * FROM product_labels WHERE product_key = ?').get(productKey) || null;
+  return serializeProductLabel(getDb().prepare('SELECT * FROM product_labels WHERE product_key = ?').get(productKey));
+}
+
+function serializeProductLabel(row) {
+  if (!row) return null;
+  let classification = null;
+  try { classification = JSON.parse(row.classification_json || 'null'); } catch (_) { classification = null; }
+  const { classification_json: _, ...label } = row;
+  return { ...label, classification };
 }
 
 function upsertProductLabel(productKey, name, category, confidence, manual) {
@@ -358,11 +405,95 @@ function getLabelChanges(limit = 100) {
 
 function getLabeledData() {
   return getDb().prepare(`
-    SELECT product_key, name, category, confidence, manual, created_at
+    SELECT product_key, name, category, confidence, manual, created_at,
+           classification_json, classification_version, classification_source
     FROM product_labels
     WHERE manual=1 OR confidence>0.3
     ORDER BY manual DESC, id DESC
-  `).all();
+  `).all().map(serializeProductLabel);
+}
+
+function saveClassificationResult(productKey, name, result, source = 'rules-v2') {
+  if (!result || typeof result !== 'object' || result.version !== 2) throw new Error('分类结果格式错误');
+  validateCategory(result.category);
+  const existing = getProductLabel(productKey);
+  if (existing?.manual) return { label: existing, skipped: true };
+  getDb().prepare(`
+    INSERT INTO product_labels
+      (product_key, name, category, confidence, manual, classification_json, classification_version, classification_source)
+    VALUES (?, ?, ?, ?, 0, ?, ?, ?)
+    ON CONFLICT(product_key) DO UPDATE SET
+      name=excluded.name, category=excluded.category, confidence=excluded.confidence,
+      classification_json=excluded.classification_json,
+      classification_version=excluded.classification_version,
+      classification_source=excluded.classification_source
+  `).run(
+    productKey,
+    String(name || '').slice(0, 1000),
+    result.category,
+    Number(result.dimensions?.product?.confidence || 0),
+    JSON.stringify(result),
+    result.version,
+    String(source || 'rules-v2').slice(0, 40),
+  );
+  return { label: getProductLabel(productKey), skipped: false };
+}
+
+function recordClassificationFeedback(productKey, name, dimension, oldValue, newValue) {
+  if (!/^[a-z][a-z0-9_-]{0,39}$/.test(String(dimension || ''))) throw new Error('反馈维度格式错误');
+  if (!/^[a-z][a-z0-9_-]{0,79}$/.test(String(newValue || ''))) throw new Error('反馈值格式错误');
+  getDb().prepare(`
+    INSERT INTO classification_feedback (product_key, name, dimension, old_value, new_value)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(productKey, String(name || '').slice(0, 1000), dimension, oldValue || null, newValue);
+}
+
+const CLASSIFICATION_ATTRIBUTE_VALUES = {
+  verification: new Set(['unverified', 'verified', 'not_required', 'unknown']),
+  activation: new Set(['self_service', 'ready_account', 'top_up', 'invite_link', 'redeem_code', 'unknown']),
+  warranty: new Set(['no_warranty', 'warranty', 'unknown']),
+  usage: new Set(['exclusive', 'shared', 'unknown']),
+  qualification: new Set(['k12', 'higher_education', 'teacher', 'student', 'enterprise', 'unknown']),
+};
+
+function setProductClassificationAttributes(productKey, name, attributes) {
+  if (!attributes || typeof attributes !== 'object' || Array.isArray(attributes)) throw new Error('分类属性格式错误');
+  const db = getDb();
+  const existing = getProductLabel(productKey);
+  if (!existing) throw new Error('商品标签不存在');
+  const previous = existing.classification && typeof existing.classification === 'object' ? existing.classification : {};
+  const previousAttributes = previous.attributes && typeof previous.attributes === 'object' ? previous.attributes : {};
+  const normalized = { ...previousAttributes };
+  const changes = [];
+  for (const [dimension, allowed] of Object.entries(CLASSIFICATION_ATTRIBUTE_VALUES)) {
+    if (!(dimension in attributes)) continue;
+    const value = String(attributes[dimension] || 'unknown');
+    if (!allowed.has(value)) throw new Error(`分类属性值错误: ${dimension}`);
+    if (value === 'unknown') delete normalized[dimension]; else normalized[dimension] = value;
+    const oldValue = previousAttributes[dimension] || 'unknown';
+    if (oldValue !== value) changes.push({ dimension, oldValue, newValue: value });
+  }
+  const classification = {
+    ...previous,
+    version: 2,
+    category: existing.category,
+    attributes: normalized,
+  };
+  const transaction = db.transaction(() => {
+    db.prepare(`UPDATE product_labels SET classification_json=?, classification_version=2,
+      classification_source='manual', manual=1 WHERE product_key=?`)
+      .run(JSON.stringify(classification), productKey);
+    for (const change of changes) {
+      recordClassificationFeedback(productKey, name, change.dimension, change.oldValue, change.newValue);
+    }
+  });
+  transaction();
+  return { label: getProductLabel(productKey), changes };
+}
+
+function getClassificationFeedback(limit = 200) {
+  return getDb().prepare('SELECT * FROM classification_feedback ORDER BY created_at DESC, id DESC LIMIT ?')
+    .all(Math.max(1, Math.min(1000, Number(limit) || 200)));
 }
 
 function exportAllData() {
@@ -375,10 +506,14 @@ function exportAllData() {
     priceHistory[r.product_key].push({ price: r.price, stock: r.stock, date: r.date });
   }
   const filterConfig = getFilterConfig();
+  const classificationConfig = getClassificationConfig();
   const refreshConfig = getRefreshConfig();
-  const productLabels = db.prepare('SELECT product_key, name, category, confidence, manual, created_at FROM product_labels').all();
+  const productLabels = db.prepare(`SELECT product_key, name, category, confidence, manual, created_at,
+    classification_json, classification_version, classification_source FROM product_labels`).all();
   const labelChanges = db.prepare('SELECT product_key, name, old_category, new_category, changed_at FROM label_changes').all();
-  return { stores, priceHistory, filterConfig, refreshConfig, storeOrder: getStoreOrder(), productLabels, labelChanges };
+  const classificationFeedback = db.prepare(`SELECT product_key, name, dimension, old_value, new_value,
+    classification_version, created_at FROM classification_feedback`).all();
+  return { stores, priceHistory, filterConfig, classificationConfig, refreshConfig, storeOrder: getStoreOrder(), productLabels, labelChanges, classificationFeedback };
 }
 
 function normalizeProduct(product) {
@@ -486,6 +621,9 @@ function importAllData(data) {
   if (storeIds.size !== stores.length) throw new Error('店铺ID重复');
   const historyRows = normalizeHistory(data, storeIds);
   const refreshConfig = data.refreshConfig ? normalizeRefreshConfig(data.refreshConfig) : null;
+  const classificationConfig = data.classificationConfig
+    ? validateClassificationConfig(data.classificationConfig)
+    : null;
   const productLabels = data.productLabels === undefined ? [] : data.productLabels;
   if (!Array.isArray(productLabels) || productLabels.length > 100000) throw new Error('商品标签格式错误');
   if (productLabels) {
@@ -507,6 +645,15 @@ function importAllData(data) {
     validateCategory(change.new_category);
     if (change.old_category) validateCategory(change.old_category);
   }
+  const classificationFeedback = Array.isArray(data.classificationFeedback) ? data.classificationFeedback : [];
+  if (classificationFeedback.length > 100000) throw new Error('分类反馈记录超过限制');
+  for (const feedback of classificationFeedback) {
+    if (!feedback || typeof feedback !== 'object') throw new Error('分类反馈记录格式错误');
+    const ownerId = String(feedback.product_key || '').split(':')[0];
+    if (!storeIds.has(ownerId)) throw new Error('分类反馈引用了不存在的店铺');
+    if (!/^[a-z][a-z0-9_-]{0,39}$/.test(String(feedback.dimension || ''))) throw new Error('分类反馈维度格式错误');
+    if (!/^[a-z][a-z0-9_-]{0,79}$/.test(String(feedback.new_value || ''))) throw new Error('分类反馈值格式错误');
+  }
   const transaction = db.transaction(() => {
     db.exec('DELETE FROM price_history; DELETE FROM stores; DELETE FROM config');
     const insertStore = db.prepare('INSERT INTO stores (id, url, name, addedAt, lastUpdated, status, error, products) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
@@ -524,15 +671,26 @@ function importAllData(data) {
     if (refreshConfig) {
       db.prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)').run('refreshConfig', JSON.stringify(refreshConfig));
     }
+    if (classificationConfig) {
+      db.prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)').run('classificationConfig', JSON.stringify(classificationConfig));
+    }
     if (productLabels) {
-      db.exec('DELETE FROM product_labels; DELETE FROM label_changes');
-      const insertLabel = db.prepare('INSERT INTO product_labels (product_key, name, category, confidence, manual, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+      db.exec('DELETE FROM product_labels; DELETE FROM label_changes; DELETE FROM classification_feedback');
+      const insertLabel = db.prepare(`INSERT INTO product_labels
+        (product_key, name, category, confidence, manual, created_at, classification_json, classification_version, classification_source)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
       for (const label of productLabels) {
-        insertLabel.run(label.product_key, String(label.name || '').slice(0, 1000), label.category, Number(label.confidence) || 1, label.manual ? 1 : 0, label.created_at || new Date().toISOString());
+        insertLabel.run(label.product_key, String(label.name || '').slice(0, 1000), label.category, Number(label.confidence) || 1, label.manual ? 1 : 0, label.created_at || new Date().toISOString(), label.classification_json || JSON.stringify(label.classification || {}), Number(label.classification_version) || 1, String(label.classification_source || 'import').slice(0, 40));
       }
       const insertChange = db.prepare('INSERT INTO label_changes (product_key, name, old_category, new_category, changed_at) VALUES (?, ?, ?, ?, ?)');
       for (const change of labelChanges) {
         insertChange.run(change.product_key, String(change.name || '').slice(0, 1000), change.old_category || null, change.new_category, change.changed_at || new Date().toISOString());
+      }
+      const insertFeedback = db.prepare(`INSERT INTO classification_feedback
+        (product_key, name, dimension, old_value, new_value, classification_version, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)`);
+      for (const feedback of classificationFeedback) {
+        insertFeedback.run(feedback.product_key, String(feedback.name || '').slice(0, 1000), feedback.dimension, feedback.old_value || null, feedback.new_value, Number(feedback.classification_version) || 2, feedback.created_at || new Date().toISOString());
       }
     }
   });
@@ -567,9 +725,12 @@ function exportStore(storeId) {
     if (!priceHistory[r.product_key]) priceHistory[r.product_key] = [];
     priceHistory[r.product_key].push({ price: r.price, stock: r.stock, date: r.date });
   }
-  const productLabels = db.prepare('SELECT product_key, name, category, confidence, manual, created_at FROM product_labels WHERE product_key LIKE ?').all(prefix + '%');
+  const productLabels = db.prepare(`SELECT product_key, name, category, confidence, manual, created_at,
+    classification_json, classification_version, classification_source FROM product_labels WHERE product_key LIKE ?`).all(prefix + '%');
   const labelChanges = db.prepare('SELECT product_key, name, old_category, new_category, changed_at FROM label_changes WHERE product_key LIKE ?').all(prefix + '%');
-  return { stores: [s], priceHistory, productLabels, labelChanges, exportedAt: new Date().toISOString() };
+  const classificationFeedback = db.prepare(`SELECT product_key, name, dimension, old_value, new_value,
+    classification_version, created_at FROM classification_feedback WHERE product_key LIKE ?`).all(prefix + '%');
+  return { stores: [s], priceHistory, productLabels, labelChanges, classificationFeedback, exportedAt: new Date().toISOString() };
 }
 
 function importSingleStore(data) {
@@ -591,6 +752,13 @@ function importSingleStore(data) {
     validateCategory(change.new_category);
     if (change.old_category) validateCategory(change.old_category);
   }
+  const classificationFeedback = Array.isArray(data.classificationFeedback) ? data.classificationFeedback : [];
+  if (classificationFeedback.length > 100000) throw new Error('分类反馈记录超过限制');
+  for (const feedback of classificationFeedback) {
+    if (!feedback || typeof feedback !== 'object' || !String(feedback.product_key || '').startsWith(`${s.id}:`)) throw new Error('分类反馈引用了其他店铺');
+    if (!/^[a-z][a-z0-9_-]{0,39}$/.test(String(feedback.dimension || ''))) throw new Error('分类反馈维度格式错误');
+    if (!/^[a-z][a-z0-9_-]{0,79}$/.test(String(feedback.new_value || ''))) throw new Error('分类反馈值格式错误');
+  }
   const transaction = db.transaction(() => {
     const existing = db.prepare('SELECT id FROM stores WHERE id = ?').get(s.id);
     if (existing) {
@@ -606,17 +774,27 @@ function importSingleStore(data) {
     const productKeys = new Set(s.products.map(product => `${s.id}:${product.id}`));
     const deleteLabels = db.prepare('DELETE FROM product_labels WHERE product_key = ?');
     const deleteChanges = db.prepare('DELETE FROM label_changes WHERE product_key = ?');
+    const deleteFeedback = db.prepare('DELETE FROM classification_feedback WHERE product_key = ?');
     for (const productKey of productKeys) {
       deleteLabels.run(productKey);
       deleteChanges.run(productKey);
+      deleteFeedback.run(productKey);
     }
-    const insertLabel = db.prepare('INSERT INTO product_labels (product_key, name, category, confidence, manual, created_at) VALUES (?, ?, ?, ?, ?, ?)');
+    const insertLabel = db.prepare(`INSERT INTO product_labels
+      (product_key, name, category, confidence, manual, created_at, classification_json, classification_version, classification_source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const label of productLabels) {
-      insertLabel.run(label.product_key, String(label.name || '').slice(0, 1000), label.category, Number(label.confidence) || 1, label.manual ? 1 : 0, label.created_at || new Date().toISOString());
+      insertLabel.run(label.product_key, String(label.name || '').slice(0, 1000), label.category, Number(label.confidence) || 1, label.manual ? 1 : 0, label.created_at || new Date().toISOString(), label.classification_json || JSON.stringify(label.classification || {}), Number(label.classification_version) || 1, String(label.classification_source || 'import').slice(0, 40));
     }
     const insertChange = db.prepare('INSERT INTO label_changes (product_key, name, old_category, new_category, changed_at) VALUES (?, ?, ?, ?, ?)');
     for (const change of labelChanges) {
       insertChange.run(change.product_key, String(change.name || '').slice(0, 1000), change.old_category || null, change.new_category, change.changed_at || new Date().toISOString());
+    }
+    const insertFeedback = db.prepare(`INSERT INTO classification_feedback
+      (product_key, name, dimension, old_value, new_value, classification_version, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`);
+    for (const feedback of classificationFeedback) {
+      insertFeedback.run(feedback.product_key, String(feedback.name || '').slice(0, 1000), feedback.dimension, feedback.old_value || null, feedback.new_value, Number(feedback.classification_version) || 2, feedback.created_at || new Date().toISOString());
     }
   });
   transaction();
@@ -680,9 +858,12 @@ module.exports = {
   getAllStores, getStoreSummaries, getStore, addStore, importStoreList, removeStore, updateStore,
   recordPrices, getPriceHistory,
   getFilterConfig, updateFilterConfig,
+  getClassificationConfig, updateClassificationConfig,
   getRefreshConfig, updateRefreshConfig,
   exportAllData, importAllData, exportStore, importSingleStore,
   getProductLabel, upsertProductLabel, setProductLabel, getLabeledData, recordLabelChange, getLabelChanges,
+  saveClassificationResult, recordClassificationFeedback, getClassificationFeedback,
+  setProductClassificationAttributes,
   getStoreOrder, updateStoreOrder,
   exportStoreHistory, exportAllHistory, importStoreHistory, importAllHistory,
 };
