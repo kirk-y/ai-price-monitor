@@ -22,6 +22,7 @@ const {
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
+app.set('trust proxy', process.env.TRUST_PROXY || 'loopback');
 
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const USER_TOKEN = process.env.USER_TOKEN || '';
@@ -29,9 +30,13 @@ const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '100mb';
 const MAX_IMPORT_FILE_BYTES = Number(process.env.MAX_IMPORT_FILE_BYTES || 150 * 1024 * 1024);
 const IMPORT_CHUNK_BYTES = 512 * 1024;
 const IMPORT_UPLOAD_TTL_MS = 30 * 60 * 1000;
+const VISITOR_REFRESH_COOLDOWN_MS = Number(process.env.VISITOR_REFRESH_COOLDOWN_MS || 60 * 1000);
 
 if (!Number.isSafeInteger(MAX_IMPORT_FILE_BYTES) || MAX_IMPORT_FILE_BYTES < IMPORT_CHUNK_BYTES) {
   throw new Error('MAX_IMPORT_FILE_BYTES must be at least 524288');
+}
+if (!Number.isSafeInteger(VISITOR_REFRESH_COOLDOWN_MS) || VISITOR_REFRESH_COOLDOWN_MS < 10000) {
+  throw new Error('VISITOR_REFRESH_COOLDOWN_MS must be at least 10000');
 }
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
@@ -173,6 +178,13 @@ app.put('/api/preferences', (req, res) => {
   if (!req.user.id) return res.status(403).json({ error: '访客偏好仅保存在当前浏览器' });
   try { res.json(store.updateUserPreferences(req.user.id, req.body)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+const visitorRefreshLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 12,
+  skip: req => req.role === 'admin' || req.role === 'operator',
+  message: { error: '单店铺更新操作过于频繁，请稍后再试' },
 });
 
 app.post('/api/system/clear-data', requireAdmin, requireStrictLimit, (req, res) => {
@@ -459,14 +471,31 @@ app.delete('/api/stores/:id', requireOperator, requireStrictLimit, (req, res) =>
   res.json({ success: store.removeStore(req.params.id) });
 });
 
-app.post('/api/stores/:id/refresh', requireOperator, requireStrictLimit, async (req, res) => {
+const visitorStoreRefreshes = new Map();
+
+app.post('/api/stores/:id/refresh', visitorRefreshLimiter, async (req, res) => {
   const s = store.getStore(req.params.id);
   if (!s) return res.status(404).json({ error: '店铺不存在' });
 
-  store.updateStore(s.id, { status: 'pending', error: '' });
-  res.json({ status: 'pending' });
+  const privileged = req.role === 'admin' || req.role === 'operator';
+  if (!privileged) {
+    const now = Date.now();
+    const lastAccepted = visitorStoreRefreshes.get(s.id) || 0;
+    const lastUpdated = s.lastUpdated ? Date.parse(s.lastUpdated) : 0;
+    const reference = Math.max(lastAccepted, Number.isFinite(lastUpdated) ? lastUpdated : 0);
+    const remainingMs = VISITOR_REFRESH_COOLDOWN_MS - (now - reference);
+    if (remainingMs > 0 && s.status !== 'pending') {
+      const retryAfter = Math.max(1, Math.ceil(remainingMs / 1000));
+      res.setHeader('Retry-After', String(retryAfter));
+      return res.status(429).json({ error: `该店铺刚更新过，请 ${retryAfter} 秒后再试`, retryAfter });
+    }
+    if (s.status !== 'pending') visitorStoreRefreshes.set(s.id, now);
+  }
 
-  enqueueStoreRefresh(s.id, s.url, 'manual');
+  store.updateStore(s.id, { status: 'pending', error: '' });
+  res.json({ status: 'pending', reused: s.status === 'pending' });
+
+  enqueueStoreRefresh(s.id, s.url, privileged ? 'manual' : 'visitor');
 });
 
 app.get('/api/products/:storeId/:productId/history', (req, res) => {
@@ -759,11 +788,12 @@ function sleep(ms) {
 function enqueueStoreRefresh(storeId, url, reason = 'manual', batchId = '') {
   if (activeRefreshes.has(storeId)) return activeRefreshes.get(storeId);
   if (queuedRefreshes.has(storeId)) {
-    if (reason === 'manual') {
+    if (reason === 'manual' || reason === 'visitor') {
       const queued = refreshQueue.find(job => job.storeId === storeId);
-      if (queued && queued.priority > 0) {
-        queued.priority = 0;
-        queued.reason = 'manual';
+      const promotedPriority = reason === 'manual' ? 0 : 5;
+      if (queued && queued.priority > promotedPriority) {
+        queued.priority = promotedPriority;
+        queued.reason = reason;
         queued.batchId = '';
         queued.sequence = refreshSequence++;
         refreshQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
@@ -772,7 +802,7 @@ function enqueueStoreRefresh(storeId, url, reason = 'manual', batchId = '') {
     return queuedRefreshes.get(storeId);
   }
 
-  const priority = reason === 'manual' ? 0 : reason === 'global' ? 10 : 20;
+  const priority = reason === 'manual' ? 0 : reason === 'visitor' ? 5 : reason === 'global' ? 10 : 20;
   const task = new Promise((resolve) => {
     refreshQueue.push({ storeId, url, reason, batchId, priority, sequence: refreshSequence++, generation: dataGeneration, resolve });
     refreshQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);

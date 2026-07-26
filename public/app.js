@@ -2535,7 +2535,7 @@ function renderStores() {
     const storeLink = safeUrl(s.url);
     const storeName = storeLink ? `<a class="sc-name sc-store-link" href="${storeLink}" target="_blank" rel="noopener noreferrer" title="打开店铺">${escapeHtml(s.name||s.id)}</a>` : `<span class="sc-name">${escapeHtml(s.name||s.id)}</span>`;
     if (!(s.products || []).length && displayStatus === 'pending') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-loading">正在获取商品数据...</div></div>`;
-    if (!(s.products || []).length && displayStatus === 'error') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(summary.error||s.error||'获取失败')}</div><div class="sc-actions"><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
+    if (!(s.products || []).length && displayStatus === 'error') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(summary.error||s.error||'获取失败')}</div><div class="sc-actions"><button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
 
     let products = filtered.filter(p => p.storeId === id);
     const storePrices = products.map(p => p.price).filter(v => v > 0);
@@ -2569,7 +2569,7 @@ function renderStores() {
         <span class="sc-meta">${products.length} 个商品</span>
         <span class="sc-sync-status ${displayStatus}" title="${displayStatus === 'error' ? escapeHtml(summary.error || '更新失败') : ''}">${displayStatus === 'pending' ? '更新中' : displayStatus === 'error' ? '更新失败' : ''}</span>
         <div class="sc-actions">
-          <button class="ref-btn admin-only" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button>
+          <button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button>
           <button class="history-store-btn" data-action="open-history-store" data-store-id="${escapeHtml(s.id)}" title="查看该店铺历史最低价">历史最低</button>
           <button class="copy-store-btn" data-action="copy-store-link" data-store-url="${escapeHtml(s.url || '')}" title="复制店铺链接">复制链接</button>
           <button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button>
@@ -3096,7 +3096,9 @@ async function refreshStore(id, silent) {
   renderStoreList();
   updateRenderedStoreStatuses();
   try {
-    await apiFetch(`/api/stores/${id}/refresh`, { method: 'POST' });
+    const response = await apiFetch(`/api/stores/${id}/refresh`, { method: 'POST' });
+    const result = await readApiResponse(response, '店铺更新失败');
+    if (!response.ok) throw new Error(result.error || '店铺更新失败');
     await waitForStoreRefresh(id);
     flashSuccess(id);
     if (!silent) render();
