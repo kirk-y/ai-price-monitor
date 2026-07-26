@@ -1,4 +1,10 @@
 const axios = require('axios');
+const { classifyProduct: classifyStructuredProduct } = require('./classification');
+const {
+  classifyHybridProduct,
+  isKnownGptClassification,
+  preClassifyProduct,
+} = require('./hybrid-classification');
 
 const BASE = 'https://pay.ldxp.cn';
 const GOODS_TYPES = ['card', 'article', 'resource', 'equity'];
@@ -172,11 +178,26 @@ function classifyProduct(name, filterPatterns) {
 async function classifyProducts(products, storeId) {
   const store = require('./store');
   const filterPatterns = store.getFilterConfig().filterPatterns || {};
+  const classificationConfig = store.getClassificationConfig();
   for (const p of products) {
     const pk = `${storeId}:${p.id}`;
     const existing = store.getProductLabel(pk);
-    // Keep manual labels, but recalculate automatic labels when a store changes the product name.
-    if (existing?.manual || (existing && existing.name === p.name)) continue;
+    if (existing?.manual) continue;
+    const knownGpt = isKnownGptClassification(existing);
+    const currentHybrid = String(existing?.classification_source || '').startsWith('hybrid-v1-');
+    // Upgrade legacy GPT labels once. Afterwards, unchanged products do not need inference.
+    if (existing && existing.name === p.name && (!knownGpt || currentHybrid)) continue;
+
+    const baseResult = classifyStructuredProduct(p.name, classificationConfig);
+    const pre = preClassifyProduct(p.name);
+    if (knownGpt || pre.eligible) {
+      const hybridResult = classifyHybridProduct(p.name, baseResult, { knownProduct: knownGpt });
+      if (hybridResult.hybrid?.accepted) {
+        store.saveClassificationResult(pk, p.name, hybridResult, `hybrid-v1-${hybridResult.hybrid.source}`);
+        continue;
+      }
+    }
+
     const result = classifyProduct(p.name, filterPatterns);
     if (result && result.category) {
       store.upsertProductLabel(pk, p.name, result.category, result.confidence, 0);

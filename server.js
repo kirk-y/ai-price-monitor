@@ -4,6 +4,11 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { scrapeShop, classifyProducts } = require('./scraper');
 const { buildFeedbackSuggestions, classifyProduct, validateClassificationConfig } = require('./classification');
+const {
+  classifyHybridProduct,
+  isKnownGptClassification,
+  preClassifyProduct,
+} = require('./hybrid-classification');
 const store = require('./store');
 const {
   isLoopbackHost,
@@ -369,6 +374,14 @@ function classificationCandidates(requestedProducts) {
   return products;
 }
 
+function classifyCandidate(product, config) {
+  const baseResult = classifyProduct(product.name, config);
+  const knownProduct = isKnownGptClassification(product.currentCategory);
+  const pre = preClassifyProduct(product.name);
+  if (!knownProduct && !pre.eligible) return baseResult;
+  return classifyHybridProduct(product.name, baseResult, { knownProduct });
+}
+
 app.post('/api/classification/preview', requireStrictLimit, (req, res) => {
   try {
     const config = req.body?.config
@@ -377,7 +390,7 @@ app.post('/api/classification/preview', requireStrictLimit, (req, res) => {
     const candidates = classificationCandidates(req.body?.products);
     const items = candidates.map(product => ({
       ...product,
-      result: classifyProduct(product.name, config),
+      result: classifyCandidate(product, config),
     }));
     const summary = items.reduce((acc, item) => {
       acc.total++;
@@ -401,12 +414,13 @@ app.post('/api/classification/apply', requireStrictLimit, (req, res) => {
     let skipped = 0;
     let needsReview = 0;
     for (const product of candidates) {
-      const result = classifyProduct(product.name, config);
+      const result = classifyCandidate(product, config);
       if (result.needsReview && req.body?.includeNeedsReview !== true) {
         needsReview++;
         continue;
       }
-      const outcome = store.saveClassificationResult(product.productKey, product.name, result);
+      const source = result.hybrid?.accepted ? `hybrid-v1-${result.hybrid.source}` : 'rules-v2';
+      const outcome = store.saveClassificationResult(product.productKey, product.name, result, source);
       if (outcome.skipped) skipped++; else saved++;
     }
     res.json({ success: true, total: candidates.length, saved, skippedManual: skipped, needsReview });
