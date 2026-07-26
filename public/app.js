@@ -1201,16 +1201,35 @@ async function importData(e) {
   msg.textContent = '导入中...';
   msg.style.color = '#1a73e8';
   try {
-    const text = await file.text();
-    const data = JSON.parse(text);
-    const res = await apiFetch('/api/stores/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
+    const start = await apiFetch('/api/stores/import/chunk/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: file.name, size: file.size }),
+    });
+    const startData = await readApiResponse(start, '无法创建导入任务');
+    if (!start.ok) throw new Error(startData.error || '无法创建导入任务');
+    const chunkSize = Number(startData.chunkSize) || 512 * 1024;
+    const chunkCount = Math.ceil(file.size / chunkSize);
+    for (let index = 0; index < chunkCount; index++) {
+      const chunk = file.slice(index * chunkSize, Math.min(file.size, (index + 1) * chunkSize));
+      const chunkResponse = await apiFetch(`/api/stores/import/chunk/${encodeURIComponent(startData.uploadId)}/part/${index}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: chunk,
+      });
+      const chunkData = await readApiResponse(chunkResponse, '分片上传失败');
+      if (!chunkResponse.ok) throw new Error(chunkData.error || '分片上传失败');
+      msg.textContent = `正在上传... ${Math.round((index + 1) / chunkCount * 100)}%`;
+    }
+    msg.textContent = '正在校验并导入数据...';
+    const res = await apiFetch(`/api/stores/import/chunk/${encodeURIComponent(startData.uploadId)}/finish`, { method: 'POST' });
+    const result = await readApiResponse(res, '导入失败');
     if (res.ok) {
       msg.textContent = '✓ 导入成功，页面即将刷新';
       msg.style.color = '#43a047';
       setTimeout(() => location.reload(), 1500);
     } else {
-      const err = await res.json();
-      msg.textContent = '导入失败: ' + (err.error || '');
+      msg.textContent = '导入失败: ' + (result.error || '');
       msg.style.color = '#e53935';
     }
   } catch (e) {
@@ -1218,6 +1237,17 @@ async function importData(e) {
     msg.style.color = '#e53935';
   }
   e.target.value = '';
+}
+
+async function readApiResponse(response, fallback) {
+  const text = await response.text();
+  try { return text ? JSON.parse(text) : {}; }
+  catch (_) {
+    const proxyHint = text.trim().startsWith('<')
+      ? '服务器或反向代理拒绝了上传，请检查上传大小限制'
+      : fallback;
+    return { error: `${proxyHint}（HTTP ${response.status}）` };
+  }
 }
 
 function renderStoreHistorySelects() {

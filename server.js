@@ -1,4 +1,7 @@
 const express = require('express');
+const crypto = require('crypto');
+const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
@@ -23,6 +26,13 @@ const HOST = process.env.HOST || '127.0.0.1';
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
 const USER_TOKEN = process.env.USER_TOKEN || '';
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '100mb';
+const MAX_IMPORT_FILE_BYTES = Number(process.env.MAX_IMPORT_FILE_BYTES || 150 * 1024 * 1024);
+const IMPORT_CHUNK_BYTES = 512 * 1024;
+const IMPORT_UPLOAD_TTL_MS = 30 * 60 * 1000;
+
+if (!Number.isSafeInteger(MAX_IMPORT_FILE_BYTES) || MAX_IMPORT_FILE_BYTES < IMPORT_CHUNK_BYTES) {
+  throw new Error('MAX_IMPORT_FILE_BYTES must be at least 524288');
+}
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
   throw new Error('PORT 必须是 1 到 65535 之间的整数');
@@ -118,7 +128,8 @@ app.use('/api/', requireAuth);
 app.use('/api/', (req, res, next) => {
   if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
     res.on('finish', () => {
-      if (res.statusCode < 400) store.recordAudit(req.user, `${req.method} ${req.route?.path || req.path}`, req.originalUrl);
+      const chunkPart = req.path.startsWith('/stores/import/chunk/') && !req.path.endsWith('/finish');
+      if (res.statusCode < 400 && !chunkPart) store.recordAudit(req.user, `${req.method} ${req.route?.path || req.path}`, req.originalUrl);
     });
   }
   next();
@@ -194,6 +205,89 @@ app.get('/api/stores/export', requireAdmin, (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', `attachment; filename="ai-price-monitor-${new Date().toISOString().slice(0,10)}.json"`);
   res.json(data);
+});
+
+const importUploads = new Map();
+
+function removeImportUpload(uploadId) {
+  const upload = importUploads.get(uploadId);
+  if (!upload) return;
+  importUploads.delete(uploadId);
+  try { fs.unlinkSync(upload.path); } catch (err) { if (err.code !== 'ENOENT') console.error('清理导入临时文件失败:', err.message); }
+}
+
+function cleanupExpiredImportUploads() {
+  const cutoff = Date.now() - IMPORT_UPLOAD_TTL_MS;
+  for (const [uploadId, upload] of importUploads) {
+    if (upload.createdAt < cutoff) removeImportUpload(uploadId);
+  }
+}
+
+function ownedImportUpload(req, res) {
+  const uploadId = String(req.params.uploadId || '');
+  const upload = importUploads.get(uploadId);
+  const owner = req.user.id ? `user:${req.user.id}` : `legacy:${req.user.username}`;
+  if (!upload || upload.owner !== owner) {
+    res.status(404).json({ error: '导入任务不存在或已过期' });
+    return null;
+  }
+  return upload;
+}
+
+app.post('/api/stores/import/chunk/start', requireAdmin, requireStrictLimit, (req, res) => {
+  cleanupExpiredImportUploads();
+  const size = Number(req.body?.size);
+  if (!Number.isSafeInteger(size) || size < 2 || size > MAX_IMPORT_FILE_BYTES) {
+    return res.status(400).json({ error: `导入文件大小无效（最大 ${Math.floor(MAX_IMPORT_FILE_BYTES / 1024 / 1024)} MB）` });
+  }
+  const uploadId = crypto.randomBytes(18).toString('hex');
+  const filePath = path.join(os.tmpdir(), `ai-price-monitor-import-${uploadId}.json`);
+  fs.writeFileSync(filePath, '');
+  importUploads.set(uploadId, {
+    path: filePath,
+    size,
+    received: 0,
+    nextIndex: 0,
+    createdAt: Date.now(),
+    owner: req.user.id ? `user:${req.user.id}` : `legacy:${req.user.username}`,
+  });
+  res.json({ uploadId, chunkSize: IMPORT_CHUNK_BYTES });
+});
+
+app.post('/api/stores/import/chunk/:uploadId/part/:index', requireAdmin,
+  express.raw({ type: 'application/octet-stream', limit: IMPORT_CHUNK_BYTES + 1024 }), (req, res) => {
+    const upload = ownedImportUpload(req, res);
+    if (!upload) return;
+    const index = Number(req.params.index);
+    const chunk = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (!Number.isSafeInteger(index) || index !== upload.nextIndex) {
+      return res.status(409).json({ error: `分片顺序错误，期望 ${upload.nextIndex}` });
+    }
+    if (!chunk.length || chunk.length > IMPORT_CHUNK_BYTES || upload.received + chunk.length > upload.size) {
+      removeImportUpload(req.params.uploadId);
+      return res.status(400).json({ error: '导入分片大小无效' });
+    }
+    fs.appendFileSync(upload.path, chunk);
+    upload.received += chunk.length;
+    upload.nextIndex++;
+    res.json({ received: upload.received });
+  });
+
+app.post('/api/stores/import/chunk/:uploadId/finish', requireAdmin, requireStrictLimit, (req, res) => {
+  const upload = ownedImportUpload(req, res);
+  if (!upload) return;
+  if (upload.received !== upload.size) {
+    return res.status(409).json({ error: `文件尚未上传完成（${upload.received}/${upload.size} 字节）` });
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(upload.path, 'utf8'));
+    store.importAllData(data);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(400).json({ error: '导入失败: ' + err.message });
+  } finally {
+    removeImportUpload(req.params.uploadId);
+  }
 });
 
 app.post('/api/stores/import', requireAdmin, requireStrictLimit, (req, res) => {
