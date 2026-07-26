@@ -853,7 +853,7 @@ function scrapeAndUpdate(storeId, url, generation = dataGeneration) {
       if (generation !== dataGeneration || !store.getStore(storeId)) return;
       store.updateStore(storeId, {
         name: result.shopName,
-        status: 'ok',
+        status: 'pending',
         error: '',
         lastUpdated: new Date().toISOString(),
         products: result.products,
@@ -863,6 +863,9 @@ function scrapeAndUpdate(storeId, url, generation = dataGeneration) {
         await classifyProducts(result.products, storeId);
       } catch (err) {
         console.error(`店铺 ${storeId} 分类失败:`, err.message);
+      }
+      if (generation === dataGeneration && store.getStore(storeId)) {
+        store.updateStore(storeId, { status: 'ok', error: '' });
       }
     } catch (err) {
       if (generation === dataGeneration && store.getStore(storeId)) {

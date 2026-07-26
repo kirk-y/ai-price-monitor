@@ -77,6 +77,11 @@ function canOperate() {
   return _userRole === 'admin' || _userRole === 'operator';
 }
 
+function visibleStoreStatus(store) {
+  const status = store?.status || 'ok';
+  return status === 'pending' && !canOperate() ? 'ok' : status;
+}
+
 function clearAuthSession() {
   _authToken = '';
   _userRole = '';
@@ -1922,17 +1927,18 @@ function renderStoreList() {
   applyStoreOrder();
   const container = document.getElementById('storeList');
   const visible = visibleStoreSummaries();
-  const ok = visible.filter(s => s.status === 'ok');
-  const error = visible.filter(s => s.status === 'error');
-  const pend = visible.filter(s => s.status === 'pending');
+  const ok = visible.filter(s => visibleStoreStatus(s) === 'ok');
+  const error = visible.filter(s => visibleStoreStatus(s) === 'error');
+  const pend = visible.filter(s => visibleStoreStatus(s) === 'pending');
   const total = visible.reduce((s, st) => s + (st.productCount || 0), 0);
 
   container.innerHTML = `<button class="store-btn store-btn-all ${!activeBrowseStoreId ? 'active' : ''}" data-action="switch-store" data-store-id="all"><span class="sb-name">顶部</span> <span class="badge">${total}</span></button>
   ${visible.map(s => {
     const sid = escapeHtml(s.id);
     const isRefreshing = refreshingStores.has(s.id);
-    const isPending = s.status === 'pending';
-    const isError = s.status === 'error';
+    const visibleStatus = visibleStoreStatus(s);
+    const isPending = visibleStatus === 'pending';
+    const isError = visibleStatus === 'error';
     const rowClass = `${isRefreshing ? ' is-refreshing' : ''}${isPending ? ' store-row-pending' : ''}${isError ? ' store-row-error' : ''}`;
     const badge = isError ? '<span class="badge badge-error">失败</span>' : isPending ? '<span class="badge badge-pending">获取中</span>' : `<span class="badge">${s.productCount||0}</span>`;
     const title = isError ? escapeHtml(s.error || '刷新失败') : isPending ? '获取中...' : formatTime(s.lastUpdated);
@@ -2484,7 +2490,8 @@ function selectHistoryBestCategory(category) {
   renderHistoricalBestPrices();
 }
 
-function goToBestPrice(storeId, category, productId, detail = 'all') {
+async function goToBestPrice(storeId, category, productId, detail = 'all') {
+  const pageScrollTop = window.scrollY;
   closeFilterDrawer();
   activeCatL1 = catL1FromFull(category);
   activeCatL2 = category;
@@ -2498,18 +2505,55 @@ function goToBestPrice(storeId, category, productId, detail = 'all') {
   // can be located even when earlier cards consume the normal page limit.
   renderLimit = Math.max(renderLimit, getFilteredProducts().length + 1);
   renderCatBar();
-  switchStore(storeId);
-  requestAnimationFrame(() => {
-    const container = document.getElementById('storesContainer');
-    const product = productId
-      ? container.querySelector(`.product-card[data-product-id="${CSS.escape(productId)}"]`)
+  await switchStore(storeId);
+  window.scrollTo({ top: pageScrollTop, behavior: 'auto' });
+  const container = document.getElementById('storesContainer');
+  if (!container) return;
+  await waitForScrollSettled(container);
+  let product = productId
+    ? container.querySelector(`.store-card[data-store-id="${CSS.escape(storeId)}"] .product-card[data-product-id="${CSS.escape(productId)}"]`)
+    : null;
+  if (!product) {
+    await loadStoreWithProducts(storeId);
+    markDirty();
+    renderStores();
+    await nextPaint();
+    window.scrollTo({ top: pageScrollTop, behavior: 'auto' });
+    product = productId
+      ? container.querySelector(`.store-card[data-store-id="${CSS.escape(storeId)}"] .product-card[data-product-id="${CSS.escape(productId)}"]`)
       : null;
-    if (!product) return;
-    const host = container.getBoundingClientRect();
-    const rect = product.getBoundingClientRect();
-    container.scrollTo({ top: container.scrollTop + rect.top - host.top - 60, behavior: 'smooth' });
-    product.classList.add('product-target');
-    setTimeout(() => product.classList.remove('product-target'), 900);
+  }
+  if (!product) {
+    showToast('目标商品已变动或不在当前分类中');
+    return;
+  }
+  const host = container.getBoundingClientRect();
+  const rect = product.getBoundingClientRect();
+  container.scrollTo({ top: container.scrollTop + rect.top - host.top - 60, behavior: 'smooth' });
+  await waitForScrollSettled(container);
+  window.scrollTo({ top: pageScrollTop, behavior: 'auto' });
+  product.classList.add('product-target');
+  setTimeout(() => product.classList.remove('product-target'), 1400);
+}
+
+function nextPaint() {
+  return new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+}
+
+function waitForScrollSettled(element, timeoutMs = 900) {
+  return new Promise(resolve => {
+    const started = Date.now();
+    let previous = element.scrollTop;
+    let stableFrames = 0;
+    const check = () => {
+      const current = element.scrollTop;
+      stableFrames = Math.abs(current - previous) < 1 ? stableFrames + 1 : 0;
+      previous = current;
+      const elapsed = Date.now() - started;
+      if ((elapsed >= 120 && stableFrames >= 4) || elapsed >= timeoutMs) resolve();
+      else requestAnimationFrame(check);
+    };
+    requestAnimationFrame(check);
   });
 }
 
@@ -2531,7 +2575,7 @@ function renderStores() {
     const s = stores.find(st => st.id === id);
     if (!s) return '';
     const summary = storeSummaries.find(item => item.id === id) || s;
-    const displayStatus = summary.status || s.status || 'ok';
+    const displayStatus = visibleStoreStatus(summary.status ? summary : s);
     const storeLink = safeUrl(s.url);
     const storeName = storeLink ? `<a class="sc-name sc-store-link" href="${storeLink}" target="_blank" rel="noopener noreferrer" title="打开店铺">${escapeHtml(s.name||s.id)}</a>` : `<span class="sc-name">${escapeHtml(s.name||s.id)}</span>`;
     if (!(s.products || []).length && displayStatus === 'pending') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-loading">正在获取商品数据...</div></div>`;
@@ -2602,7 +2646,7 @@ function updateRenderedStoreStatuses() {
   document.querySelectorAll('.store-card[data-store-id]').forEach(card => {
     const summary = summaries.get(card.dataset.storeId);
     if (!summary) return;
-    const status = summary.status || 'ok';
+    const status = visibleStoreStatus(summary);
     const indicator = card.querySelector('.sc-sync-status');
     if (indicator) {
       indicator.className = `sc-sync-status ${status}`;
@@ -2639,18 +2683,19 @@ let _loadingMore = false;
 function observeSentinel() {
   if (window._scrollObs) window._scrollObs.disconnect();
   const el = document.querySelector('.scroll-sentinel');
-  if (!el) return;
+  const container = document.getElementById('storesContainer');
+  if (!el || !container) return;
   window._scrollObs = new IntersectionObserver(entries => {
     if (_loadingMore) return;
     if (entries[0].isIntersecting) {
       _loadingMore = true;
       window._scrollObs.disconnect();
       renderLimit += 30;
-      const sy = window.scrollY;
+      const scrollTop = container.scrollTop;
       renderStores();
-      requestAnimationFrame(() => { window.scrollTo(0, sy); _loadingMore = false; });
+      requestAnimationFrame(() => { container.scrollTop = scrollTop; _loadingMore = false; });
     }
-  }, { rootMargin: '400px' });
+  }, { root: container, rootMargin: '400px' });
   window._scrollObs.observe(el);
 }
 
@@ -2678,7 +2723,7 @@ function renderProductCard(p) {
   const price = Number.isFinite(Number(p.price)) ? Number(p.price) : 0;
   const attributeLabels = classificationAttributeLabels(p.classification?.attributes);
 
-  return `<div class="product-card ${inStock ? 'has-stock' : 'no-stock'}" data-price="${price}" data-product-id="${escapeHtml(p.id)}">
+  return `<div class="product-card ${inStock ? 'has-stock' : 'no-stock'}" data-price="${price}" data-product-id="${escapeHtml(p.id)}" data-product-key="${escapeHtml(p.productKey)}">
     <div class="pc-top">
       <div class="pc-tags">${category !== 'other' ? `<span class="tag tag-${categoryClass}" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="${escapeHtml(category)}" data-confidence="${confidence}" title="点击修改分类">${categoryText}</span>` : `<span class="tag tag-other" data-action="edit-label" data-product-key="${escapeHtml(p.productKey)}" data-product-name="${escapeHtml(p.name)}" data-category="其他" data-confidence="0" title="点击添加分类">其他</span>`}${attributeLabels.map(label => `<span class="tag tag-attribute">${escapeHtml(label)}</span>`).join('')}</div>
       <span class="pc-name" title="${escapeHtml(p.name)}">${escapeHtml(p.name)}</span>
@@ -2954,6 +2999,7 @@ async function saveLabelFromSettings(productKey, name, category, previousCategor
 }
 
 async function saveLabel(productKey, name, previousCategory) {
+  const viewportAnchor = captureProductViewport(productKey);
   const select = document.getElementById('labelSelect');
   const category = select.value;
   const res = await apiFetch(`/api/product-labels/${encodeURIComponent(productKey)}`, {
@@ -2973,7 +3019,36 @@ async function saveLabel(productKey, name, previousCategory) {
     markDirty();
     document.getElementById('labelOverlay')?.remove();
     render();
+    restoreProductViewport(viewportAnchor);
   }
+}
+
+function captureProductViewport(productKey) {
+  const container = document.getElementById('storesContainer');
+  const product = container?.querySelector(`.product-card[data-product-key="${CSS.escape(productKey)}"]`);
+  if (!container) return null;
+  const hostRect = container.getBoundingClientRect();
+  const productRect = product?.getBoundingClientRect();
+  return {
+    productKey,
+    scrollTop: container.scrollTop,
+    offset: productRect ? productRect.top - hostRect.top : null,
+  };
+}
+
+function restoreProductViewport(anchor) {
+  if (!anchor) return;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const container = document.getElementById('storesContainer');
+    if (!container) return;
+    const product = container.querySelector(`.product-card[data-product-key="${CSS.escape(anchor.productKey)}"]`);
+    if (product && anchor.offset !== null) {
+      const hostRect = container.getBoundingClientRect();
+      container.scrollTop += product.getBoundingClientRect().top - hostRect.top - anchor.offset;
+    } else {
+      container.scrollTop = anchor.scrollTop;
+    }
+  }));
 }
 
 function escapeHtml(s) {
@@ -3152,13 +3227,20 @@ let _stopRefreshAll = false;
 let _refreshBatchId = '';
 let refreshingStores = new Set();
 let _storeStatusTimer = null;
+let _storeStatusPolling = false;
 
 function startStoreStatusPolling() {
   clearInterval(_storeStatusTimer);
   _storeStatusTimer = setInterval(async () => {
-    if (document.visibilityState === 'hidden') return;
+    if (document.visibilityState === 'hidden' || _storeStatusPolling) return;
+    _storeStatusPolling = true;
     try {
       const summary = await (await apiFetch('/api/stores/summary')).json();
+      const refreshedStoreIds = summary.filter(next => {
+        const prev = storeSummaries.find(store => store.id === next.id);
+        if (!prev || next.status !== 'ok' || !stores.some(store => store.id === next.id)) return false;
+        return next.lastUpdated !== prev.lastUpdated || prev.status === 'pending';
+      }).map(store => store.id);
       const changed = summary.length !== storeSummaries.length || summary.some(next => {
         const prev = storeSummaries.find(store => store.id === next.id);
         return !prev || prev.status !== next.status || prev.lastUpdated !== next.lastUpdated || prev.productCount !== next.productCount;
@@ -3166,10 +3248,17 @@ function startStoreStatusPolling() {
       if (!changed) return;
       storeSummaries = summary;
       applyStoreOrder();
+      if (refreshedStoreIds.length) {
+        await loadStoreBatch(refreshedStoreIds, true);
+        markDirty();
+        renderBestPrices();
+        renderPriceRange();
+      }
       renderStoreList();
       renderActiveStoreCard();
       updateRenderedStoreStatuses();
     } catch (_) { /* A later poll will retry. */ }
+    finally { _storeStatusPolling = false; }
   }, 5000);
 }
 
