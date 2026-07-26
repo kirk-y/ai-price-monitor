@@ -66,7 +66,16 @@ const strictLimiter = rateLimit({
 });
 
 app.use('/api/', apiLimiter);
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+  setHeaders(res, filePath) {
+    const name = path.basename(filePath).toLowerCase();
+    if (name === 'index.html' || name === 'app.js') {
+      res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+      res.setHeader('Pragma', 'no-cache');
+      res.setHeader('Expires', '0');
+    }
+  },
+}));
 app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 function requestToken(req) {

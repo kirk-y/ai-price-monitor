@@ -1075,7 +1075,7 @@ async function importStoreList(e) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ stores: list }),
     });
-    const result = await response.json();
+    const result = await readApiResponse(response, '店铺列表导入失败');
     if (!response.ok) throw new Error(result.error || '批量导入失败');
     const added = Number(result.addedIds?.length || 0);
     const skipped = Number(result.skipped || 0);
@@ -1116,7 +1116,7 @@ async function importSingleStoreFile(e) {
     const data = JSON.parse(text);
     const res = await apiFetch('/api/stores/import-single', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
     if (res.ok) {
-      const result = await res.json();
+      const result = await readApiResponse(res, '单店铺导入失败');
       msg.textContent = '✓ 导入成功，即将刷新';
       msg.style.color = '#43a047';
       storeSummaries = await (await apiFetch('/api/stores/summary')).json();
@@ -1124,7 +1124,7 @@ async function importSingleStoreFile(e) {
       e.target.value = '';
       setTimeout(() => location.reload(), 1500);
     } else {
-      const err = await res.json();
+      const err = await readApiResponse(res, '单店铺导入失败');
       msg.textContent = '导入失败: ' + (err.error || '');
       msg.style.color = '#e53935';
     }
@@ -1287,7 +1287,7 @@ async function importStoreHistoryFile(e) {
       markDirty();
       renderHistoricalBestPrices();
     } else {
-      const err = await res.json();
+      const err = await readApiResponse(res, '店铺历史导入失败');
       msg.textContent = '导入失败: ' + (err.error || '');
       msg.style.color = '#e53935';
     }
@@ -1315,7 +1315,7 @@ async function importAllHistoryFile(e) {
       markDirty();
       renderHistoricalBestPrices();
     } else {
-      const err = await res.json();
+      const err = await readApiResponse(res, '全量历史导入失败');
       msg.textContent = '导入失败: ' + (err.error || '');
       msg.style.color = '#e53935';
     }
