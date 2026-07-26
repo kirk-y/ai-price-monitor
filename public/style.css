@@ -2564,6 +2564,7 @@ body.role-operator .superadmin-only { display: none !important; }
 .auth-overlay.visible { display: flex; }
 
 .auth-panel {
+  position: relative;
   width: min(360px, 100%);
   padding: 28px;
   border: 1px solid var(--border);
@@ -2571,6 +2572,26 @@ body.role-operator .superadmin-only { display: none !important; }
   background: var(--panel);
   box-shadow: 0 18px 50px rgba(15, 23, 42, .16);
 }
+
+.auth-panel .auth-close {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 30px;
+  height: 30px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text3);
+  font-size: 24px;
+  line-height: 1;
+}
+.auth-panel .auth-close:hover { background: var(--surface); color: var(--text1); }
+
+.settings-option.danger-option { color: var(--danger); }
+.settings-option.danger-option.active { background: var(--danger-light); color: var(--danger); }
+.settings-danger-title { margin: 0 0 10px; color: var(--danger); font-size: 15px; }
 
 .auth-panel .brand-mark { margin-bottom: 18px; }
 .auth-panel h1 { margin: 0 0 6px; color: var(--text1); font-size: 22px; letter-spacing: 0; }

@@ -40,21 +40,28 @@ let priceRange = { min: 0, max: 0 };
 let _priceTimer = null;
 
 localStorage.removeItem('authToken');
-let _authToken = sessionStorage.getItem('authToken') || '';
+let _authToken = sessionStorage.getItem('sessionToken') || sessionStorage.getItem('authToken') || '';
+if (_authToken) sessionStorage.setItem('sessionToken', _authToken);
+sessionStorage.removeItem('authToken');
 let _userRole = sessionStorage.getItem('userRole') || '';
 let _currentUser = null;
 
 async function apiFetch(url, opts) {
+  const requestToken = _authToken;
   const h = { ...(opts?.headers || {}) };
-  if (_authToken) h['x-auth-token'] = _authToken;
+  if (requestToken) h['x-auth-token'] = requestToken;
   const res = await fetch(url, { ...opts, headers: h });
   if (res.status === 401) {
-    clearAuthSession();
-    document.getElementById('authOverlay')?.classList.add('visible');
+    // A response from an older request must not invalidate a session that was
+    // established while that request was still in flight.
+    if (requestToken === _authToken) {
+      clearAuthSession();
+      document.getElementById('authOverlay')?.classList.add('visible');
+    }
     throw new Error('未授权');
   }
   if (res.status === 403) {
-    alert('权限不足，该操作需要管理员权限');
+    if (requestToken === _authToken) alert('权限不足，该操作需要更高权限');
     throw new Error('权限不足');
   }
   return res;
@@ -72,8 +79,16 @@ function clearAuthSession() {
   _authToken = '';
   _userRole = '';
   _currentUser = null;
+  sessionStorage.removeItem('sessionToken');
   sessionStorage.removeItem('authToken');
   sessionStorage.removeItem('userRole');
+}
+
+function useGuestSession() {
+  clearAuthSession();
+  _currentUser = { id: null, username: '', role: 'viewer', guest: true };
+  _userRole = 'viewer';
+  applyRoleRestrictions();
 }
 
 async function fetchUserRole() {
@@ -82,6 +97,10 @@ async function fetchUserRole() {
     const data = await res.json();
     _currentUser = data.user || null;
     _userRole = _currentUser?.role || '';
+    if (_currentUser?.guest) {
+      useGuestSession();
+      return true;
+    }
     sessionStorage.setItem('userRole', _userRole);
     applyRoleRestrictions();
     return true;
@@ -95,14 +114,23 @@ function applyRoleRestrictions() {
   const badge = document.getElementById('roleBadge');
   if (badge) {
     const roleLabels = { admin: '管理员', operator: '操作员', viewer: '访客' };
-    badge.textContent = `${_currentUser?.username || ''} · ${roleLabels[_userRole] || ''}`;
+    badge.textContent = _currentUser?.username ? `${_currentUser.username} · ${roleLabels[_userRole] || ''}` : (roleLabels[_userRole] || '访客');
     badge.className = 'role-badge ' + (_userRole || 'viewer');
+  }
+  const accountButton = document.getElementById('authAccountBtn');
+  if (accountButton) {
+    const loggedIn = Boolean(_currentUser?.id);
+    accountButton.title = loggedIn ? '退出登录' : '登录';
+    accountButton.setAttribute('aria-label', loggedIn ? '退出登录' : '登录');
   }
 }
 
 async function ensureAuthenticated() {
   if (_authToken && await fetchUserRole()) return;
-  clearAuthSession();
+  useGuestSession();
+}
+
+async function openAuthOverlay() {
   const status = await fetch('/api/auth/status').then(response => response.json());
   const setup = Boolean(status.setupRequired);
   const overlay = document.getElementById('authOverlay');
@@ -116,8 +144,8 @@ async function ensureAuthenticated() {
   hint.textContent = setup ? '首次使用，请创建平台管理员账户。' : '使用平台账户继续。';
   submit.textContent = setup ? '创建并进入' : '登录';
   overlay.classList.add('visible');
-  await new Promise(resolve => {
-    document.getElementById('authForm').onsubmit = async event => {
+  username.focus();
+  document.getElementById('authForm').onsubmit = async event => {
       event.preventDefault();
       message.textContent = '';
       submit.disabled = true;
@@ -131,16 +159,25 @@ async function ensureAuthenticated() {
         _authToken = data.token;
         _currentUser = data.user;
         _userRole = data.user.role;
-        sessionStorage.setItem('authToken', _authToken);
+        sessionStorage.setItem('sessionToken', _authToken);
         sessionStorage.setItem('userRole', _userRole);
         password.value = '';
         overlay.classList.remove('visible');
         applyRoleRestrictions();
-        resolve();
+        location.reload();
       } catch (error) { message.textContent = error.message; }
       finally { submit.disabled = false; }
-    };
-  });
+  };
+}
+
+function closeAuthOverlay() {
+  document.getElementById('authOverlay').classList.remove('visible');
+  document.getElementById('authMessage').textContent = '';
+}
+
+function handleAccountAction() {
+  if (_currentUser?.id) logout();
+  else openAuthOverlay();
 }
 
 async function logout() {
@@ -309,7 +346,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   initTheme();
   await ensureAuthenticated();
   document.getElementById('themeToggle').addEventListener('click', toggleTheme);
-  document.getElementById('logoutBtn').addEventListener('click', logout);
+  document.getElementById('authAccountBtn').addEventListener('click', handleAccountAction);
+  document.getElementById('authClose').addEventListener('click', closeAuthOverlay);
   document.addEventListener('click', handleActionClick);
   document.addEventListener('change', handleActionChange);
   document.addEventListener('input', handleActionInput);
@@ -318,6 +356,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   filterConfig = await (await apiFetch('/api/filter-config')).json();
   userPreferences = await (await apiFetch('/api/preferences')).json();
+  if (_currentUser?.guest) {
+    try { userPreferences = JSON.parse(localStorage.getItem('guestPreferences') || '{}'); } catch (_) { userPreferences = {}; }
+  }
   classificationConfig = await (await apiFetch('/api/classification/config')).json();
   syncCategoryDefinitions();
   hiddenStoreIds = Array.isArray(userPreferences.hiddenStoreIds)
@@ -475,6 +516,8 @@ function initSettings() {
   document.getElementById('classificationPreviewBtn').addEventListener('click', previewClassificationRules);
   document.getElementById('classificationApplyBtn').addEventListener('click', applyClassificationRules);
   document.getElementById('createUserBtn').addEventListener('click', createManagedUser);
+  document.getElementById('clearDataConfirmation').addEventListener('input', updateClearDataButton);
+  document.getElementById('clearSystemDataBtn').addEventListener('click', clearSystemData);
   document.querySelectorAll('.settings-option').forEach(el => {
     el.addEventListener('click', () => switchSettingsOption(el.dataset.option));
   });
@@ -752,6 +795,36 @@ function switchSettingsOption(option) {
   if (option === 'labels') setTimeout(loadLabelManager, 50);
   if (option === 'classification') setTimeout(renderClassificationRules, 0);
   if (option === 'users') setTimeout(loadManagedUsers, 0);
+}
+
+function updateClearDataButton() {
+  document.getElementById('clearSystemDataBtn').disabled =
+    document.getElementById('clearDataConfirmation').value.trim() !== '清除所有数据';
+}
+
+async function clearSystemData() {
+  const confirmation = document.getElementById('clearDataConfirmation');
+  const button = document.getElementById('clearSystemDataBtn');
+  const message = document.getElementById('clearSystemDataMsg');
+  if (confirmation.value.trim() !== '清除所有数据') return;
+  if (!confirm('最后确认：永久清除所有监控数据？')) return;
+  button.disabled = true;
+  message.textContent = '正在清除...';
+  try {
+    const response = await apiFetch('/api/system/clear-data', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmation: confirmation.value.trim() }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '清除失败');
+    localStorage.removeItem('guestPreferences');
+    message.textContent = '数据已清除，正在重新加载...';
+    setTimeout(() => location.reload(), 500);
+  } catch (error) {
+    message.textContent = error.message;
+    updateClearDataButton();
+  }
 }
 
 const USER_ROLE_LABELS = { admin: '管理员', operator: '操作员', viewer: '访客' };
@@ -1834,6 +1907,10 @@ function persistHiddenStores() {
 }
 
 function saveUserPreferences() {
+  if (_currentUser?.guest) {
+    localStorage.setItem('guestPreferences', JSON.stringify(userPreferences));
+    return;
+  }
   apiFetch('/api/preferences', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },

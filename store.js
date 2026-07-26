@@ -1048,6 +1048,39 @@ function importAllHistory(data) {
   return true;
 }
 
+function clearSystemData() {
+  const db = getDb();
+  const tables = [
+    'stores',
+    'price_history',
+    'config',
+    'product_labels',
+    'label_changes',
+    'classification_feedback',
+    'user_preferences',
+    'audit_logs',
+  ];
+  const counts = Object.fromEntries(tables.map(table => [
+    table,
+    db.prepare(`SELECT COUNT(*) AS count FROM ${table}`).get().count,
+  ]));
+  const transaction = db.transaction(() => {
+    db.exec(`
+      DELETE FROM price_history;
+      DELETE FROM product_labels;
+      DELETE FROM label_changes;
+      DELETE FROM classification_feedback;
+      DELETE FROM stores;
+      DELETE FROM config;
+      DELETE FROM user_preferences;
+      DELETE FROM audit_logs;
+    `);
+    db.prepare(`DELETE FROM sqlite_sequence WHERE name IN (${tables.map(() => '?').join(',')})`).run(...tables);
+  });
+  transaction();
+  return counts;
+}
+
 module.exports = {
   getAllStores, getStoreSummaries, getStore, addStore, importStoreList, removeStore, updateStore,
   recordPrices, getPriceHistory,
@@ -1062,4 +1095,5 @@ module.exports = {
   exportStoreHistory, exportAllHistory, importStoreHistory, importAllHistory,
   getUserCount, listUsers, createUser, authenticateUser, createAuthSession, resolveAuthSession, deleteAuthSession,
   updateUser, deleteUser, recordAudit, getAuditLogs, getUserPreferences, updateUserPreferences,
+  clearSystemData,
 };

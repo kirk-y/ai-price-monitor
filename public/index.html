@@ -25,7 +25,7 @@
       <button id="filterToggleBtn" class="icon-btn filter-toggle-btn" type="button" title="筛选与价格" aria-label="打开筛选与价格面板" aria-controls="rightBar" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18l-7 8v5.5l-4 2v-7.5L3 5z" fill="currentColor"></path></svg></button>
       <a class="github-link" href="https://github.com/kirk-y/ai-price-monitor" target="_blank" rel="noopener noreferrer" title="给项目一个 Star" aria-label="在 GitHub 打开项目，给项目一个 Star"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49v-1.7c-2.78.62-3.37-1.38-3.37-1.38-.46-1.2-1.11-1.52-1.11-1.52-.91-.64.07-.63.07-.63 1 .08 1.53 1.05 1.53 1.05.9 1.58 2.35 1.12 2.92.86.09-.67.35-1.12.64-1.38-2.22-.26-4.56-1.14-4.56-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.7 0 0 .84-.27 2.75 1.05A9.2 9.2 0 0 1 12 7.1c.85 0 1.7.12 2.5.36 1.9-1.32 2.74-1.05 2.74-1.05.55 1.4.2 2.44.1 2.7.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.8-4.57 5.06.36.32.68.94.68 1.9v2.82c0 .27.18.6.69.49A10.27 10.27 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"></path></svg></a>
       <button id="settingsBtn" class="icon-btn" type="button" title="设置" aria-label="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" fill="currentColor"></path></svg></button>
-      <button id="logoutBtn" class="icon-btn" type="button" title="退出登录" aria-label="退出登录"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M10 17l5-5-5-5M15 12H3M14 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
+      <button id="authAccountBtn" class="icon-btn" type="button" title="登录" aria-label="登录"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
       <button id="themeToggle" class="icon-btn" type="button" title="切换主题" aria-label="切换主题"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 9 9c0-.46-.04-.92-.1-1.36a5.39 5.39 0 0 1-4.4 2.26 5.4 5.4 0 0 1-3.14-9.8c-.44-.06-.9-.1-1.36-.1z" fill="currentColor"></path></svg></button>
     </div>
   </header>
@@ -137,6 +137,7 @@
           <div class="settings-option" data-option="hiddenstores">隐藏店铺</div>
           <div class="settings-option admin-only" data-option="aiclassify">大模型分类</div>
           <div class="settings-option superadmin-only" data-option="users">用户管理</div>
+          <div class="settings-option superadmin-only danger-option" data-option="cleardata">清除数据</div>
         </div>
         <div class="settings-panel">
           <div id="settingsPanelExport" class="settings-panel-item active">
@@ -310,6 +311,16 @@
             <div class="settings-divider"></div>
             <div id="userList" class="user-list"></div>
           </div>
+          <div id="settingsPanelCleardata" class="settings-panel-item">
+            <h3 class="settings-danger-title">清除系统数据</h3>
+            <p class="settings-desc">将删除所有店铺、商品、价格历史、分类结果与反馈、系统配置、用户偏好和审计记录。用户账户和当前登录会话会保留。</p>
+            <p class="settings-desc"><strong>此操作无法撤销，建议先导出 JSON 备份。</strong></p>
+            <label class="settings-field-label" for="clearDataConfirmation">输入“清除所有数据”以确认</label>
+            <input id="clearDataConfirmation" class="settings-text-input" autocomplete="off" placeholder="清除所有数据">
+            <div class="settings-divider"></div>
+            <button id="clearSystemDataBtn" class="settings-action-btn danger" type="button" disabled>永久清除所有数据</button>
+            <span id="clearSystemDataMsg" class="settings-msg"></span>
+          </div>
         </div>
       </div>
     </div>
@@ -319,6 +330,7 @@
 
   <div id="authOverlay" class="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="authTitle">
     <form id="authForm" class="auth-panel">
+      <button id="authClose" class="auth-close" type="button" title="返回访客页面" aria-label="返回访客页面">&times;</button>
       <div class="brand-mark" aria-hidden="true">¥</div>
       <h1 id="authTitle">登录价格监控</h1>
       <p id="authHint">使用平台账户继续。</p>

@@ -31,6 +31,43 @@ test('history imports are idempotent and unsafe backup IDs are rejected', () => 
   }
 });
 
+test('clearing system data preserves users and sessions but removes monitoring data', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-clear-'));
+  const dbPath = path.join(tempDir, 'clear.db');
+  const script = `
+    const assert = require('node:assert/strict');
+    const store = require('./store');
+    const user = store.createUser('admin', 'admin-password', 'admin');
+    const session = store.createAuthSession(user.id);
+    const shop = store.addStore('https://pay.ldxp.cn/shop/clear_test');
+    store.updateStore(shop.id, { products: [{ id: 'item1', name: 'GPT Plus', price: 9.9, stock: 1 }] });
+    store.recordPrices(shop.id, store.getStore(shop.id).products);
+    store.setProductLabel(shop.id + ':item1', 'GPT Plus', 'plus_未接码');
+    store.updateFilterConfig({ suggestedKeywords: ['test'] });
+    store.updateUserPreferences(user.id, { hiddenStoreIds: [shop.id] });
+    store.recordAudit(user, 'test.action');
+    const deleted = store.clearSystemData();
+    assert.equal(deleted.stores, 1);
+    assert.equal(store.getAllStores().length, 0);
+    assert.equal(store.getPriceHistory(shop.id + ':item1').length, 0);
+    assert.equal(store.getAllProductLabels().length, 0);
+    assert.deepEqual(store.getUserPreferences(user.id), {});
+    assert.equal(store.getAuditLogs().length, 0);
+    assert.equal(store.listUsers().length, 1);
+    assert.equal(store.resolveAuthSession(session.token).username, 'admin');
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, DB_PATH: dbPath },
+    encoding: 'utf8',
+  });
+  try {
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('schema migration removes legacy duplicate history before adding the unique index', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-migration-'));
   const dbPath = path.join(tempDir, 'legacy.db');

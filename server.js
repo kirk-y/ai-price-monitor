@@ -75,7 +75,9 @@ function requireAuth(req, res, next) {
   if (user) { req.user = user; req.role = user.role; req.authToken = token; return next(); }
   if (ADMIN_TOKEN && token === ADMIN_TOKEN) { req.user = { id: null, username: 'legacy-admin', role: 'admin' }; req.role = 'admin'; return next(); }
   if (USER_TOKEN && token === USER_TOKEN) { req.user = { id: null, username: 'legacy-viewer', role: 'viewer' }; req.role = 'viewer'; return next(); }
-  res.status(401).json({ error: '未授权，请提供有效的访问令牌' });
+  req.user = { id: null, username: '', role: 'viewer', guest: true };
+  req.role = 'viewer';
+  next();
 }
 
 function requireAdmin(req, res, next) {
@@ -146,10 +148,22 @@ app.delete('/api/users/:id', requireAdmin, requireStrictLimit, (req, res) => {
   catch (err) { res.status(400).json({ error: err.message }); }
 });
 app.get('/api/audit-logs', requireAdmin, (req, res) => res.json(store.getAuditLogs(req.query.limit)));
-app.get('/api/preferences', (req, res) => res.json(store.getUserPreferences(req.user.id)));
+app.get('/api/preferences', (req, res) => res.json(req.user.id ? store.getUserPreferences(req.user.id) : {}));
 app.put('/api/preferences', (req, res) => {
+  if (!req.user.id) return res.status(403).json({ error: '访客偏好仅保存在当前浏览器' });
   try { res.json(store.updateUserPreferences(req.user.id, req.body)); }
   catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/system/clear-data', requireAdmin, requireStrictLimit, (req, res) => {
+  if (req.body?.confirmation !== '清除所有数据') {
+    return res.status(400).json({ error: '请输入“清除所有数据”以确认操作' });
+  }
+  invalidateRefreshQueue();
+  const deleted = store.clearSystemData();
+  autoRefreshAttempts.clear();
+  nextRefreshAt = null;
+  res.json({ success: true, deleted });
 });
 
 function requireStrictLimit(req, res, next) {
@@ -571,6 +585,15 @@ const cancelledRefreshBatches = new Set();
 let refreshQueueRunning = false;
 let refreshSequence = 0;
 let lastRefreshFinishedAt = 0;
+let dataGeneration = 0;
+
+function invalidateRefreshQueue() {
+  dataGeneration++;
+  while (refreshQueue.length) refreshQueue.shift().resolve();
+  queuedRefreshes.clear();
+  cancelledRefreshBatches.clear();
+  lastRefreshFinishedAt = 0;
+}
 
 function queueDelay(min, max) {
   const lo = Number(process.env.REFRESH_STORE_DELAY_MIN || min);
@@ -588,7 +611,7 @@ function enqueueStoreRefresh(storeId, url, reason = 'manual', batchId = '') {
 
   const priority = reason === 'manual' ? 0 : reason === 'global' ? 10 : 20;
   const task = new Promise((resolve) => {
-    refreshQueue.push({ storeId, url, reason, batchId, priority, sequence: refreshSequence++, resolve });
+    refreshQueue.push({ storeId, url, reason, batchId, priority, sequence: refreshSequence++, generation: dataGeneration, resolve });
     refreshQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
   });
   queuedRefreshes.set(storeId, task);
@@ -603,6 +626,10 @@ async function processRefreshQueue() {
     while (refreshQueue.length) {
       const job = refreshQueue.shift();
       queuedRefreshes.delete(job.storeId);
+      if (job.generation !== dataGeneration) {
+        job.resolve();
+        continue;
+      }
       if (job.batchId && cancelledRefreshBatches.has(job.batchId)) {
         store.updateStore(job.storeId, {
           status: 'error',
@@ -615,7 +642,7 @@ async function processRefreshQueue() {
       const minimumGap = queueDelay(2000, 6000);
       if (lastRefreshFinishedAt && sinceLast < minimumGap) await sleep(minimumGap - sinceLast);
       store.updateStore(job.storeId, { status: 'pending', error: '' });
-      await scrapeAndUpdate(job.storeId, job.url);
+      await scrapeAndUpdate(job.storeId, job.url, job.generation);
       lastRefreshFinishedAt = Date.now();
       job.resolve();
     }
@@ -625,11 +652,12 @@ async function processRefreshQueue() {
   }
 }
 
-function scrapeAndUpdate(storeId, url) {
+function scrapeAndUpdate(storeId, url, generation = dataGeneration) {
   if (activeRefreshes.has(storeId)) return activeRefreshes.get(storeId);
   const task = (async () => {
     try {
       const result = await scrapeShop(url);
+      if (generation !== dataGeneration || !store.getStore(storeId)) return;
       store.updateStore(storeId, {
         name: result.shopName,
         status: 'ok',
@@ -644,7 +672,9 @@ function scrapeAndUpdate(storeId, url) {
         console.error(`店铺 ${storeId} 分类失败:`, err.message);
       }
     } catch (err) {
-      store.updateStore(storeId, { status: 'error', error: err.message });
+      if (generation === dataGeneration && store.getStore(storeId)) {
+        store.updateStore(storeId, { status: 'error', error: err.message });
+      }
     }
   })();
   activeRefreshes.set(storeId, task);
