@@ -2573,6 +2573,27 @@ body.role-operator .superadmin-only { display: none !important; }
   box-shadow: 0 18px 50px rgba(15, 23, 42, .16);
 }
 
+.sc-sync-status {
+  display: none;
+  flex: 0 0 auto;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.sc-sync-status.pending {
+  display: inline-flex;
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.sc-sync-status.error {
+  display: inline-flex;
+  background: var(--danger-light);
+  color: var(--danger);
+}
+
 .auth-panel .auth-close {
   position: absolute;
   top: 10px;

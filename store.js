@@ -240,6 +240,15 @@ function getAllStores() {
   return getDb().prepare('SELECT * FROM stores ORDER BY addedAt ASC').all().map(serializeStore);
 }
 
+function getStoresByIds(storeIds) {
+  const ids = [...new Set((storeIds || []).map(String))].slice(0, 20);
+  if (!ids.length) return [];
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = getDb().prepare(`SELECT * FROM stores WHERE id IN (${placeholders})`).all(...ids);
+  const byId = new Map(rows.map(row => [row.id, serializeStore(row)]));
+  return ids.map(id => byId.get(id)).filter(Boolean);
+}
+
 function getStoreSummaries() {
   return getDb().prepare('SELECT * FROM stores ORDER BY addedAt ASC').all().map(r => {
     const products = JSON.parse(r.products || '[]');
@@ -1048,6 +1057,19 @@ function importAllHistory(data) {
   return true;
 }
 
+function getProductLabelsForStores(storeIds) {
+  const ids = [...new Set((storeIds || []).map(String))].slice(0, 20);
+  if (!ids.length) return [];
+  const conditions = ids.map(() => '(product_key >= ? AND product_key < ?)').join(' OR ');
+  return getDb().prepare(`
+    SELECT product_key, name, category, confidence, manual, created_at,
+           classification_json, classification_version, classification_source
+    FROM product_labels
+    WHERE ${conditions}
+    ORDER BY manual DESC, id DESC
+  `).all(...ids.flatMap(id => [`${id}:`, `${id};`])).map(serializeProductLabel);
+}
+
 function clearSystemData() {
   const db = getDb();
   const tables = [
@@ -1082,13 +1104,13 @@ function clearSystemData() {
 }
 
 module.exports = {
-  getAllStores, getStoreSummaries, getStore, addStore, importStoreList, removeStore, updateStore,
+  getAllStores, getStoresByIds, getStoreSummaries, getStore, addStore, importStoreList, removeStore, updateStore,
   recordPrices, getPriceHistory,
   getFilterConfig, updateFilterConfig,
   getClassificationConfig, updateClassificationConfig,
   getRefreshConfig, updateRefreshConfig,
   exportAllData, importAllData, exportStore, importSingleStore,
-  getProductLabel, upsertProductLabel, setProductLabel, getLabeledData, getAllProductLabels, recordLabelChange, getLabelChanges,
+  getProductLabel, upsertProductLabel, setProductLabel, getLabeledData, getAllProductLabels, getProductLabelsForStores, recordLabelChange, getLabelChanges,
   saveClassificationResult, recordClassificationFeedback, getClassificationFeedback,
   setProductClassificationAttributes,
   getStoreOrder, updateStoreOrder,

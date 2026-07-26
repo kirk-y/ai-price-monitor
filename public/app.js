@@ -38,6 +38,8 @@ let storeOrder = [];
 let dragDropPosition = 'before';
 let priceRange = { min: 0, max: 0 };
 let _priceTimer = null;
+let fullCatalogLoaded = false;
+let fullCatalogLoading = null;
 
 localStorage.removeItem('authToken');
 let _authToken = sessionStorage.getItem('sessionToken') || sessionStorage.getItem('authToken') || '';
@@ -354,28 +356,30 @@ document.addEventListener('DOMContentLoaded', async () => {
   ['dragstart', 'dragover', 'drop', 'dragend'].forEach(type => {
     document.addEventListener(type, handleActionDrag);
   });
-  filterConfig = await (await apiFetch('/api/filter-config')).json();
-  userPreferences = await (await apiFetch('/api/preferences')).json();
+  const bootstrap = await (await apiFetch('/api/bootstrap')).json();
+  filterConfig = bootstrap.filterConfig || {};
+  userPreferences = bootstrap.preferences || {};
   if (_currentUser?.guest) {
     try { userPreferences = JSON.parse(localStorage.getItem('guestPreferences') || '{}'); } catch (_) { userPreferences = {}; }
   }
-  classificationConfig = await (await apiFetch('/api/classification/config')).json();
+  classificationConfig = bootstrap.classificationConfig || { version: 2, taxonomy: [], rules: [] };
   syncCategoryDefinitions();
   hiddenStoreIds = Array.isArray(userPreferences.hiddenStoreIds)
     ? userPreferences.hiddenStoreIds
     : (Array.isArray(filterConfig.hiddenStoreIds) ? filterConfig.hiddenStoreIds : []);
   suggestedKeywords = filterConfig.suggestedKeywords || ['GPT', 'Plus', 'Pro', 'Team', '接码', '直充', '成品', '账号', 'Claude', 'Gemini', 'OpenAI', 'SMS', '谷歌', '微软', '邮箱', 'API', '订阅', '会员', 'Access'];
   keywordUsage = filterConfig.keywordUsage || {};
-  refreshConfig = await (await apiFetch('/api/refresh-config')).json();
-  await loadStoreSummaries();
-  stores = await (await apiFetch('/api/stores')).json();
-  const sharedStoreOrder = await (await apiFetch('/api/store-order')).json();
+  refreshConfig = bootstrap.refreshConfig || {};
+  storeSummaries = Array.isArray(bootstrap.summaries) ? bootstrap.summaries : [];
+  stores = Array.isArray(bootstrap.stores) ? bootstrap.stores : [];
+  const sharedStoreOrder = Array.isArray(bootstrap.storeOrder) ? bootstrap.storeOrder : [];
   storeOrder = Array.isArray(userPreferences.storeOrder) ? userPreferences.storeOrder : sharedStoreOrder;
   applyStoreOrder();
-  const labels = await (await apiFetch('/api/product-labels')).json();
+  const labels = Array.isArray(bootstrap.productLabels) ? bootstrap.productLabels : [];
   for (const l of labels) { productLabels[l.product_key] = l; }
   markDirty();
   render();
+  hydrateFullCatalog();
   document.getElementById('catBar').addEventListener('wheel', e => { e.preventDefault(); document.getElementById('catBar').scrollLeft += e.deltaY; }, { passive: false });
   document.querySelectorAll('.close').forEach(el => el.addEventListener('click', () => {
     document.getElementById('historyModal').style.display = 'none';
@@ -1371,15 +1375,48 @@ async function loadStoreSummaries() {
 
 async function loadStoreWithProducts(storeId) {
   if (storeId === 'all') {
-    stores = await (await apiFetch('/api/stores')).json();
-    markDirty();
+    await hydrateFullCatalog();
     return;
   }
-  const full = await (await apiFetch(`/api/stores/${storeId}`)).json();
-  const idx = stores.findIndex(s => s.id === storeId);
-  if (idx >= 0) stores[idx] = full;
-  else stores.push(full);
+  await loadStoreBatch([storeId], true);
+}
+
+async function loadStoreBatch(storeIds, force = false) {
+  const ids = [...new Set(storeIds)].filter(id => id && (force || !stores.some(store => store.id === id)));
+  if (!ids.length) return;
+  const response = await apiFetch(`/api/stores-batch?ids=${ids.map(encodeURIComponent).join(',')}`);
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || '店铺数据加载失败');
+  for (const full of data.stores || []) {
+    const index = stores.findIndex(store => store.id === full.id);
+    if (index >= 0) stores[index] = full; else stores.push(full);
+  }
+  for (const label of data.productLabels || []) productLabels[label.product_key] = label;
+  applyStoreOrder();
   markDirty();
+}
+
+async function hydrateFullCatalog() {
+  if (fullCatalogLoaded) return;
+  if (fullCatalogLoading) return fullCatalogLoading;
+  fullCatalogLoading = (async () => {
+    const [storeResponse, labelResponse] = await Promise.all([
+      apiFetch('/api/stores'),
+      apiFetch('/api/product-labels'),
+    ]);
+    const [allStores, labels] = await Promise.all([storeResponse.json(), labelResponse.json()]);
+    if (!storeResponse.ok || !labelResponse.ok) throw new Error('全量商品数据加载失败');
+    stores = allStores;
+    productLabels = {};
+    for (const label of labels) productLabels[label.product_key] = label;
+    fullCatalogLoaded = true;
+    applyStoreOrder();
+    markDirty();
+    render();
+  })().catch(error => {
+    console.error('后台加载全量数据失败:', error.message);
+  }).finally(() => { fullCatalogLoading = null; });
+  return fullCatalogLoading;
 }
 
 function categorize(name) {
@@ -2046,7 +2083,7 @@ function setupStoreScrollTracking() {
   if (!container) return;
   let frame = 0;
   let previousScrollTop = container.scrollTop;
-  const expandPreviousStores = () => {
+  const expandPreviousStores = async () => {
     if (storeWindowStart <= 0 || storeWindowBusy) return false;
     storeWindowBusy = true;
     const anchor = container.querySelector('.store-card[data-store-id]');
@@ -2054,7 +2091,15 @@ function setupStoreScrollTracking() {
     const anchorId = anchor?.dataset.storeId;
     const anchorOffset = anchor ? anchor.getBoundingClientRect().top - host.top : 0;
     storeWindowStart = Math.max(0, storeWindowStart - 4);
-    renderStores();
+    try {
+      const ids = visibleStoreSummaries().slice(storeWindowStart, storeWindowEnd + 1).map(store => store.id);
+      await loadStoreBatch(ids);
+      renderStores();
+    } catch (error) {
+      console.error('加载上一批店铺失败:', error.message);
+      storeWindowBusy = false;
+      return false;
+    }
     requestAnimationFrame(() => {
       const nextAnchor = anchorId
         ? container.querySelector(`.store-card[data-store-id="${CSS.escape(anchorId)}"]`)
@@ -2083,8 +2128,14 @@ function setupStoreScrollTracking() {
       if (storeWindowEnd < max) {
         storeWindowBusy = true;
         storeWindowEnd = Math.min(max, storeWindowEnd + 4);
-        renderStores();
-        requestAnimationFrame(() => requestAnimationFrame(() => { storeWindowBusy = false; }));
+        const ids = visibleStoreSummaries().slice(storeWindowStart, storeWindowEnd + 1).map(store => store.id);
+        loadStoreBatch(ids).then(() => {
+          renderStores();
+          requestAnimationFrame(() => requestAnimationFrame(() => { storeWindowBusy = false; }));
+        }).catch(error => {
+          console.error('加载下一批店铺失败:', error.message);
+          storeWindowBusy = false;
+        });
       }
     } else if ((scrollingUp || atTop) && container.scrollTop <= 120 && storeWindowStart > 0) {
       expandPreviousStores();
@@ -2160,7 +2211,8 @@ async function switchStore(storeId) {
   const summary = storeSummaries.find(s => s.id === storeId);
   if (!summary || isStoreHidden(storeId)) return;
   const loadedStore = stores.find(store => store.id === storeId);
-  if (!loadedStore || loadedStore.status === 'pending' || loadedStore.status === 'error') {
+  const loadedDataIsStale = Boolean(loadedStore && summary.lastUpdated && loadedStore.lastUpdated !== summary.lastUpdated);
+  if (!loadedStore || loadedDataIsStale || loadedStore.status === 'pending' || loadedStore.status === 'error') {
     showStoreLoadingOverlay('正在加载店铺数据…');
     try {
       await loadStoreWithProducts(storeId);
@@ -2478,10 +2530,12 @@ function renderStores() {
     if (reachedLimit) return '';
     const s = stores.find(st => st.id === id);
     if (!s) return '';
+    const summary = storeSummaries.find(item => item.id === id) || s;
+    const displayStatus = summary.status || s.status || 'ok';
     const storeLink = safeUrl(s.url);
     const storeName = storeLink ? `<a class="sc-name sc-store-link" href="${storeLink}" target="_blank" rel="noopener noreferrer" title="打开店铺">${escapeHtml(s.name||s.id)}</a>` : `<span class="sc-name">${escapeHtml(s.name||s.id)}</span>`;
-    if (s.status === 'pending') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-loading">正在获取商品数据...</div></div>`;
-    if (s.status === 'error') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(s.error||'获取失败')}</div><div class="sc-actions"><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
+    if (!(s.products || []).length && displayStatus === 'pending') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-loading">正在获取商品数据...</div></div>`;
+    if (!(s.products || []).length && displayStatus === 'error') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(summary.error||s.error||'获取失败')}</div><div class="sc-actions"><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
 
     let products = filtered.filter(p => p.storeId === id);
     const storePrices = products.map(p => p.price).filter(v => v > 0);
@@ -2511,8 +2565,9 @@ function renderStores() {
     return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">
       <div class="sc-header">
         ${storeName}
-        <span class="sc-time">${formatTime(s.lastUpdated)}</span>
+        <span class="sc-time">${formatTime(summary.lastUpdated || s.lastUpdated)}</span>
         <span class="sc-meta">${products.length} 个商品</span>
+        <span class="sc-sync-status ${displayStatus}" title="${displayStatus === 'error' ? escapeHtml(summary.error || '更新失败') : ''}">${displayStatus === 'pending' ? '更新中' : displayStatus === 'error' ? '更新失败' : ''}</span>
         <div class="sc-actions">
           <button class="ref-btn admin-only" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button>
           <button class="history-store-btn" data-action="open-history-store" data-store-id="${escapeHtml(s.id)}" title="查看该店铺历史最低价">历史最低</button>
@@ -2540,6 +2595,23 @@ function renderStores() {
     button.setAttribute('title', '查看价格走势');
   });
   observeSentinel();
+}
+
+function updateRenderedStoreStatuses() {
+  const summaries = new Map(storeSummaries.map(summary => [summary.id, summary]));
+  document.querySelectorAll('.store-card[data-store-id]').forEach(card => {
+    const summary = summaries.get(card.dataset.storeId);
+    if (!summary) return;
+    const status = summary.status || 'ok';
+    const indicator = card.querySelector('.sc-sync-status');
+    if (indicator) {
+      indicator.className = `sc-sync-status ${status}`;
+      indicator.textContent = status === 'pending' ? '更新中' : status === 'error' ? '更新失败' : '';
+      indicator.title = status === 'error' ? (summary.error || '更新失败') : '';
+    }
+    const time = card.querySelector('.sc-time');
+    if (time && status !== 'pending') time.textContent = formatTime(summary.lastUpdated);
+  });
 }
 
 async function copyStoreLink(url) {
@@ -2960,8 +3032,6 @@ async function submitAddStore() {
       if (updated && updated.status === 'ok') {
         storeSummaries = check;
         await loadStoreWithProducts(storeData.id);
-        const newLabels = await (await apiFetch('/api/product-labels')).json();
-        for (const l of newLabels) { productLabels[l.product_key] = l; }
         markDirty();
         if (activeStoreId === 'all' || activeStoreId === storeData.id) {
           render();
@@ -3007,8 +3077,6 @@ async function waitForStoreRefresh(id, maxAttempts = 60) {
     if (updated.status === 'error') throw new Error(updated.error || '店铺刷新失败');
     if (updated.status !== 'pending') {
       await loadStoreWithProducts(id);
-      const newLabels = await (await apiFetch('/api/product-labels')).json();
-      for (const label of newLabels) productLabels[label.product_key] = label;
       markDirty();
       return updated;
     }
@@ -3017,9 +3085,8 @@ async function waitForStoreRefresh(id, maxAttempts = 60) {
 }
 
 async function refreshStore(id, silent) {
-  if (!id || (_refreshingAll && !silent)) return;
-  if (refreshingStores.has(id)) {
-    if (_refreshingAll && silent) await waitForStoreRefresh(id);
+  if (!id) return;
+  if (refreshingStores.has(id) && !_refreshingAll) {
     return;
   }
   refreshingStores.add(id);
@@ -3027,6 +3094,7 @@ async function refreshStore(id, silent) {
     ? { ...store, status: 'pending', error: '' }
     : store);
   renderStoreList();
+  updateRenderedStoreStatuses();
   try {
     await apiFetch(`/api/stores/${id}/refresh`, { method: 'POST' });
     await waitForStoreRefresh(id);
@@ -3035,6 +3103,7 @@ async function refreshStore(id, silent) {
   } catch (error) {
     if (!silent) alert('刷新失败: ' + error.message);
     renderStoreList();
+    updateRenderedStoreStatuses();
   } finally {
     refreshingStores.delete(id);
     renderStoreList();
@@ -3056,8 +3125,6 @@ async function legacyRefreshStore(id, silent) {
         applyStoreOrder();
         if (updated.status === 'ok') {
           await loadStoreWithProducts(id);
-          const newLabels = await (await apiFetch('/api/product-labels')).json();
-          for (const l of newLabels) { productLabels[l.product_key] = l; }
           markDirty();
           flashSuccess(id);
           if (!silent) renderStores();
@@ -3095,24 +3162,11 @@ function startStoreStatusPolling() {
         return !prev || prev.status !== next.status || prev.lastUpdated !== next.lastUpdated || prev.productCount !== next.productCount;
       });
       if (!changed) return;
-      const refreshed = summary.some(next => {
-        const prev = storeSummaries.find(store => store.id === next.id);
-        return next.status === 'ok' && prev && prev.lastUpdated !== next.lastUpdated;
-      });
-      const refreshedIds = summary.filter(next => {
-        const prev = storeSummaries.find(store => store.id === next.id);
-        return next.status === 'ok' && prev && prev.lastUpdated !== next.lastUpdated;
-      }).map(store => store.id);
       storeSummaries = summary;
       applyStoreOrder();
       renderStoreList();
       renderActiveStoreCard();
-      if (refreshed) {
-        for (const id of refreshedIds) await loadStoreWithProducts(id);
-        markDirty();
-        renderStores();
-        renderBestPrices();
-      }
+      updateRenderedStoreStatuses();
     } catch (_) { /* A later poll will retry. */ }
   }, 5000);
 }
@@ -3134,6 +3188,7 @@ async function refreshAllStores() {
       : store);
     ids.forEach(id => refreshingStores.add(id));
     renderStoreList();
+    updateRenderedStoreStatuses();
     const response = await apiFetch('/api/stores/refresh-all', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3183,8 +3238,6 @@ async function legacyRefreshAllStores() {
           applyStoreOrder();
           if (updated.status === 'ok') {
             await loadStoreWithProducts(s.id);
-            const newLabels = await (await apiFetch('/api/product-labels')).json();
-            for (const l of newLabels) { productLabels[l.product_key] = l; }
             markDirty();
             flashSuccess(s.id);
             break;

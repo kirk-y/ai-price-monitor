@@ -334,6 +334,54 @@ app.get('/api/stores/summary', (req, res) => {
   res.json(store.getStoreSummaries());
 });
 
+function compactProductLabels(labels) {
+  return labels.map(label => ({
+    product_key: label.product_key,
+    category: label.category,
+    confidence: label.confidence,
+    manual: label.manual,
+    classification: label.classification ? {
+      category: label.classification.category,
+      attributes: label.classification.attributes || {},
+    } : null,
+  }));
+}
+
+app.get('/api/bootstrap', (req, res) => {
+  const summaries = store.getStoreSummaries();
+  const preferences = req.user.id ? store.getUserPreferences(req.user.id) : {};
+  const sharedOrder = store.getStoreOrder();
+  const preferredOrder = Array.isArray(preferences.storeOrder) ? preferences.storeOrder : sharedOrder;
+  const byId = new Map(summaries.map(item => [item.id, item]));
+  const orderedIds = [...new Set([...preferredOrder, ...summaries.map(item => item.id)])].filter(id => byId.has(id));
+  const hidden = new Set(Array.isArray(preferences.hiddenStoreIds) ? preferences.hiddenStoreIds : []);
+  const initialStoreIds = orderedIds.filter(id => !hidden.has(id)).slice(0, 5);
+  const filterConfig = store.getFilterConfig();
+  const safeFilterConfig = req.role === 'viewer' && filterConfig.aiClassify
+    ? { ...filterConfig, aiClassify: { ...filterConfig.aiClassify, key: '' } }
+    : filterConfig;
+  res.json({
+    filterConfig: safeFilterConfig,
+    preferences,
+    classificationConfig: store.getClassificationConfig(),
+    refreshConfig: { ...store.getRefreshConfig(), nextRefreshAt },
+    summaries,
+    storeOrder: sharedOrder,
+    stores: store.getStoresByIds(initialStoreIds),
+    productLabels: compactProductLabels(store.getProductLabelsForStores(initialStoreIds)),
+  });
+});
+
+app.get('/api/stores-batch', (req, res) => {
+  const ids = String(req.query.ids || '').split(',').filter(Boolean).slice(0, 20);
+  const knownIds = new Set(store.getStoreSummaries().map(item => item.id));
+  if (ids.some(id => !knownIds.has(id))) return res.status(400).json({ error: '店铺参数无效' });
+  res.json({
+    stores: store.getStoresByIds(ids),
+    productLabels: compactProductLabels(store.getProductLabelsForStores(ids)),
+  });
+});
+
 app.post('/api/stores/refresh-all', requireOperator, requireStrictLimit, (req, res) => {
   const requested = Array.isArray(req.body?.storeIds) ? req.body.storeIds : [];
   const byId = new Map(store.getAllStores().map(item => [item.id, item]));
@@ -710,7 +758,19 @@ function sleep(ms) {
 
 function enqueueStoreRefresh(storeId, url, reason = 'manual', batchId = '') {
   if (activeRefreshes.has(storeId)) return activeRefreshes.get(storeId);
-  if (queuedRefreshes.has(storeId)) return queuedRefreshes.get(storeId);
+  if (queuedRefreshes.has(storeId)) {
+    if (reason === 'manual') {
+      const queued = refreshQueue.find(job => job.storeId === storeId);
+      if (queued && queued.priority > 0) {
+        queued.priority = 0;
+        queued.reason = 'manual';
+        queued.batchId = '';
+        queued.sequence = refreshSequence++;
+        refreshQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+      }
+    }
+    return queuedRefreshes.get(storeId);
+  }
 
   const priority = reason === 'manual' ? 0 : reason === 'global' ? 10 : 20;
   const task = new Promise((resolve) => {

@@ -68,6 +68,32 @@ test('clearing system data preserves users and sessions but removes monitoring d
   }
 });
 
+test('batch startup reads preserve store order and isolate labels by exact store prefix', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-batch-'));
+  const dbPath = path.join(tempDir, 'batch.db');
+  const script = `
+    const assert = require('node:assert/strict');
+    const store = require('./store');
+    store.addStore('https://pay.ldxp.cn/shop/shop_one');
+    store.addStore('https://pay.ldxp.cn/shop/shopXone');
+    store.setProductLabel('shop_one:item1', 'First', 'gpt_plus');
+    store.setProductLabel('shopXone:item2', 'Second', 'claude_pro');
+    assert.deepEqual(store.getStoresByIds(['shopXone', 'shop_one']).map(item => item.id), ['shopXone', 'shop_one']);
+    const labels = store.getProductLabelsForStores(['shop_one']);
+    assert.deepEqual(labels.map(item => item.product_key), ['shop_one:item1']);
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, DB_PATH: dbPath },
+    encoding: 'utf8',
+  });
+  try {
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('schema migration removes legacy duplicate history before adding the unique index', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-migration-'));
   const dbPath = path.join(tempDir, 'legacy.db');
