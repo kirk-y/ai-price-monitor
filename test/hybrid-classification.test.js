@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
+  classifyHybridProduct,
   inspectProductSubject,
   isKnownGptClassification,
   preClassifyProduct,
@@ -43,6 +44,13 @@ test('known GPT context allows ambiguous marketplace titles into tier validation
   const result = validateModelPrediction('韩国渠道成品号，质保首登', { tier: 'plus', confidence: 0.82 }, { knownProduct: true });
   assert.equal(result.accepted, true);
   assert.equal(result.tier, 'plus');
+});
+
+test('hybrid classification supplies confidence for known GPT context', () => {
+  const base = { version: 2, dimensions: { product: { value: null, confidence: 0 } }, attributes: {} };
+  const result = classifyHybridProduct('韩国渠道成品号，质保首登', base, { knownProduct: true });
+  assert.equal(result.dimensions.product.value, 'gpt');
+  assert.ok(result.dimensions.product.confidence > 0.3);
 });
 
 test('recognizes canonical and legacy GPT labels without matching other products', () => {

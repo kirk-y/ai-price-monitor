@@ -144,13 +144,25 @@ function classifyHybridProduct(name, baseResult, options = {}) {
     evidence: [],
     alternatives: prediction.alternatives.map(item => ({ value: item.label, score: item.score })),
   };
+  const existingProductDimension = baseResult?.dimensions?.product || {};
+  const productDimension = existingProductDimension.value
+    ? existingProductDimension
+    : {
+      value: 'gpt',
+      label: 'GPT',
+      score: prediction.margin,
+      confidence: knownProduct ? 0.95 : prediction.confidence,
+      ambiguous: false,
+      evidence: knownProduct ? ['existing-gpt-label'] : [],
+      alternatives: [],
+    };
   return {
     ...baseResult,
     version: 2,
     category,
     product: 'gpt',
     tier: decision.tier,
-    dimensions: { ...(baseResult?.dimensions || {}), tier: tierDimension },
+    dimensions: { ...(baseResult?.dimensions || {}), product: productDimension, tier: tierDimension },
     needsReview: Boolean(baseResult?.dimensions?.product?.ambiguous || decision.needsReview),
     hybrid: {
       ...decision,
