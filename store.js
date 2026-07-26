@@ -1,4 +1,5 @@
 const Database = require('better-sqlite3');
+const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
 const { DEFAULT_CLASSIFICATION_CONFIG, validateClassificationConfig } = require('./classification');
@@ -73,6 +74,7 @@ function getDb() {
     const exists = fs.existsSync(DB_PATH);
     db = new Database(DB_PATH);
     db.pragma('journal_mode = WAL');
+    db.pragma('foreign_keys = ON');
     initSchema();
     if (!exists && fs.existsSync(JSON_PATH)) {
       migrateFromJson();
@@ -134,6 +136,40 @@ function initSchema() {
     );
     CREATE INDEX IF NOT EXISTS idx_classification_feedback_product
     ON classification_feedback(product_key, created_at DESC);
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      password_hash TEXT NOT NULL,
+      role TEXT NOT NULL CHECK(role IN ('admin', 'operator', 'viewer')),
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      last_login_at TEXT
+    );
+    CREATE TABLE IF NOT EXISTS auth_sessions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      token_hash TEXT NOT NULL UNIQUE,
+      expires_at TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_auth_sessions_token ON auth_sessions(token_hash);
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER,
+      username TEXT,
+      action TEXT NOT NULL,
+      target TEXT,
+      detail TEXT,
+      created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS user_preferences (
+      user_id INTEGER PRIMARY KEY,
+      value TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
   `);
 
   for (const statement of [
@@ -411,6 +447,155 @@ function getLabeledData() {
     WHERE manual=1 OR confidence>0.3
     ORDER BY manual DESC, id DESC
   `).all().map(serializeProductLabel);
+}
+
+const AUTH_ROLES = new Set(['admin', 'operator', 'viewer']);
+
+function validateUsername(username) {
+  const value = String(username || '').trim();
+  if (!/^[\p{L}\p{N}_.-]{3,32}$/u.test(value)) throw new Error('用户名需为 3-32 位字母、数字、中文、点、横线或下划线');
+  return value;
+}
+
+function validatePassword(password) {
+  const value = String(password || '');
+  if (value.length < 8 || value.length > 128) throw new Error('密码长度需为 8-128 位');
+  return value;
+}
+
+function validateRole(role) {
+  const value = String(role || '');
+  if (!AUTH_ROLES.has(value)) throw new Error('无效的用户角色');
+  return value;
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16);
+  const hash = crypto.scryptSync(validatePassword(password), salt, 64);
+  return `scrypt:${salt.toString('hex')}:${hash.toString('hex')}`;
+}
+
+function verifyPassword(password, stored) {
+  try {
+    const [algorithm, saltHex, hashHex] = String(stored || '').split(':');
+    if (algorithm !== 'scrypt' || !saltHex || !hashHex) return false;
+    const expected = Buffer.from(hashHex, 'hex');
+    const actual = crypto.scryptSync(String(password || ''), Buffer.from(saltHex, 'hex'), expected.length);
+    return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+  } catch (_) { return false; }
+}
+
+function publicUser(row) {
+  if (!row) return null;
+  return { id: row.id, username: row.username, role: row.role, enabled: Boolean(row.enabled), createdAt: row.created_at, updatedAt: row.updated_at, lastLoginAt: row.last_login_at };
+}
+
+function getUserCount() {
+  return getDb().prepare('SELECT COUNT(*) count FROM users').get().count;
+}
+
+function listUsers() {
+  return getDb().prepare('SELECT * FROM users ORDER BY username COLLATE NOCASE').all().map(publicUser);
+}
+
+function createUser(username, password, role = 'viewer') {
+  const now = new Date().toISOString();
+  const info = getDb().prepare(`INSERT INTO users (username, password_hash, role, enabled, created_at, updated_at)
+    VALUES (?, ?, ?, 1, ?, ?)`).run(validateUsername(username), hashPassword(password), validateRole(role), now, now);
+  return publicUser(getDb().prepare('SELECT * FROM users WHERE id=?').get(info.lastInsertRowid));
+}
+
+function authenticateUser(username, password) {
+  const row = getDb().prepare('SELECT * FROM users WHERE username=? COLLATE NOCASE').get(String(username || '').trim());
+  if (!row || !row.enabled || !verifyPassword(password, row.password_hash)) return null;
+  const now = new Date().toISOString();
+  getDb().prepare('UPDATE users SET last_login_at=?, updated_at=? WHERE id=?').run(now, now, row.id);
+  return publicUser({ ...row, last_login_at: now, updated_at: now });
+}
+
+function createAuthSession(userId, maxAgeMs = 7 * 24 * 60 * 60 * 1000) {
+  const token = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + maxAgeMs).toISOString();
+  const db = getDb();
+  db.prepare('DELETE FROM auth_sessions WHERE expires_at<=?').run(now.toISOString());
+  db.prepare('INSERT INTO auth_sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)')
+    .run(userId, tokenHash, expiresAt, now.toISOString());
+  return { token, expiresAt };
+}
+
+function resolveAuthSession(token) {
+  if (!token) return null;
+  const tokenHash = crypto.createHash('sha256').update(String(token)).digest('hex');
+  const row = getDb().prepare(`SELECT s.id session_id, s.expires_at, u.* FROM auth_sessions s
+    JOIN users u ON u.id=s.user_id WHERE s.token_hash=?`).get(tokenHash);
+  if (!row || !row.enabled || Date.parse(row.expires_at) <= Date.now()) {
+    if (row) getDb().prepare('DELETE FROM auth_sessions WHERE id=?').run(row.session_id);
+    return null;
+  }
+  return { ...publicUser(row), sessionId: row.session_id, expiresAt: row.expires_at };
+}
+
+function deleteAuthSession(token) {
+  if (!token) return false;
+  const tokenHash = crypto.createHash('sha256').update(String(token)).digest('hex');
+  return getDb().prepare('DELETE FROM auth_sessions WHERE token_hash=?').run(tokenHash).changes > 0;
+}
+
+function updateUser(userId, changes, actorId) {
+  const id = Number(userId);
+  const current = getDb().prepare('SELECT * FROM users WHERE id=?').get(id);
+  if (!current) throw new Error('用户不存在');
+  const role = changes.role === undefined ? current.role : validateRole(changes.role);
+  const enabled = changes.enabled === undefined ? current.enabled : (changes.enabled ? 1 : 0);
+  if (id === Number(actorId) && (!enabled || role !== 'admin')) throw new Error('不能取消自己的管理员权限');
+  if (current.role === 'admin' && current.enabled && (!enabled || role !== 'admin')) {
+    const admins = getDb().prepare("SELECT COUNT(*) count FROM users WHERE role='admin' AND enabled=1").get().count;
+    if (admins <= 1) throw new Error('至少需要保留一个启用的管理员');
+  }
+  const passwordHash = changes.password ? hashPassword(changes.password) : current.password_hash;
+  const now = new Date().toISOString();
+  const db = getDb();
+  db.prepare('UPDATE users SET role=?, enabled=?, password_hash=?, updated_at=? WHERE id=?').run(role, enabled, passwordHash, now, id);
+  if (!enabled || changes.password) db.prepare('DELETE FROM auth_sessions WHERE user_id=?').run(id);
+  return publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(id));
+}
+
+function deleteUser(userId, actorId) {
+  const id = Number(userId);
+  if (id === Number(actorId)) throw new Error('不能删除当前登录用户');
+  const row = getDb().prepare('SELECT * FROM users WHERE id=?').get(id);
+  if (!row) return false;
+  if (row.role === 'admin' && row.enabled) {
+    const admins = getDb().prepare("SELECT COUNT(*) count FROM users WHERE role='admin' AND enabled=1").get().count;
+    if (admins <= 1) throw new Error('至少需要保留一个启用的管理员');
+  }
+  return getDb().prepare('DELETE FROM users WHERE id=?').run(id).changes > 0;
+}
+
+function recordAudit(user, action, target = '', detail = '') {
+  getDb().prepare('INSERT INTO audit_logs (user_id, username, action, target, detail, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(user?.id || null, user?.username || '', String(action).slice(0, 100), String(target).slice(0, 500), String(detail).slice(0, 2000), new Date().toISOString());
+}
+
+function getAuditLogs(limit = 200) {
+  return getDb().prepare('SELECT * FROM audit_logs ORDER BY id DESC LIMIT ?').all(Math.min(500, Math.max(1, Number(limit) || 200)));
+}
+
+function getUserPreferences(userId) {
+  const row = getDb().prepare('SELECT value FROM user_preferences WHERE user_id=?').get(Number(userId));
+  try { return JSON.parse(row?.value || '{}'); } catch (_) { return {}; }
+}
+
+function updateUserPreferences(userId, value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('用户偏好格式错误');
+  const json = JSON.stringify(value);
+  if (json.length > 100000) throw new Error('用户偏好数据过大');
+  getDb().prepare(`INSERT INTO user_preferences (user_id, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`)
+    .run(Number(userId), json, new Date().toISOString());
+  return value;
 }
 
 function getAllProductLabels() {
@@ -875,4 +1060,6 @@ module.exports = {
   setProductClassificationAttributes,
   getStoreOrder, updateStoreOrder,
   exportStoreHistory, exportAllHistory, importStoreHistory, importAllHistory,
+  getUserCount, listUsers, createUser, authenticateUser, createAuthSession, resolveAuthSession, deleteAuthSession,
+  updateUser, deleteUser, recordAudit, getAuditLogs, getUserPreferences, updateUserPreferences,
 };

@@ -6,6 +6,7 @@ let stores = [];
 let activeStoreId = 'all';
 let activeBrowseStoreId = '';
 let hiddenStoreIds = [];
+let userPreferences = {};
 let storeWindowStart = 0;
 let storeWindowEnd = 4;
 let storeWindowBusy = false;
@@ -14,6 +15,7 @@ let activeCatL1 = 'gpt';
 let activeCatL2 = 'gpt_plus';
 let plusDetailsExpanded = activeCatL2 === 'gpt_plus';
 let activePlusDetail = localStorage.getItem('activePlusDetail') || 'all';
+let bestPricePlusExpanded = localStorage.getItem('bestPricePlusExpanded') === 'true';
 let renderLimit = 30;
 let expandedNoStock = {};
 let includeWords = [];
@@ -33,36 +35,118 @@ let productLabels = {};
 let cachedProducts = [];
 let productsDirty = true;
 let storeOrder = [];
+let dragDropPosition = 'before';
 let priceRange = { min: 0, max: 0 };
 let _priceTimer = null;
 
 localStorage.removeItem('authToken');
 let _authToken = sessionStorage.getItem('authToken') || '';
+let _userRole = sessionStorage.getItem('userRole') || '';
+let _currentUser = null;
 
 async function apiFetch(url, opts) {
   const h = { ...(opts?.headers || {}) };
   if (_authToken) h['x-auth-token'] = _authToken;
   const res = await fetch(url, { ...opts, headers: h });
   if (res.status === 401) {
-    if (!_authToken) {
-      showAuthPrompt();
-    } else {
-      _authToken = '';
-      sessionStorage.removeItem('authToken');
-      showAuthPrompt();
-    }
+    clearAuthSession();
+    document.getElementById('authOverlay')?.classList.add('visible');
     throw new Error('未授权');
+  }
+  if (res.status === 403) {
+    alert('权限不足，该操作需要管理员权限');
+    throw new Error('权限不足');
   }
   return res;
 }
 
-function showAuthPrompt() {
-  const token = prompt('请输入访问令牌:');
-  if (token) {
-    _authToken = token;
-    sessionStorage.setItem('authToken', token);
-    location.reload();
+function isAdmin() {
+  return _userRole === 'admin';
+}
+
+function canOperate() {
+  return _userRole === 'admin' || _userRole === 'operator';
+}
+
+function clearAuthSession() {
+  _authToken = '';
+  _userRole = '';
+  _currentUser = null;
+  sessionStorage.removeItem('authToken');
+  sessionStorage.removeItem('userRole');
+}
+
+async function fetchUserRole() {
+  try {
+    const res = await apiFetch('/api/auth/me');
+    const data = await res.json();
+    _currentUser = data.user || null;
+    _userRole = _currentUser?.role || '';
+    sessionStorage.setItem('userRole', _userRole);
+    applyRoleRestrictions();
+    return true;
+  } catch (e) { return false; }
+}
+
+function applyRoleRestrictions() {
+  document.body.classList.toggle('role-admin', isAdmin());
+  document.body.classList.toggle('role-operator', _userRole === 'operator');
+  document.body.classList.toggle('role-viewer', _userRole === 'viewer');
+  const badge = document.getElementById('roleBadge');
+  if (badge) {
+    const roleLabels = { admin: '管理员', operator: '操作员', viewer: '访客' };
+    badge.textContent = `${_currentUser?.username || ''} · ${roleLabels[_userRole] || ''}`;
+    badge.className = 'role-badge ' + (_userRole || 'viewer');
   }
+}
+
+async function ensureAuthenticated() {
+  if (_authToken && await fetchUserRole()) return;
+  clearAuthSession();
+  const status = await fetch('/api/auth/status').then(response => response.json());
+  const setup = Boolean(status.setupRequired);
+  const overlay = document.getElementById('authOverlay');
+  const title = document.getElementById('authTitle');
+  const hint = document.getElementById('authHint');
+  const submit = document.getElementById('authSubmit');
+  const username = document.getElementById('authUsername');
+  const password = document.getElementById('authPassword');
+  const message = document.getElementById('authMessage');
+  title.textContent = setup ? '创建管理员' : '登录价格监控';
+  hint.textContent = setup ? '首次使用，请创建平台管理员账户。' : '使用平台账户继续。';
+  submit.textContent = setup ? '创建并进入' : '登录';
+  overlay.classList.add('visible');
+  await new Promise(resolve => {
+    document.getElementById('authForm').onsubmit = async event => {
+      event.preventDefault();
+      message.textContent = '';
+      submit.disabled = true;
+      try {
+        const response = await fetch(setup ? '/api/auth/bootstrap' : '/api/auth/login', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: username.value.trim(), password: password.value }),
+        });
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || '登录失败');
+        _authToken = data.token;
+        _currentUser = data.user;
+        _userRole = data.user.role;
+        sessionStorage.setItem('authToken', _authToken);
+        sessionStorage.setItem('userRole', _userRole);
+        password.value = '';
+        overlay.classList.remove('visible');
+        applyRoleRestrictions();
+        resolve();
+      } catch (error) { message.textContent = error.message; }
+      finally { submit.disabled = false; }
+    };
+  });
+}
+
+async function logout() {
+  try { await apiFetch('/api/auth/logout', { method: 'POST' }); } catch (_) {}
+  clearAuthSession();
+  location.reload();
 }
 
 const THEME_ICONS = {
@@ -128,9 +212,10 @@ function handleActionClick(event) {
     'set-cat-l1': () => setCatL1(target.dataset.category),
     'set-cat-l2': () => setCatL2(target.dataset.category),
     'set-plus-detail': () => setPlusDetail(target.dataset.detail),
+    'toggle-best-plus': () => toggleBestPricePlus(),
     'set-cat-all': () => setAllCategories(),
     'switch-store': () => switchStore(target.dataset.storeId),
-    'go-best-price': () => goToBestPrice(target.dataset.storeId, target.dataset.category, target.dataset.productId),
+    'go-best-price': () => goToBestPrice(target.dataset.storeId, target.dataset.category, target.dataset.productId, target.dataset.detail),
     'history-cat': () => selectHistoryBestCategory(target.dataset.category),
     'open-history-best': () => openHistoricalBestView(),
     'open-history-store': () => openHistoricalBestForStore(target.dataset.storeId),
@@ -142,6 +227,8 @@ function handleActionClick(event) {
     'hide-store': () => hideStore(target.dataset.storeId),
     'copy-store-link': () => copyStoreLink(target.dataset.storeUrl),
     'restore-store': () => restoreStore(target.dataset.storeId),
+    'save-user': () => saveManagedUser(target.dataset.userId),
+    'delete-user': () => deleteManagedUser(target.dataset.userId),
     'refresh-store': () => refreshStore(target.dataset.storeId),
     'edit-label': () => editLabel(
       target.dataset.productKey,
@@ -206,7 +293,7 @@ function handleActionDrag(event) {
   }
   if (target.dataset.dragType === 'store') {
     if (event.type === 'dragstart') dragStart(event, target.dataset.id);
-    if (event.type === 'dragover') dragOver(event);
+    if (event.type === 'dragover') dragOver(event, target.dataset.id);
     if (event.type === 'drop') dropStore(event, target.dataset.id);
     if (event.type === 'dragend') dragEnd();
   }
@@ -220,7 +307,9 @@ function handleActionDrag(event) {
 
 document.addEventListener('DOMContentLoaded', async () => {
   initTheme();
+  await ensureAuthenticated();
   document.getElementById('themeToggle').addEventListener('click', toggleTheme);
+  document.getElementById('logoutBtn').addEventListener('click', logout);
   document.addEventListener('click', handleActionClick);
   document.addEventListener('change', handleActionChange);
   document.addEventListener('input', handleActionInput);
@@ -228,15 +317,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     document.addEventListener(type, handleActionDrag);
   });
   filterConfig = await (await apiFetch('/api/filter-config')).json();
+  userPreferences = await (await apiFetch('/api/preferences')).json();
   classificationConfig = await (await apiFetch('/api/classification/config')).json();
   syncCategoryDefinitions();
-  hiddenStoreIds = Array.isArray(filterConfig.hiddenStoreIds) ? filterConfig.hiddenStoreIds : [];
+  hiddenStoreIds = Array.isArray(userPreferences.hiddenStoreIds)
+    ? userPreferences.hiddenStoreIds
+    : (Array.isArray(filterConfig.hiddenStoreIds) ? filterConfig.hiddenStoreIds : []);
   suggestedKeywords = filterConfig.suggestedKeywords || ['GPT', 'Plus', 'Pro', 'Team', '接码', '直充', '成品', '账号', 'Claude', 'Gemini', 'OpenAI', 'SMS', '谷歌', '微软', '邮箱', 'API', '订阅', '会员', 'Access'];
   keywordUsage = filterConfig.keywordUsage || {};
   refreshConfig = await (await apiFetch('/api/refresh-config')).json();
   await loadStoreSummaries();
   stores = await (await apiFetch('/api/stores')).json();
-  storeOrder = await (await apiFetch('/api/store-order')).json();
+  const sharedStoreOrder = await (await apiFetch('/api/store-order')).json();
+  storeOrder = Array.isArray(userPreferences.storeOrder) ? userPreferences.storeOrder : sharedStoreOrder;
   applyStoreOrder();
   const labels = await (await apiFetch('/api/product-labels')).json();
   for (const l of labels) { productLabels[l.product_key] = l; }
@@ -330,6 +423,7 @@ function addSuggestKey(key) {
 }
 
 function scheduleSaveKeywordUsage() {
+  if (!canOperate()) return;
   clearTimeout(keywordSaveTimer);
   keywordSaveTimer = setTimeout(() => saveKeywordUsage(), 2000);
 }
@@ -380,12 +474,16 @@ function initSettings() {
   document.getElementById('classificationSaveBtn').addEventListener('click', saveClassificationRules);
   document.getElementById('classificationPreviewBtn').addEventListener('click', previewClassificationRules);
   document.getElementById('classificationApplyBtn').addEventListener('click', applyClassificationRules);
+  document.getElementById('createUserBtn').addEventListener('click', createManagedUser);
   document.querySelectorAll('.settings-option').forEach(el => {
     el.addEventListener('click', () => switchSettingsOption(el.dataset.option));
   });
 }
 
 function openSettings() {
+  if (!isAdmin() && document.querySelector('.settings-option.active')?.dataset.option === 'export') {
+    switchSettingsOption('storeexport');
+  }
   const cfg = refreshConfig;
   if (cfg.mode === 'fixed') {
     document.querySelector('input[name="refreshMode"][value="fixed"]').checked = true;
@@ -653,6 +751,62 @@ function switchSettingsOption(option) {
   if (panel) panel.classList.add('active');
   if (option === 'labels') setTimeout(loadLabelManager, 50);
   if (option === 'classification') setTimeout(renderClassificationRules, 0);
+  if (option === 'users') setTimeout(loadManagedUsers, 0);
+}
+
+const USER_ROLE_LABELS = { admin: '管理员', operator: '操作员', viewer: '访客' };
+
+async function loadManagedUsers() {
+  if (!isAdmin()) return;
+  const host = document.getElementById('userList');
+  try {
+    const response = await apiFetch('/api/users');
+    const users = await response.json();
+    host.innerHTML = users.map(user => `<div class="user-row" data-user-id="${user.id}">
+      <div class="user-identity"><strong>${escapeHtml(user.username)}</strong><span>${user.lastLoginAt ? `最近登录 ${formatTime(user.lastLoginAt)}` : '尚未登录'}</span></div>
+      <select class="settings-select user-role-select" aria-label="${escapeHtml(user.username)}的角色">
+        ${Object.entries(USER_ROLE_LABELS).map(([role, label]) => `<option value="${role}" ${user.role === role ? 'selected' : ''}>${label}</option>`).join('')}
+      </select>
+      <label class="user-enabled"><input type="checkbox" ${user.enabled ? 'checked' : ''}>启用</label>
+      <input class="settings-text-input user-password-reset" type="password" maxlength="128" placeholder="留空则不改密码">
+      <button type="button" class="settings-action-btn" data-action="save-user" data-user-id="${user.id}">保存</button>
+      <button type="button" class="settings-action-btn danger" data-action="delete-user" data-user-id="${user.id}" ${user.id === _currentUser?.id ? 'disabled' : ''}>删除</button>
+    </div>`).join('');
+  } catch (error) { host.innerHTML = `<div class="settings-msg">${escapeHtml(error.message)}</div>`; }
+}
+
+async function createManagedUser() {
+  const message = document.getElementById('userManageMsg');
+  const username = document.getElementById('newUsername');
+  const password = document.getElementById('newUserPassword');
+  try {
+    const response = await apiFetch('/api/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: username.value.trim(), password: password.value, role: document.getElementById('newUserRole').value }) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '创建失败');
+    username.value = ''; password.value = '';
+    message.textContent = `已创建用户 ${data.username}`;
+    await loadManagedUsers();
+  } catch (error) { message.textContent = error.message; }
+}
+
+async function saveManagedUser(userId) {
+  const row = document.querySelector(`.user-row[data-user-id="${CSS.escape(String(userId))}"]`);
+  if (!row) return;
+  const password = row.querySelector('.user-password-reset').value;
+  const body = { role: row.querySelector('.user-role-select').value, enabled: row.querySelector('.user-enabled input').checked };
+  if (password) body.password = password;
+  const response = await apiFetch(`/api/users/${encodeURIComponent(userId)}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const data = await response.json();
+  document.getElementById('userManageMsg').textContent = response.ok ? `已更新 ${data.username}` : (data.error || '更新失败');
+  if (response.ok) await loadManagedUsers();
+}
+
+async function deleteManagedUser(userId) {
+  if (!confirm('确定删除这个用户？该用户的所有登录会话会立即失效。')) return;
+  const response = await apiFetch(`/api/users/${encodeURIComponent(userId)}`, { method: 'DELETE' });
+  const data = await response.json();
+  document.getElementById('userManageMsg').textContent = response.ok ? '用户已删除' : (data.error || '删除失败');
+  if (response.ok) await loadManagedUsers();
 }
 
 const CLASSIFICATION_DIMENSION_LABELS = {
@@ -1230,6 +1384,11 @@ function getAllProducts() {
 function markDirty() { productsDirty = true; }
 
 function applyStoreOrder() {
+  const knownIds = new Set([...storeSummaries, ...stores].map(store => store.id));
+  storeOrder = [...new Set(storeOrder.filter(id => knownIds.has(id)))];
+  for (const item of [...storeSummaries, ...stores]) {
+    if (!storeOrder.includes(item.id)) storeOrder.push(item.id);
+  }
   if (!storeOrder.length) return;
   const sortByOrder = (a, b) => {
     const ai = storeOrder.indexOf(a.id);
@@ -1620,6 +1779,7 @@ function browseStoreIsActive(storeId) {
 }
 
 function renderStoreList() {
+  applyStoreOrder();
   const container = document.getElementById('storeList');
   const visible = visibleStoreSummaries();
   const ok = visible.filter(s => s.status === 'ok');
@@ -1628,24 +1788,17 @@ function renderStoreList() {
   const total = visible.reduce((s, st) => s + (st.productCount || 0), 0);
 
   container.innerHTML = `<button class="store-btn store-btn-all ${!activeBrowseStoreId ? 'active' : ''}" data-action="switch-store" data-store-id="all"><span class="sb-name">顶部</span> <span class="badge">${total}</span></button>
-  ${ok.map(s => {
+  ${visible.map(s => {
     const sid = escapeHtml(s.id);
     const isRefreshing = refreshingStores.has(s.id);
-    return `<div class="store-row${isRefreshing ? ' is-refreshing' : ''}" draggable="true" data-drag-type="store" data-id="${sid}">
-      <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${formatTime(s.lastUpdated)}"><span class="drag-handle">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span> <span class="badge">${s.productCount||0}</span></button>
+    const isPending = s.status === 'pending';
+    const isError = s.status === 'error';
+    const rowClass = `${isRefreshing ? ' is-refreshing' : ''}${isPending ? ' store-row-pending' : ''}${isError ? ' store-row-error' : ''}`;
+    const badge = isError ? '<span class="badge badge-error">失败</span>' : isPending ? '<span class="badge badge-pending">获取中</span>' : `<span class="badge">${s.productCount||0}</span>`;
+    const title = isError ? escapeHtml(s.error || '刷新失败') : isPending ? '获取中...' : formatTime(s.lastUpdated);
+    return `<div class="store-row${rowClass}" draggable="true" data-drag-type="store" data-id="${sid}">
+      <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${title}"><span class="drag-handle">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span>${badge}</button>
       ${isRefreshing ? '<div class="refresh-bar"><div class="refresh-bar-inner"></div></div>' : ''}
-    </div>`;
-  }).join('')}
-  ${error.map(s => {
-    const sid = escapeHtml(s.id);
-    return `<div class="store-row store-row-error" data-id="${escapeHtml(s.id)}">
-      <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${escapeHtml(s.error||'刷新失败')}"><span class="drag-handle" style="color:var(--danger)">⚠</span><span class="sb-name" style="color:var(--danger)">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-error">失败</span></button>
-    </div>`;
-  }).join('')}
-  ${pend.map(s => {
-    const sid = escapeHtml(s.id);
-    return `<div class="store-row store-row-pending" data-id="${escapeHtml(s.id)}">
-      <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="获取中..."><span class="drag-handle" style="color:var(--text3);opacity:.5">⠿</span><span class="sb-name" style="opacity:.7">${escapeHtml((s.name||s.id))}</span> <span class="badge badge-pending">获取中</span></button>
     </div>`;
   }).join('')}`;
   updateDashboardChrome(total, ok.length, error.length, pend.length);
@@ -1676,12 +1829,16 @@ function renderActiveStoreCard() {
 }
 
 function persistHiddenStores() {
-  filterConfig.hiddenStoreIds = [...hiddenStoreIds];
-  apiFetch('/api/filter-config', {
+  userPreferences.hiddenStoreIds = [...hiddenStoreIds];
+  saveUserPreferences();
+}
+
+function saveUserPreferences() {
+  apiFetch('/api/preferences', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(filterConfig),
-  }).catch(error => console.error('保存隐藏店铺失败:', error.message));
+    body: JSON.stringify(userPreferences),
+  }).catch(error => console.error('保存用户偏好失败:', error.message));
 }
 
 function showToast(message) {
@@ -1742,31 +1899,38 @@ function dragStart(e, id) {
   e.target.classList.add('dragging');
 }
 
-function dragOver(e) {
+function dragOver(e, targetId) {
   e.preventDefault();
   e.dataTransfer.dropEffect = 'move';
+  const row = e.target.closest('.store-row');
+  if (!row || !dragId || targetId === dragId) return;
+  const rect = row.getBoundingClientRect();
+  dragDropPosition = e.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+  document.querySelectorAll('.store-row.drop-before, .store-row.drop-after').forEach(item => item.classList.remove('drop-before', 'drop-after'));
+  row.classList.add(dragDropPosition === 'before' ? 'drop-before' : 'drop-after');
 }
 
 function dropStore(e, targetId) {
   e.preventDefault();
   if (!dragId || dragId === targetId) return;
-  const from = storeSummaries.findIndex(s => s.id === dragId);
-  const to = storeSummaries.findIndex(s => s.id === targetId);
-  if (from === -1 || to === -1) return;
-  const [moved] = storeSummaries.splice(from, 1);
-  storeSummaries.splice(to, 0, moved);
-  const [movedStore] = stores.splice(from, 1);
-  stores.splice(to, 0, movedStore);
-  storeOrder = storeSummaries.filter(s => s.status === 'ok').map(s => s.id);
-  apiFetch('/api/store-order', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(storeOrder) })
-    .then(res => { if (!res.ok) throw new Error('保存店铺排序失败'); })
-    .catch(err => console.error(err.message));
+  applyStoreOrder();
+  const order = [...storeOrder];
+  const from = order.indexOf(dragId);
+  if (from < 0 || !order.includes(targetId)) return;
+  order.splice(from, 1);
+  let to = order.indexOf(targetId);
+  if (dragDropPosition === 'after') to += 1;
+  order.splice(to, 0, dragId);
+  storeOrder = order;
+  userPreferences.storeOrder = [...storeOrder];
+  saveUserPreferences();
+  applyStoreOrder();
   markDirty();
   render();
 }
 
 function dragEnd() {
-  document.querySelectorAll('.store-row.dragging').forEach(el => el.classList.remove('dragging'));
+  document.querySelectorAll('.store-row.dragging, .store-row.drop-before, .store-row.drop-after').forEach(el => el.classList.remove('dragging', 'drop-before', 'drop-after'));
   dragId = null;
 }
 
@@ -1950,18 +2114,34 @@ function renderBestPrices() {
   let pool = getAllProducts().filter(p => !isStoreHidden(p.storeId));
   if (includeWords.length || excludeWords.length) pool = pool.filter(p => matchesSearch(p.name));
   const gptEntries = visibleCatEntries().filter(([k]) => isGptCategory(k) && pool.some(product => product.category === k));
-  document.getElementById('bestPriceList').innerHTML = gptEntries.map(([k, label]) => {
-    const detail = k === 'gpt_plus' && activeCatL2 === 'gpt_plus' ? activePlusDetail : 'all';
-    const items = pool.filter(product => matchesCategorySelection(product, k, detail) && product.price > 0 && product.stock > 0).sort((a, b) => a.price - b.price);
-    if (!items.length) return `<div class="bp-item"><div class="bp-cat">${label}</div><div class="bp-na">暂无</div></div>`;
+  const renderItem = (category, label, detail = 'all', child = false) => {
+    const items = pool.filter(product => matchesCategorySelection(product, category, detail) && product.price > 0 && product.stock > 0).sort((a, b) => a.price - b.price);
+    if (!items.length) return `<div class="bp-item ${child ? 'bp-detail-item' : ''}"><div class="bp-cat">${label}</div><div class="bp-na">暂无</div></div>`;
     const item = items[0];
-    const storeId = item.storeId;
-    const catFull = k;
-    return `<div class="bp-item" data-action="go-best-price" data-store-id="${escapeHtml(storeId)}" data-category="${escapeHtml(catFull)}" data-product-id="${escapeHtml(item.id)}">
+    return `<div class="bp-item ${child ? 'bp-detail-item' : ''}" data-action="go-best-price" data-store-id="${escapeHtml(item.storeId)}" data-category="${escapeHtml(category)}" data-detail="${escapeHtml(detail)}" data-product-id="${escapeHtml(item.id)}">
       <div class="bp-cat">${label}</div>
       <div class="bp-row"><span class="bp-price">¥${item.price.toFixed(2)}</span><span class="bp-store" title="${escapeHtml(item.storeName)}">${escapeHtml(item.storeName)}</span></div>
     </div>`;
+  };
+  document.getElementById('bestPriceList').innerHTML = gptEntries.map(([category, label]) => {
+    if (category !== 'gpt_plus') return renderItem(category, label);
+    const details = PLUS_DETAIL_OPTIONS.filter(([detail]) => detail !== 'all');
+    return `<div class="bp-plus-group">
+      <div class="bp-plus-head">
+        ${renderItem(category, label)}
+        <button type="button" class="bp-plus-toggle ${bestPricePlusExpanded ? 'expanded' : ''}" data-action="toggle-best-plus" title="${bestPricePlusExpanded ? '收起 Plus 详细类目' : '展开 Plus 详细类目'}" aria-label="${bestPricePlusExpanded ? '收起 Plus 详细类目' : '展开 Plus 详细类目'}" aria-expanded="${bestPricePlusExpanded}">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"></path></svg>
+        </button>
+      </div>
+      ${bestPricePlusExpanded ? `<div class="bp-plus-details">${details.map(([detail, detailLabel]) => renderItem(category, detailLabel, detail, true)).join('')}</div>` : ''}
+    </div>`;
   }).join('');
+}
+
+function toggleBestPricePlus() {
+  bestPricePlusExpanded = !bestPricePlusExpanded;
+  localStorage.setItem('bestPricePlusExpanded', String(bestPricePlusExpanded));
+  renderBestPrices();
 }
 
 const HISTORY_BEST_CATEGORIES = [
@@ -1985,15 +2165,16 @@ function matchesHistoricalCategory(product, category) {
 }
 
 function visibleHistoryBestCategories() {
-  const saved = filterConfig.historyBestVisibleCategories;
+  const saved = userPreferences.historyBestVisibleCategories || filterConfig.historyBestVisibleCategories;
   const visible = Array.isArray(saved) ? new Set(saved.map(key => key === 'gptk12' ? 'gpt_k12' : key)) : null;
   return historyBestCategoriesInOrder().filter(([key]) => !visible || visible.has(key));
 }
 
 function historyBestCategoriesInOrder() {
   const known = new Map(HISTORY_BEST_CATEGORIES.map(entry => [entry[0], entry]));
-  const order = Array.isArray(filterConfig.historyBestCategoryOrder)
-    ? filterConfig.historyBestCategoryOrder.map(key => key === 'gptk12' ? 'gpt_k12' : key)
+  const savedOrder = userPreferences.historyBestCategoryOrder || filterConfig.historyBestCategoryOrder;
+  const order = Array.isArray(savedOrder)
+    ? savedOrder.map(key => key === 'gptk12' ? 'gpt_k12' : key)
     : HISTORY_BEST_CATEGORIES.map(([key]) => key);
   return [...new Set([...order, ...HISTORY_BEST_CATEGORIES.map(([key]) => key)])]
     .filter(key => known.has(key))
@@ -2020,8 +2201,8 @@ function historyCatDrop(event, targetKey) {
   const to = order.indexOf(targetKey);
   if (from < 0 || to < 0) return;
   order.splice(from, 1); order.splice(to, 0, historyCatDragKey);
-  filterConfig.historyBestCategoryOrder = order;
-  apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) }).catch(error => console.error('保存曲线顺序失败:', error.message));
+  userPreferences.historyBestCategoryOrder = order;
+  saveUserPreferences();
   renderHistoryBestControls();
   renderHistoricalBestPrices();
 }
@@ -2040,8 +2221,8 @@ function toggleHistoryBestCategory(category) {
     if (visible.size <= 1) return;
     visible.delete(category);
   } else visible.add(category);
-  filterConfig.historyBestVisibleCategories = HISTORY_BEST_CATEGORIES.map(([key]) => key).filter(key => visible.has(key));
-  apiFetch('/api/filter-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(filterConfig) }).catch(error => console.error('保存曲线显示设置失败:', error.message));
+  userPreferences.historyBestVisibleCategories = HISTORY_BEST_CATEGORIES.map(([key]) => key).filter(key => visible.has(key));
+  saveUserPreferences();
   renderHistoryBestControls();
   renderHistoricalBestPrices();
 }
@@ -2144,11 +2325,16 @@ function selectHistoryBestCategory(category) {
   renderHistoricalBestPrices();
 }
 
-function goToBestPrice(storeId, category, productId) {
+function goToBestPrice(storeId, category, productId, detail = 'all') {
   closeFilterDrawer();
   activeCatL1 = catL1FromFull(category);
   activeCatL2 = category;
   activeCategory = category;
+  if (category === 'gpt_plus' && PLUS_DETAIL_OPTIONS.some(([key]) => key === detail)) {
+    activePlusDetail = detail;
+    plusDetailsExpanded = true;
+    localStorage.setItem('activePlusDetail', detail);
+  }
   // Render the focused store's nearby window completely so its product card
   // can be located even when earlier cards consume the normal page limit.
   renderLimit = Math.max(renderLimit, getFilteredProducts().length + 1);
@@ -2188,7 +2374,7 @@ function renderStores() {
     const storeLink = safeUrl(s.url);
     const storeName = storeLink ? `<a class="sc-name sc-store-link" href="${storeLink}" target="_blank" rel="noopener noreferrer" title="打开店铺">${escapeHtml(s.name||s.id)}</a>` : `<span class="sc-name">${escapeHtml(s.name||s.id)}</span>`;
     if (s.status === 'pending') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-loading">正在获取商品数据...</div></div>`;
-    if (s.status === 'error') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(s.error||'获取失败')}</div><div class="sc-actions"><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
+    if (s.status === 'error') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(s.error||'获取失败')}</div><div class="sc-actions"><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
 
     let products = filtered.filter(p => p.storeId === id);
     const storePrices = products.map(p => p.price).filter(v => v > 0);
@@ -2221,11 +2407,11 @@ function renderStores() {
         <span class="sc-time">${formatTime(s.lastUpdated)}</span>
         <span class="sc-meta">${products.length} 个商品</span>
         <div class="sc-actions">
-          <button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button>
+          <button class="ref-btn admin-only" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button>
           <button class="history-store-btn" data-action="open-history-store" data-store-id="${escapeHtml(s.id)}" title="查看该店铺历史最低价">历史最低</button>
           <button class="copy-store-btn" data-action="copy-store-link" data-store-url="${escapeHtml(s.url || '')}" title="复制店铺链接">复制链接</button>
           <button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button>
-          <button class="del-btn" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button>
+          <button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button>
         </div>
       </div>
       <div class="product-grid">${gridItems.join('')}</div>
