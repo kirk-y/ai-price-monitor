@@ -20,16 +20,13 @@ const app = express();
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '127.0.0.1';
 
-const AUTH_TOKEN = process.env.AUTH_TOKEN || '';
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+const USER_TOKEN = process.env.USER_TOKEN || '';
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '100mb';
 
 if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) {
   throw new Error('PORT 必须是 1 到 65535 之间的整数');
 }
-if (!AUTH_TOKEN && !isLoopbackHost(HOST)) {
-  throw new Error('监听非本机地址时必须设置 AUTH_TOKEN');
-}
-
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -60,15 +57,100 @@ const strictLimiter = rateLimit({
 
 app.use('/api/', apiLimiter);
 app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
+
+function requestToken(req) {
+  const authorization = String(req.headers.authorization || '');
+  return String(req.headers['x-auth-token'] || (authorization.startsWith('Bearer ') ? authorization.slice(7) : ''));
+}
+
+function isLocalRequest(req) {
+  const address = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+  return address === '127.0.0.1' || address === '::1';
+}
 
 function requireAuth(req, res, next) {
-  if (!AUTH_TOKEN) return next();
-  const token = req.headers['x-auth-token'];
-  if (token === AUTH_TOKEN) return next();
+  const token = requestToken(req);
+  const user = store.resolveAuthSession(token);
+  if (user) { req.user = user; req.role = user.role; req.authToken = token; return next(); }
+  if (ADMIN_TOKEN && token === ADMIN_TOKEN) { req.user = { id: null, username: 'legacy-admin', role: 'admin' }; req.role = 'admin'; return next(); }
+  if (USER_TOKEN && token === USER_TOKEN) { req.user = { id: null, username: 'legacy-viewer', role: 'viewer' }; req.role = 'viewer'; return next(); }
   res.status(401).json({ error: '未授权，请提供有效的访问令牌' });
 }
 
+function requireAdmin(req, res, next) {
+  if (req.role === 'admin') return next();
+  res.status(403).json({ error: '权限不足，需要管理员权限' });
+}
+
+function requireOperator(req, res, next) {
+  if (req.role === 'admin' || req.role === 'operator') return next();
+  res.status(403).json({ error: '权限不足，需要操作员权限' });
+}
+
+app.get('/api/auth/status', (req, res) => {
+  res.json({ setupRequired: store.getUserCount() === 0 });
+});
+
+app.post('/api/auth/bootstrap', requireStrictLimit, (req, res) => {
+  try {
+    if (!isLocalRequest(req)) return res.status(403).json({ error: '首次管理员只能在服务所在电脑上创建' });
+    if (store.getUserCount() > 0) return res.status(409).json({ error: '管理员已经初始化' });
+    const user = store.createUser(req.body?.username, req.body?.password, 'admin');
+    const session = store.createAuthSession(user.id);
+    store.recordAudit(user, 'auth.bootstrap', String(user.id));
+    res.status(201).json({ token: session.token, expiresAt: session.expiresAt, user });
+  } catch (err) { res.status(400).json({ error: err.message }); }
+});
+
+app.post('/api/auth/login', requireStrictLimit, (req, res) => {
+  const user = store.authenticateUser(req.body?.username, req.body?.password);
+  if (!user) return res.status(401).json({ error: '用户名或密码错误' });
+  const session = store.createAuthSession(user.id);
+  store.recordAudit(user, 'auth.login', String(user.id));
+  res.json({ token: session.token, expiresAt: session.expiresAt, user });
+});
+
 app.use('/api/', requireAuth);
+
+app.use('/api/', (req, res, next) => {
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    res.on('finish', () => {
+      if (res.statusCode < 400) store.recordAudit(req.user, `${req.method} ${req.route?.path || req.path}`, req.originalUrl);
+    });
+  }
+  next();
+});
+
+app.get('/api/auth/role', (req, res) => {
+  res.json({ role: req.role, user: req.user });
+});
+
+app.get('/api/auth/me', (req, res) => res.json({ user: req.user }));
+app.post('/api/auth/logout', (req, res) => {
+  if (req.authToken) store.deleteAuthSession(req.authToken);
+  res.json({ success: true });
+});
+
+app.get('/api/users', requireAdmin, (req, res) => res.json(store.listUsers()));
+app.post('/api/users', requireAdmin, requireStrictLimit, (req, res) => {
+  try { res.status(201).json(store.createUser(req.body?.username, req.body?.password, req.body?.role)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.put('/api/users/:id', requireAdmin, requireStrictLimit, (req, res) => {
+  try { res.json(store.updateUser(req.params.id, req.body || {}, req.user.id)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.delete('/api/users/:id', requireAdmin, requireStrictLimit, (req, res) => {
+  try { res.json({ success: store.deleteUser(req.params.id, req.user.id) }); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
+app.get('/api/audit-logs', requireAdmin, (req, res) => res.json(store.getAuditLogs(req.query.limit)));
+app.get('/api/preferences', (req, res) => res.json(store.getUserPreferences(req.user.id)));
+app.put('/api/preferences', (req, res) => {
+  try { res.json(store.updateUserPreferences(req.user.id, req.body)); }
+  catch (err) { res.status(400).json({ error: err.message }); }
+});
 
 function requireStrictLimit(req, res, next) {
   strictLimiter(req, res, next);
@@ -78,8 +160,6 @@ function safeDownloadName(value, fallback = 'export') {
   const name = String(value || fallback).replace(/[^\p{L}\p{N}._-]+/gu, '_').slice(0, 100);
   return name || fallback;
 }
-
-app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 app.use((err, req, res, next) => {
   if (err?.type === 'entity.too.large') {
@@ -95,14 +175,14 @@ process.on('uncaughtException', (err) => {
   console.error('未捕获的异常:', err.message);
 });
 
-app.get('/api/stores/export', (req, res) => {
+app.get('/api/stores/export', requireAdmin, (req, res) => {
   const data = store.exportAllData();
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', `attachment; filename="ai-price-monitor-${new Date().toISOString().slice(0,10)}.json"`);
   res.json(data);
 });
 
-app.post('/api/stores/import', requireStrictLimit, (req, res) => {
+app.post('/api/stores/import', requireAdmin, requireStrictLimit, (req, res) => {
   try {
     store.importAllData(req.body);
     res.json({ success: true });
@@ -111,7 +191,7 @@ app.post('/api/stores/import', requireStrictLimit, (req, res) => {
   }
 });
 
-app.post('/api/stores/import-single', requireStrictLimit, (req, res) => {
+app.post('/api/stores/import-single', requireAdmin, requireStrictLimit, (req, res) => {
   try {
     if (!req.body.stores?.length) return res.status(400).json({ error: '数据格式错误，缺少店铺信息' });
     store.importSingleStore(req.body);
@@ -137,7 +217,7 @@ app.get('/api/stores/summary', (req, res) => {
   res.json(store.getStoreSummaries());
 });
 
-app.post('/api/stores/refresh-all', requireStrictLimit, (req, res) => {
+app.post('/api/stores/refresh-all', requireOperator, requireStrictLimit, (req, res) => {
   const requested = Array.isArray(req.body?.storeIds) ? req.body.storeIds : [];
   const byId = new Map(store.getAllStores().map(item => [item.id, item]));
   const storesToRefresh = requested
@@ -156,7 +236,7 @@ app.post('/api/stores/refresh-all', requireStrictLimit, (req, res) => {
   })().catch(error => console.error('全局刷新任务失败:', error.message));
 });
 
-app.post('/api/stores/refresh-all/cancel', requireStrictLimit, (req, res) => {
+app.post('/api/stores/refresh-all/cancel', requireOperator, requireStrictLimit, (req, res) => {
   const batchId = String(req.body?.batchId || '');
   if (!batchId) return res.status(400).json({ error: '缺少刷新批次标识' });
   cancelledRefreshBatches.add(batchId);
@@ -178,7 +258,7 @@ app.get('/api/stores/:id', (req, res) => {
   res.json(s);
 });
 
-app.post('/api/stores', requireStrictLimit, async (req, res) => {
+app.post('/api/stores', requireOperator, requireStrictLimit, async (req, res) => {
   let shop;
   try {
     shop = normalizeShopUrl(req.body?.url);
@@ -197,7 +277,7 @@ app.post('/api/stores', requireStrictLimit, async (req, res) => {
   enqueueStoreRefresh(existing.id, shop.url, 'initial');
 });
 
-app.post('/api/stores/import-list', requireStrictLimit, (req, res) => {
+app.post('/api/stores/import-list', requireOperator, requireStrictLimit, (req, res) => {
   try {
     const result = store.importStoreList(req.body?.stores ?? req.body);
     for (const id of result.addedIds) {
@@ -210,11 +290,11 @@ app.post('/api/stores/import-list', requireStrictLimit, (req, res) => {
   }
 });
 
-app.delete('/api/stores/:id', requireStrictLimit, (req, res) => {
+app.delete('/api/stores/:id', requireOperator, requireStrictLimit, (req, res) => {
   res.json({ success: store.removeStore(req.params.id) });
 });
 
-app.post('/api/stores/:id/refresh', requireStrictLimit, async (req, res) => {
+app.post('/api/stores/:id/refresh', requireOperator, requireStrictLimit, async (req, res) => {
   const s = store.getStore(req.params.id);
   if (!s) return res.status(404).json({ error: '店铺不存在' });
 
@@ -236,7 +316,7 @@ app.get('/api/stores/:id/history/export', (req, res) => {
   res.json(data);
 });
 
-app.post('/api/stores/:id/history/import', requireStrictLimit, (req, res) => {
+app.post('/api/stores/:id/history/import', requireAdmin, requireStrictLimit, (req, res) => {
   try {
     store.importStoreHistory(req.params.id, req.body);
     res.json({ success: true });
@@ -253,7 +333,7 @@ app.get('/api/history/export', (req, res) => {
   res.json(data);
 });
 
-app.post('/api/history/import', requireStrictLimit, (req, res) => {
+app.post('/api/history/import', requireAdmin, requireStrictLimit, (req, res) => {
   try {
     store.importAllHistory(req.body);
     res.json({ success: true });
@@ -270,7 +350,7 @@ app.get('/api/label-changes', (req, res) => {
   res.json(store.getLabelChanges());
 });
 
-app.put('/api/product-labels/:productKey', (req, res) => {
+app.put('/api/product-labels/:productKey', requireOperator, (req, res) => {
   try {
     const category = validateCategory(req.body?.category);
     const previousCategory = req.body?.previousCategory
@@ -296,7 +376,7 @@ app.put('/api/product-labels/:productKey', (req, res) => {
   }
 });
 
-app.post('/api/ai-classify', async (req, res) => {
+app.post('/api/ai-classify', requireOperator, async (req, res) => {
   try {
     const url = String(req.body?.url || '').trim();
     const key = String(req.body?.key || '').trim();
@@ -331,10 +411,15 @@ app.post('/api/ai-classify', async (req, res) => {
 });
 
 app.get('/api/filter-config', (req, res) => {
-  res.json(store.getFilterConfig());
+  const config = store.getFilterConfig();
+  if (req.role === 'viewer' && config.aiClassify) {
+    res.json({ ...config, aiClassify: { ...config.aiClassify, key: '' } });
+    return;
+  }
+  res.json(config);
 });
 
-app.put('/api/filter-config', (req, res) => {
+app.put('/api/filter-config', requireOperator, (req, res) => {
   try {
     res.json(store.updateFilterConfig(req.body));
   } catch (err) {
@@ -346,7 +431,7 @@ app.get('/api/classification/config', (req, res) => {
   res.json(store.getClassificationConfig());
 });
 
-app.put('/api/classification/config', (req, res) => {
+app.put('/api/classification/config', requireOperator, (req, res) => {
   try {
     res.json(store.updateClassificationConfig(req.body));
   } catch (err) {
@@ -382,7 +467,7 @@ function classifyCandidate(product, config) {
   return classifyHybridProduct(product.name, baseResult, { knownProduct });
 }
 
-app.post('/api/classification/preview', requireStrictLimit, (req, res) => {
+app.post('/api/classification/preview', requireOperator, requireStrictLimit, (req, res) => {
   try {
     const config = req.body?.config
       ? validateClassificationConfig(req.body.config)
@@ -406,7 +491,7 @@ app.post('/api/classification/preview', requireStrictLimit, (req, res) => {
   }
 });
 
-app.post('/api/classification/apply', requireStrictLimit, (req, res) => {
+app.post('/api/classification/apply', requireOperator, requireStrictLimit, (req, res) => {
   try {
     const config = store.getClassificationConfig();
     const candidates = classificationCandidates(req.body?.products);
@@ -438,7 +523,7 @@ app.get('/api/classification/suggestions', (req, res) => {
   res.json({ suggestions: buildFeedbackSuggestions(feedback) });
 });
 
-app.post('/api/classification/feedback', requireStrictLimit, (req, res) => {
+app.post('/api/classification/feedback', requireOperator, requireStrictLimit, (req, res) => {
   try {
     store.recordClassificationFeedback(
       String(req.body?.productKey || '').slice(0, 500),
@@ -459,7 +544,7 @@ app.get('/api/refresh-config', (req, res) => {
   res.json(cfg);
 });
 
-app.put('/api/refresh-config', (req, res) => {
+app.put('/api/refresh-config', requireAdmin, (req, res) => {
   try {
     res.json(store.updateRefreshConfig(req.body));
   } catch (err) {
@@ -471,7 +556,7 @@ app.get('/api/store-order', (req, res) => {
   res.json(store.getStoreOrder());
 });
 
-app.put('/api/store-order', (req, res) => {
+app.put('/api/store-order', requireOperator, (req, res) => {
   try {
     res.json(store.updateStoreOrder(req.body));
   } catch (err) {

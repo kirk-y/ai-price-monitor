@@ -128,6 +128,36 @@ test('all product labels include low-confidence classifications used by the UI',
   }
 });
 
+test('user accounts hash passwords and revoke sessions on security changes', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-auth-'));
+  const dbPath = path.join(tempDir, 'auth.db');
+  const script = `
+    const assert = require('node:assert/strict');
+    const Database = require('better-sqlite3');
+    const store = require('./store');
+    const admin = store.createUser('admin_user', 'strong-password-1', 'admin');
+    const viewer = store.createUser('viewer_user', 'strong-password-2', 'viewer');
+    assert.equal(store.authenticateUser('admin_user', 'wrong-password'), null);
+    assert.equal(store.authenticateUser('admin_user', 'strong-password-1').role, 'admin');
+    const db = new Database(process.env.DB_PATH, { readonly: true });
+    assert.equal(db.prepare('SELECT password_hash FROM users WHERE id=?').get(admin.id).password_hash.includes('strong-password-1'), false);
+    db.close();
+    const session = store.createAuthSession(viewer.id);
+    assert.equal(store.resolveAuthSession(session.token).username, 'viewer_user');
+    store.updateUser(viewer.id, { password: 'changed-password-3' }, admin.id);
+    assert.equal(store.resolveAuthSession(session.token), null);
+    assert.equal(store.authenticateUser('viewer_user', 'strong-password-2'), null);
+    assert.equal(store.authenticateUser('viewer_user', 'changed-password-3').role, 'viewer');
+    assert.throws(() => store.updateUser(admin.id, { enabled: false }, admin.id));
+    assert.throws(() => store.deleteUser(admin.id, admin.id));
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'), env: { ...process.env, DB_PATH: dbPath }, encoding: 'utf8',
+  });
+  try { assert.equal(result.status, 0, result.stderr || result.stdout); }
+  finally { fs.rmSync(tempDir, { recursive: true, force: true }); }
+});
+
 test('structured classifications and per-dimension feedback survive backups', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-classification-'));
   const dbPath = path.join(tempDir, 'classification.db');
