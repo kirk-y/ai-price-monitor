@@ -45,12 +45,23 @@ foreach ($artifact in @($archivePath, $archive7zPath, $archiveHashPath, $archive
 
 New-Item -ItemType Directory -Force -Path $packagePath | Out-Null
 
-$files = @('server.js', 'store.js', 'scraper.js', 'validation.js', 'package.json', '.env.example')
+$files = @(
+  'server.js',
+  'store.js',
+  'scraper.js',
+  'validation.js',
+  'classification.js',
+  'hybrid-classification.js',
+  'ml-classifier.js',
+  'package.json',
+  '.env.example'
+)
 foreach ($file in $files) {
   Copy-Item -LiteralPath (Join-Path $projectRoot $file) -Destination (Join-Path $packagePath $file)
 }
 
 Copy-Item -LiteralPath (Join-Path $projectRoot 'public') -Destination (Join-Path $packagePath 'public') -Recurse
+Copy-Item -LiteralPath (Join-Path $projectRoot 'models') -Destination (Join-Path $packagePath 'models') -Recurse
 Copy-Item -LiteralPath (Join-Path $projectRoot 'node_modules') -Destination (Join-Path $packagePath 'node_modules') -Recurse
 
 $runtimeDirectory = Join-Path $packagePath 'runtime'

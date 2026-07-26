@@ -1,5 +1,7 @@
 'use strict';
 
+const { predictGptTier } = require('./ml-classifier');
+
 function normalizeHybridText(value) {
   return String(value || '')
     .normalize('NFKC')
@@ -61,6 +63,15 @@ function preClassifyProduct(name) {
   return { ...subject, strongTier: strong?.tier || null, strongReason: strong?.reason || null };
 }
 
+function isKnownGptClassification(labelOrCategory) {
+  if (!labelOrCategory) return false;
+  if (typeof labelOrCategory === 'string') {
+    return /^(?:gpt(?:_|$)|plus_|gptk12$)/i.test(labelOrCategory);
+  }
+  return isKnownGptClassification(labelOrCategory.category)
+    || labelOrCategory.classification?.product === 'gpt';
+}
+
 function validateModelPrediction(name, prediction, options = {}) {
   const pre = options.knownProduct
     ? { eligible: true, product: 'gpt', reason: '已有分类上下文确认商品主体为 GPT', ...(() => {
@@ -110,9 +121,51 @@ function validateModelPrediction(name, prediction, options = {}) {
   };
 }
 
+function classifyHybridProduct(name, baseResult, options = {}) {
+  const knownProduct = options.knownProduct === true;
+  const pre = preClassifyProduct(name);
+  if (!knownProduct && !pre.eligible) {
+    return {
+      ...baseResult,
+      hybrid: { accepted: false, source: 'pre-rule-rejected', reason: pre.reason },
+    };
+  }
+
+  const prediction = predictGptTier(name, options);
+  const decision = validateModelPrediction(name, prediction, { knownProduct });
+  if (!decision.accepted) return { ...baseResult, hybrid: decision };
+  const category = decision.tier === 'other' ? 'gpt_other' : `gpt_${decision.tier}`;
+  const tierDimension = {
+    value: decision.tier,
+    label: decision.tier,
+    score: prediction.margin,
+    confidence: prediction.confidence,
+    ambiguous: decision.needsReview,
+    evidence: [],
+    alternatives: prediction.alternatives.map(item => ({ value: item.label, score: item.score })),
+  };
+  return {
+    ...baseResult,
+    version: 2,
+    category,
+    product: 'gpt',
+    tier: decision.tier,
+    dimensions: { ...(baseResult?.dimensions || {}), tier: tierDimension },
+    needsReview: Boolean(baseResult?.dimensions?.product?.ambiguous || decision.needsReview),
+    hybrid: {
+      ...decision,
+      modelTier: prediction.tier,
+      confidence: prediction.confidence,
+      margin: prediction.margin,
+    },
+  };
+}
+
 module.exports = {
+  classifyHybridProduct,
   detectStrongTier,
   inspectProductSubject,
+  isKnownGptClassification,
   normalizeHybridText,
   preClassifyProduct,
   validateModelPrediction,
