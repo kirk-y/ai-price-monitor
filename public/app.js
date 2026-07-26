@@ -1246,12 +1246,10 @@ function applyStoreOrder() {
 function getFilteredProducts() {
   let all = getAllProducts().filter(p => !isStoreHidden(p.storeId));
   if (activeCatL2) {
-    all = all.filter(p => p.category === activeCatL2);
+    const detail = activeCatL2 === 'gpt_plus' ? activePlusDetail : 'all';
+    all = all.filter(product => matchesCategorySelection(product, activeCatL2, detail));
   } else if (activeCatL1) {
     all = all.filter(p => catL1Display(catL1FromFull(p.category)) === activeCatL1);
-  }
-  if (activeCatL2 === 'gpt_plus' && activePlusDetail !== 'all') {
-    all = all.filter(product => matchesPlusDetail(product, activePlusDetail));
   }
   if (includeWords.length || excludeWords.length) all = all.filter(p => matchesSearch(p.name));
   all.sort((a, b) => {
@@ -1266,7 +1264,8 @@ function computeBestPrices() {
   const all = (includeWords.length || excludeWords.length) ? getFilteredProducts() : getAllProducts().filter(p => !isStoreHidden(p.storeId));
   const result = {};
   for (const cat of cats) {
-    const items = all.filter(p => p.category === cat && p.price > 0);
+    const detail = cat === 'gpt_plus' && activeCatL2 === 'gpt_plus' ? activePlusDetail : 'all';
+    const items = all.filter(product => matchesCategorySelection(product, cat, detail) && product.price > 0 && product.stock > 0);
     if (items.length) {
       items.sort((a, b) => a.price - b.price);
       result[cat] = items[0];
@@ -1487,6 +1486,14 @@ function matchesPlusDetail(product, detail) {
   if (detail === 'unverified' || detail === 'verified') return attributes.verification === detail;
   if (detail === 'self_service') return attributes.activation === detail;
   if (detail === 'warranty') return attributes.warranty === detail;
+  return true;
+}
+
+function matchesCategorySelection(product, category, plusDetail = 'all') {
+  if (!product || !category) return false;
+  const canonical = canonicalLegacyCategory(category, product.name);
+  if (product.category !== canonical && product.legacyCategory !== category) return false;
+  if (canonical === 'gpt_plus' && plusDetail !== 'all') return matchesPlusDetail(product, plusDetail);
   return true;
 }
 
@@ -1944,11 +1951,12 @@ function renderBestPrices() {
   if (includeWords.length || excludeWords.length) pool = pool.filter(p => matchesSearch(p.name));
   const gptEntries = visibleCatEntries().filter(([k]) => isGptCategory(k) && pool.some(product => product.category === k));
   document.getElementById('bestPriceList').innerHTML = gptEntries.map(([k, label]) => {
-    const items = pool.filter(p => p.category === k && p.price > 0 && p.stock > 0).sort((a, b) => a.price - b.price);
+    const detail = k === 'gpt_plus' && activeCatL2 === 'gpt_plus' ? activePlusDetail : 'all';
+    const items = pool.filter(product => matchesCategorySelection(product, k, detail) && product.price > 0 && product.stock > 0).sort((a, b) => a.price - b.price);
     if (!items.length) return `<div class="bp-item"><div class="bp-cat">${label}</div><div class="bp-na">暂无</div></div>`;
     const item = items[0];
     const storeId = item.storeId;
-    const catFull = item.category;
+    const catFull = k;
     return `<div class="bp-item" data-action="go-best-price" data-store-id="${escapeHtml(storeId)}" data-category="${escapeHtml(catFull)}" data-product-id="${escapeHtml(item.id)}">
       <div class="bp-cat">${label}</div>
       <div class="bp-row"><span class="bp-price">¥${item.price.toFixed(2)}</span><span class="bp-store" title="${escapeHtml(item.storeName)}">${escapeHtml(item.storeName)}</span></div>
