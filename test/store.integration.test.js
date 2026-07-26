@@ -96,6 +96,38 @@ test('manual category updates keep labels and change records associated', () => 
   }
 });
 
+test('all product labels include low-confidence classifications used by the UI', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-all-labels-'));
+  const dbPath = path.join(tempDir, 'labels.db');
+  const script = `
+    const assert = require('node:assert/strict');
+    const store = require('./store');
+    store.saveClassificationResult('shop:uncertain', 'Ambiguous GPT item', {
+      version: 2,
+      category: 'gpt_plus',
+      dimensions: { product: { value: 'gpt', confidence: 0.2 } },
+      attributes: {},
+      needsReview: true,
+    });
+    assert.equal(store.getLabeledData().length, 0);
+    const labels = store.getAllProductLabels();
+    assert.equal(labels.length, 1);
+    assert.equal(labels[0].category, 'gpt_plus');
+    assert.equal(labels[0].classification.needsReview, true);
+  `;
+
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { ...process.env, DB_PATH: dbPath },
+    encoding: 'utf8',
+  });
+  try {
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
 test('structured classifications and per-dimension feedback survive backups', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-classification-'));
   const dbPath = path.join(tempDir, 'classification.db');

@@ -413,6 +413,15 @@ function getLabeledData() {
   `).all().map(serializeProductLabel);
 }
 
+function getAllProductLabels() {
+  return getDb().prepare(`
+    SELECT product_key, name, category, confidence, manual, created_at,
+           classification_json, classification_version, classification_source
+    FROM product_labels
+    ORDER BY manual DESC, id DESC
+  `).all().map(serializeProductLabel);
+}
+
 function saveClassificationResult(productKey, name, result, source = 'rules-v2') {
   if (!result || typeof result !== 'object' || result.version !== 2) throw new Error('分类结果格式错误');
   validateCategory(result.category);
@@ -861,7 +870,7 @@ module.exports = {
   getClassificationConfig, updateClassificationConfig,
   getRefreshConfig, updateRefreshConfig,
   exportAllData, importAllData, exportStore, importSingleStore,
-  getProductLabel, upsertProductLabel, setProductLabel, getLabeledData, recordLabelChange, getLabelChanges,
+  getProductLabel, upsertProductLabel, setProductLabel, getLabeledData, getAllProductLabels, recordLabelChange, getLabelChanges,
   saveClassificationResult, recordClassificationFeedback, getClassificationFeedback,
   setProductClassificationAttributes,
   getStoreOrder, updateStoreOrder,

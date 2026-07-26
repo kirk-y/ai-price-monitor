@@ -1965,34 +1965,39 @@ function renderBestPrices() {
 }
 
 const HISTORY_BEST_CATEGORIES = [
-  ['plus_未接码', 'GPT Plus 未接码'], ['plus_已接码', 'GPT Plus 已接码'],
-  ['plus_质保', 'GPT Plus 质保'], ['gpt_free', 'GPT Free'],
-  ['gptk12', 'GPT K12'], ['gpt_team', 'GPT Team'],
-  ['claude_pro', 'Claude Pro'], ['claude_max', 'Claude MAX'],
-  ['developer_tools_kiro', 'Kiro'],
+  ['plus_未接码', 'GPT Plus 未接码', 'gpt_plus', 'unverified'],
+  ['plus_已接码', 'GPT Plus 已接码', 'gpt_plus', 'verified'],
+  ['plus_质保', 'GPT Plus 质保', 'gpt_plus', 'warranty'],
+  ['gpt_free', 'GPT Free', 'gpt_free'],
+  ['gpt_k12', 'GPT K12', 'gpt_k12'],
+  ['gpt_team', 'GPT Team', 'gpt_team'],
+  ['claude_pro', 'Claude Pro', 'claude_pro'],
+  ['claude_max', 'Claude MAX', 'claude_max'],
+  ['developer_tools_kiro', 'Kiro', 'developer_tools_kiro'],
 ];
 
 function matchesHistoricalCategory(product, category) {
   if (!product) return false;
-  const attributes = product.classification?.attributes || {};
-  if (category === 'plus_未接码') return product.category === 'gpt_plus' && attributes.verification === 'unverified';
-  if (category === 'plus_已接码') return product.category === 'gpt_plus' && attributes.verification === 'verified';
-  if (category === 'plus_质保') return product.category === 'gpt_plus' && attributes.warranty === 'warranty';
-  if (category === 'gptk12') return product.category.startsWith('gpt_') && attributes.qualification === 'k12';
-  if (category === 'gpt_team') return product.category === 'gpt_team';
-  return product.category === canonicalLegacyCategory(category) || product.legacyCategory === category;
+  const definition = HISTORY_BEST_CATEGORIES.find(([key]) => key === category);
+  if (!definition) return false;
+  const [, , canonicalCategory, plusDetail = 'all'] = definition;
+  return matchesCategorySelection(product, canonicalCategory, plusDetail);
 }
 
 function visibleHistoryBestCategories() {
   const saved = filterConfig.historyBestVisibleCategories;
-  const visible = Array.isArray(saved) ? new Set(saved) : null;
+  const visible = Array.isArray(saved) ? new Set(saved.map(key => key === 'gptk12' ? 'gpt_k12' : key)) : null;
   return historyBestCategoriesInOrder().filter(([key]) => !visible || visible.has(key));
 }
 
 function historyBestCategoriesInOrder() {
-  const known = new Map(HISTORY_BEST_CATEGORIES);
-  const order = Array.isArray(filterConfig.historyBestCategoryOrder) ? filterConfig.historyBestCategoryOrder : HISTORY_BEST_CATEGORIES.map(([key]) => key);
-  return [...new Set([...order, ...HISTORY_BEST_CATEGORIES.map(([key]) => key)])].filter(key => known.has(key)).map(key => [key, known.get(key)]);
+  const known = new Map(HISTORY_BEST_CATEGORIES.map(entry => [entry[0], entry]));
+  const order = Array.isArray(filterConfig.historyBestCategoryOrder)
+    ? filterConfig.historyBestCategoryOrder.map(key => key === 'gptk12' ? 'gpt_k12' : key)
+    : HISTORY_BEST_CATEGORIES.map(([key]) => key);
+  return [...new Set([...order, ...HISTORY_BEST_CATEGORIES.map(([key]) => key)])]
+    .filter(key => known.has(key))
+    .map(key => known.get(key));
 }
 
 function renderHistoryBestControls() {

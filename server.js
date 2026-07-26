@@ -263,7 +263,7 @@ app.post('/api/history/import', requireStrictLimit, (req, res) => {
 });
 
 app.get('/api/product-labels', (req, res) => {
-  res.json(store.getLabeledData());
+  res.json(store.getAllProductLabels());
 });
 
 app.get('/api/label-changes', (req, res) => {
