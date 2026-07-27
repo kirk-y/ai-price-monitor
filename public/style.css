@@ -868,12 +868,24 @@ button:disabled {
   margin-bottom: 10px;
 }
 
+.sc-store-info {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.store-link-control {
+  min-width: 0;
+}
+
 .sc-name {
   max-width: 100%;
+  overflow: hidden;
   font-size: 13px;
   font-weight: 700;
-  overflow-wrap: anywhere;
-  white-space: normal;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .sc-store-link {
@@ -888,6 +900,7 @@ button:disabled {
 
 .sc-time,
 .sc-meta {
+  flex-shrink: 0;
   color: var(--text3);
   font-size: 10px;
 }
@@ -2260,8 +2273,8 @@ body.dark .tag-gptk12 { background: color-mix(in srgb, #167e8d 28%, transparent)
   user-select: none;
 }
 
-/* Filter drawer toggle (header button), only visible when the right bar
-   collapses into a drawer. */
+/* Drawer toggles are shown when the sidebars collapse. */
+.store-toggle-btn,
 .filter-toggle-btn {
   display: none;
 }
@@ -2272,11 +2285,56 @@ body.dark .tag-gptk12 { background: color-mix(in srgb, #167e8d 28%, transparent)
 
 @media (max-width: 1120px) {
   .columns {
-    grid-template-columns: 200px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .store-toggle-btn,
+  .filter-toggle-btn {
+    display: grid;
   }
 
   .filter-toggle-btn {
-    display: grid;
+    position: fixed;
+    z-index: 60;
+    right: max(16px, env(safe-area-inset-right));
+    bottom: max(16px, env(safe-area-inset-bottom));
+    width: 46px;
+    height: 46px;
+    border-color: var(--border);
+    border-radius: 50%;
+    background: var(--card-bg);
+    color: var(--primary);
+    box-shadow: var(--shadow-lg);
+  }
+
+  .filter-toggle-btn:hover {
+    background: var(--primary-light);
+  }
+
+  .filter-toggle-btn svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .left-bar {
+    position: fixed;
+    z-index: 70;
+    top: var(--header-height);
+    bottom: 0;
+    left: 0;
+    width: min(280px, 88vw);
+    height: auto;
+    border-top: 0;
+    border-bottom: 0;
+    border-left: 0;
+    border-radius: 0;
+    box-shadow: var(--shadow-lg);
+    transform: translateX(-105%);
+    transition: transform .22s ease;
+  }
+
+  .left-bar.drawer-open {
+    transform: translateX(0);
   }
 
   .right-bar {
@@ -2366,22 +2424,19 @@ body.dark .tag-gptk12 { background: color-mix(in srgb, #167e8d 28%, transparent)
     gap: 8px;
   }
 
-  .left-bar,
   .main-area {
     width: 100%;
     height: auto;
   }
 
   .left-bar {
-    max-height: 280px;
+    width: min(280px, 88vw);
+    height: auto;
+    max-height: none;
   }
 
   .panel-heading {
     min-height: 50px;
-  }
-
-  .store-list {
-    max-height: 150px;
   }
 
   .main-area {
@@ -2462,16 +2517,9 @@ body.dark .tag-gptk12 { background: color-mix(in srgb, #167e8d 28%, transparent)
     grid-template-columns: 1fr;
   }
 
-  .sc-header {
-    flex-wrap: wrap;
-  }
-
-  .sc-name {
-    max-width: 70%;
-  }
-
-  .sc-meta {
-    margin-left: 0;
+  .sc-store-info {
+    max-width: 100%;
+    gap: 6px;
   }
 }
 .category-manager { margin: 8px 0 12px; }

@@ -230,11 +230,32 @@ function refreshOpenCharts() {
   }
 }
 
-function isFilterDrawerMode() {
+function isDrawerMode() {
   return window.matchMedia('(max-width: 1120px)').matches;
 }
 
+function openStoreDrawer() {
+  closeFilterDrawer();
+  document.getElementById('leftBar').classList.add('drawer-open');
+  document.getElementById('drawerBackdrop').classList.add('visible');
+  document.getElementById('storeToggleBtn').setAttribute('aria-expanded', 'true');
+}
+
+function closeStoreDrawer() {
+  document.getElementById('leftBar').classList.remove('drawer-open');
+  document.getElementById('storeToggleBtn').setAttribute('aria-expanded', 'false');
+  if (!document.getElementById('rightBar').classList.contains('drawer-open')) {
+    document.getElementById('drawerBackdrop').classList.remove('visible');
+  }
+}
+
+function toggleStoreDrawer() {
+  if (document.getElementById('leftBar').classList.contains('drawer-open')) closeStoreDrawer();
+  else openStoreDrawer();
+}
+
 function openFilterDrawer() {
+  closeStoreDrawer();
   document.getElementById('rightBar').classList.add('drawer-open');
   document.getElementById('drawerBackdrop').classList.add('visible');
   document.getElementById('filterToggleBtn').setAttribute('aria-expanded', 'true');
@@ -242,8 +263,10 @@ function openFilterDrawer() {
 
 function closeFilterDrawer() {
   document.getElementById('rightBar').classList.remove('drawer-open');
-  document.getElementById('drawerBackdrop').classList.remove('visible');
   document.getElementById('filterToggleBtn').setAttribute('aria-expanded', 'false');
+  if (!document.getElementById('leftBar').classList.contains('drawer-open')) {
+    document.getElementById('drawerBackdrop').classList.remove('visible');
+  }
 }
 
 function toggleFilterDrawer() {
@@ -425,7 +448,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
   window.addEventListener('keydown', e => {
     if (e.key === 'Escape') {
-      closeFilterDrawer();
+      closeAllDrawers();
       if (document.getElementById('historyModal').style.display === 'block') { closeModal(); return; }
       if (document.getElementById('settingsModal').style.display === 'block') { closeSettings(); return; }
       if (document.getElementById('addStoreModal').style.display === 'block') { closeAddModal(); return; }
@@ -436,9 +459,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (e.key === 'ArrowLeft') navigateProduct(-1);
     if (e.key === 'ArrowRight') navigateProduct(1);
   });
+  document.getElementById('storeToggleBtn').addEventListener('click', toggleStoreDrawer);
   document.getElementById('filterToggleBtn').addEventListener('click', toggleFilterDrawer);
-  document.getElementById('drawerBackdrop').addEventListener('click', closeFilterDrawer);
-  window.addEventListener('resize', () => { if (!isFilterDrawerMode()) closeFilterDrawer(); });
+  document.getElementById('drawerBackdrop').addEventListener('click', closeAllDrawers);
+  window.addEventListener('resize', () => { if (!isDrawerMode()) closeAllDrawers(); });
 
   setupSearch('includeInput', 'includeChips', 'includeWords', 'include');
   setupSearch('excludeInput', 'excludeChips', 'excludeWords', 'exclude');
@@ -458,6 +482,11 @@ function resetInitialViewport() {
     const currentContainer = document.getElementById('storesContainer');
     if (currentContainer) currentContainer.scrollTop = 0;
   }));
+}
+
+function closeAllDrawers() {
+  closeStoreDrawer();
+  closeFilterDrawer();
 }
 
 async function loadInitialStoreWindow() {
@@ -903,7 +932,7 @@ async function loadManagedUsers() {
     const response = await apiFetch('/api/users');
     const users = await response.json();
     host.innerHTML = users.map(user => `<div class="user-row" data-user-id="${user.id}">
-      <div class="user-identity"><strong>${escapeHtml(user.username)}</strong><span>${user.lastLoginAt ? `最近登录 ${formatTime(user.lastLoginAt)}` : '尚未登录'}</span></div>
+      <div class="user-identity"><strong>${escapeHtml(user.username)}</strong><span>${user.lastLoginAt ? `最近登录 ${new Date(user.lastLoginAt).toLocaleString('zh-CN')}` : '尚未登录'}</span></div>
       <select class="settings-select user-role-select" aria-label="${escapeHtml(user.username)}的角色">
         ${Object.entries(USER_ROLE_LABELS).map(([role, label]) => `<option value="${role}" ${user.role === role ? 'selected' : ''}>${label}</option>`).join('')}
       </select>
@@ -2095,7 +2124,7 @@ function renderActiveStoreCard() {
     } else {
       meta.textContent = `${summary.productCount || 0} 个商品`;
       card.innerHTML = `<div class="active-store-name">${escapeHtml(summary.name || summary.id)}</div>
-        <div class="active-store-meta">${summary.productCount || 0} 个商品 · ${formatTime(summary.lastUpdated)}</div>
+        <div class="active-store-meta">${summary.productCount || 0} · ${formatTime(summary.lastUpdated)}</div>
         <button class="active-store-hide" data-action="hide-store" data-store-id="${escapeHtml(summary.id)}">隐藏店铺</button>`;
     }
   }
@@ -2224,11 +2253,21 @@ function setupStoreScrollTracking() {
   if (!container) return;
   let frame = 0;
   let previousScrollTop = container.scrollTop;
+  const usesDocumentScroll = () => window.matchMedia('(max-width: 760px)').matches;
+  const currentScrollTop = () => usesDocumentScroll() ? window.scrollY : container.scrollTop;
+  const scrollViewport = () => usesDocumentScroll()
+    ? { top: 0, bottom: window.innerHeight }
+    : container.getBoundingClientRect();
+  const offsetScroll = amount => {
+    if (usesDocumentScroll()) window.scrollBy({ top: amount, behavior: 'auto' });
+    else container.scrollTop += amount;
+  };
+  previousScrollTop = currentScrollTop();
   const expandPreviousStores = async () => {
     if (storeWindowStart <= 0 || storeWindowBusy) return false;
     storeWindowBusy = true;
     const anchor = container.querySelector('.store-card[data-store-id]');
-    const host = container.getBoundingClientRect();
+    const host = scrollViewport();
     const anchorId = anchor?.dataset.storeId;
     const anchorOffset = anchor ? anchor.getBoundingClientRect().top - host.top : 0;
     storeWindowStart = Math.max(0, storeWindowStart - 4);
@@ -2249,8 +2288,8 @@ function setupStoreScrollTracking() {
         storeWindowBusy = false;
         return;
       }
-      const nextHost = container.getBoundingClientRect();
-      container.scrollTop += nextAnchor.getBoundingClientRect().top - nextHost.top - anchorOffset;
+      const nextHost = scrollViewport();
+      offsetScroll(nextAnchor.getBoundingClientRect().top - nextHost.top - anchorOffset);
       requestAnimationFrame(() => { storeWindowBusy = false; });
     });
     return true;
@@ -2258,13 +2297,16 @@ function setupStoreScrollTracking() {
   const update = () => {
     frame = 0;
     if (storeWindowBusy) return;
-    const currentScrollTop = container.scrollTop;
-    const scrollingUp = currentScrollTop < previousScrollTop;
-    previousScrollTop = currentScrollTop;
-    const atTop = container.scrollTop <= 4;
+    const scrollTop = currentScrollTop();
+    const scrollingUp = scrollTop < previousScrollTop;
+    previousScrollTop = scrollTop;
+    const atTop = scrollTop <= 4;
     const cards = [...container.querySelectorAll('.store-card[data-store-id]')];
     if (!cards.length) return;
-    if (container.scrollTop + container.clientHeight >= container.scrollHeight - 180) {
+    const nearEnd = usesDocumentScroll()
+      ? window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 400
+      : container.scrollTop + container.clientHeight >= container.scrollHeight - 180;
+    if (nearEnd) {
       const max = visibleStoreSummaries().length - 1;
       if (storeWindowEnd < max) {
         storeWindowBusy = true;
@@ -2278,7 +2320,7 @@ function setupStoreScrollTracking() {
           storeWindowBusy = false;
         });
       }
-    } else if ((scrollingUp || atTop) && container.scrollTop <= 120 && storeWindowStart > 0) {
+    } else if ((scrollingUp || atTop) && scrollTop <= 120 && storeWindowStart > 0) {
       expandPreviousStores();
     }
     if (atTop) {
@@ -2289,7 +2331,7 @@ function setupStoreScrollTracking() {
       }
       return;
     }
-    const host = container.getBoundingClientRect();
+    const host = scrollViewport();
     if (scrollingUp && storeWindowStart > 0) {
       const firstRect = cards[0].getBoundingClientRect();
       if (firstRect.top >= host.top - 20) expandPreviousStores();
@@ -2313,6 +2355,9 @@ function setupStoreScrollTracking() {
   container.addEventListener('scroll', () => {
     if (!frame) frame = requestAnimationFrame(update);
   }, { passive: true });
+  window.addEventListener('scroll', () => {
+    if (usesDocumentScroll() && !frame) frame = requestAnimationFrame(update);
+  }, { passive: true });
   container.addEventListener('wheel', event => {
     if (storeWindowBusy) {
       event.preventDefault();
@@ -2330,6 +2375,7 @@ function setupStoreScrollTracking() {
 async function switchStore(storeId) {
   const container = document.getElementById('storesContainer');
   if (!container) return;
+  if (isDrawerMode()) closeStoreDrawer();
   if (historicalBestMode) {
     historyBestStoreId = storeId === 'all' ? '' : storeId;
     activeBrowseStoreId = historyBestStoreId;
@@ -2766,9 +2812,11 @@ function renderStores() {
     if (reachedLimit && !gridItems.length) return '';
     return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">
       <div class="sc-header">
-        ${storeName}
-        <span class="sc-meta">${products.length} 个商品</span>
-        <span class="sc-time">${formatTime(summary.lastUpdated || s.lastUpdated)}</span>
+        <div class="sc-store-info">
+          ${storeName}
+          <span class="sc-meta" title="商品数">${products.length}</span>
+          <span class="sc-time">${formatTime(summary.lastUpdated || s.lastUpdated)}</span>
+        </div>
         <span class="sc-sync-status ${displayStatus}" title="${displayStatus === 'error' ? escapeHtml(summary.error || '更新失败') : ''}">${displayStatus === 'pending' ? '更新中' : displayStatus === 'error' ? '更新失败' : ''}</span>
         <div class="sc-actions">
           <button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button>
@@ -2883,17 +2931,22 @@ function observeSentinel() {
   const el = document.querySelector('.scroll-sentinel');
   const container = document.getElementById('storesContainer');
   if (!el || !container) return;
+  const usesDocumentScroll = window.matchMedia('(max-width: 760px)').matches;
   window._scrollObs = new IntersectionObserver(entries => {
     if (_loadingMore) return;
     if (entries[0].isIntersecting) {
       _loadingMore = true;
       window._scrollObs.disconnect();
       renderLimit += 30;
-      const scrollTop = container.scrollTop;
+      const scrollTop = usesDocumentScroll ? window.scrollY : container.scrollTop;
       renderStores();
-      requestAnimationFrame(() => { container.scrollTop = scrollTop; _loadingMore = false; });
+      requestAnimationFrame(() => {
+        if (usesDocumentScroll) window.scrollTo({ top: scrollTop, behavior: 'auto' });
+        else container.scrollTop = scrollTop;
+        _loadingMore = false;
+      });
     }
-  }, { root: container, rootMargin: '400px' });
+  }, { root: usesDocumentScroll ? null : container, rootMargin: '400px' });
   window._scrollObs.observe(el);
 }
 
@@ -3258,11 +3311,12 @@ function escapeHtml(s) {
 
 function formatTime(iso) {
   if (!iso) return '暂无更新';
-  const diff = Date.now() - new Date(iso).getTime();
-  if (diff < 60000) return '刚刚更新';
-  if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前更新';
-  if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前更新';
-  return new Date(iso).toLocaleDateString('zh-CN') + ' 更新';
+  const timestamp = new Date(iso).getTime();
+  if (!Number.isFinite(timestamp)) return '暂无更新';
+  const diff = Math.max(0, Date.now() - timestamp);
+  if (diff < 3600000) return `更新于 ${Math.floor(diff / 60000)}min`;
+  if (diff < 86400000) return `更新于 ${Math.floor(diff / 3600000)}h`;
+  return `更新于 ${Math.floor(diff / 86400000)}d`;
 }
 
 function showAddModal() {

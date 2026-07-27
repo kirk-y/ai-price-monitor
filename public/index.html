@@ -6,7 +6,7 @@
   <script>if ('scrollRestoration' in history) history.scrollRestoration = 'manual';</script>
   <title>AI价格监控</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/style.css?v=20260727-progressive-catalog">
+  <link rel="stylesheet" href="/style.css?v=20260727-mobile-scroll">
 </head>
 <body>
   <header class="app-header">
@@ -23,6 +23,7 @@
       <div class="header-health"><span class="health-dot"></span><span id="headerHealthText">数据同步中</span><span id="roleBadge" class="role-badge"></span></div>
     </div>
     <div class="header-actions">
+      <button id="storeToggleBtn" class="icon-btn store-toggle-btn" type="button" title="店铺列表" aria-label="打开店铺列表" aria-controls="leftBar" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 9 5 3h14l2 6M4 12v9h16v-9M9 21v-6h6v6M3 9a3 3 0 0 0 6 0 3 3 0 0 0 6 0 3 3 0 0 0 6 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"></path></svg></button>
       <button id="filterToggleBtn" class="icon-btn filter-toggle-btn" type="button" title="筛选与价格" aria-label="打开筛选与价格面板" aria-controls="rightBar" aria-expanded="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h18l-7 8v5.5l-4 2v-7.5L3 5z" fill="currentColor"></path></svg></button>
       <a class="github-link" href="https://github.com/kirk-y/ai-price-monitor" target="_blank" rel="noopener noreferrer" title="给项目一个 Star" aria-label="在 GitHub 打开项目，给项目一个 Star"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49v-1.7c-2.78.62-3.37-1.38-3.37-1.38-.46-1.2-1.11-1.52-1.11-1.52-.91-.64.07-.63.07-.63 1 .08 1.53 1.05 1.53 1.05.9 1.58 2.35 1.12 2.92.86.09-.67.35-1.12.64-1.38-2.22-.26-4.56-1.14-4.56-5.07 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.3.1-2.7 0 0 .84-.27 2.75 1.05A9.2 9.2 0 0 1 12 7.1c.85 0 1.7.12 2.5.36 1.9-1.32 2.74-1.05 2.74-1.05.55 1.4.2 2.44.1 2.7.64.72 1.03 1.63 1.03 2.75 0 3.94-2.34 4.8-4.57 5.06.36.32.68.94.68 1.9v2.82c0 .27.18.6.69.49A10.27 10.27 0 0 0 22 12.25C22 6.58 17.52 2 12 2Z"></path></svg></a>
       <button id="settingsBtn" class="icon-btn" type="button" title="设置" aria-label="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z" fill="currentColor"></path></svg></button>
@@ -356,6 +357,6 @@
   </div>
 
   <script src="/chart.umd.min.js"></script>
-  <script src="/app.js?v=20260727-progressive-catalog"></script>
+  <script src="/app.js?v=20260727-mobile-scroll"></script>
 </body>
 </html>
