@@ -43,6 +43,7 @@ let priceRange = { min: 0, max: 0 };
 let _priceTimer = null;
 let fullCatalogLoaded = false;
 let fullCatalogLoading = null;
+let initialViewportTouched = false;
 
 localStorage.removeItem('authToken');
 let _authToken = sessionStorage.getItem('sessionToken') || sessionStorage.getItem('authToken') || '';
@@ -50,6 +51,8 @@ if (_authToken) sessionStorage.setItem('sessionToken', _authToken);
 sessionStorage.removeItem('authToken');
 let _userRole = sessionStorage.getItem('userRole') || '';
 let _currentUser = null;
+
+if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
 
 async function apiFetch(url, opts) {
   const requestToken = _authToken;
@@ -360,6 +363,11 @@ function handleActionDrag(event) {
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
+  const markInitialInteraction = () => { initialViewportTouched = true; };
+  window.addEventListener('wheel', markInitialInteraction, { passive: true, once: true });
+  window.addEventListener('touchstart', markInitialInteraction, { passive: true, once: true });
+  window.addEventListener('pointerdown', markInitialInteraction, { passive: true, once: true });
+  window.addEventListener('keydown', markInitialInteraction, { once: true });
   initTheme();
   await ensureAuthenticated();
   document.getElementById('themeToggle').addEventListener('click', toggleTheme);
@@ -394,7 +402,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   for (const l of labels) { productLabels[l.product_key] = l; }
   markDirty();
   render();
-  hydrateFullCatalog();
+  resetInitialViewport();
+  loadInitialStoreWindow().finally(() => {
+    if (!initialViewportTouched) resetInitialViewport();
+    scheduleCatalogHydration();
+  });
   document.getElementById('catBar').addEventListener('wheel', e => { e.preventDefault(); document.getElementById('catBar').scrollLeft += e.deltaY; }, { passive: false });
   document.querySelectorAll('.close').forEach(el => el.addEventListener('click', () => {
     document.getElementById('historyModal').style.display = 'none';
@@ -435,6 +447,34 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupStoreScrollTracking();
   startStoreStatusPolling();
 });
+
+function resetInitialViewport() {
+  activeBrowseStoreId = '';
+  window.scrollTo({ top: 0, behavior: 'auto' });
+  const container = document.getElementById('storesContainer');
+  if (container) container.scrollTop = 0;
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    window.scrollTo({ top: 0, behavior: 'auto' });
+    const currentContainer = document.getElementById('storesContainer');
+    if (currentContainer) currentContainer.scrollTop = 0;
+  }));
+}
+
+async function loadInitialStoreWindow() {
+  const ids = visibleStoreSummaries().slice(storeWindowStart, storeWindowEnd + 1).map(store => store.id);
+  try {
+    await loadStoreBatch(ids);
+    render();
+  } catch (error) {
+    console.error('首屏店铺补充加载失败:', error.message);
+  }
+}
+
+function scheduleCatalogHydration() {
+  const start = () => hydrateFullCatalog();
+  if ('requestIdleCallback' in window) window.requestIdleCallback(start, { timeout: 3000 });
+  else setTimeout(start, 1200);
+}
 
 function setupSearch(inputId, chipsId, wordsVar, type) {
   const input = document.getElementById(inputId);
@@ -1405,7 +1445,7 @@ async function loadStoreWithProducts(storeId) {
 }
 
 async function loadStoreBatch(storeIds, force = false) {
-  const ids = [...new Set(storeIds)].filter(id => id && (force || !stores.some(store => store.id === id)));
+  const ids = [...new Set(storeIds)].filter(id => id && (force || !stores.some(store => store.id === id && !store.partial)));
   if (!ids.length) return;
   const response = await apiFetch(`/api/stores-batch?ids=${ids.map(encodeURIComponent).join(',')}`);
   const data = await response.json();
@@ -1423,19 +1463,23 @@ async function hydrateFullCatalog() {
   if (fullCatalogLoaded) return;
   if (fullCatalogLoading) return fullCatalogLoading;
   fullCatalogLoading = (async () => {
-    const [storeResponse, labelResponse] = await Promise.all([
-      apiFetch('/api/stores'),
-      apiFetch('/api/product-labels'),
-    ]);
-    const [allStores, labels] = await Promise.all([storeResponse.json(), labelResponse.json()]);
-    if (!storeResponse.ok || !labelResponse.ok) throw new Error('全量商品数据加载失败');
-    stores = allStores;
-    productLabels = {};
-    for (const label of labels) productLabels[label.product_key] = label;
-    fullCatalogLoaded = true;
+    let failed = false;
+    const pendingIds = storeSummaries.map(store => store.id).filter(id => !stores.some(item => item.id === id));
+    for (let offset = 0; offset < pendingIds.length; offset += 4) {
+      const batch = pendingIds.slice(offset, offset + 4);
+      try {
+        await loadStoreBatch(batch);
+      } catch (error) {
+        failed = true;
+        console.error(`后台商品批次加载失败 (${batch.join(',')}):`, error.message);
+      }
+      await new Promise(resolve => setTimeout(resolve, 180));
+    }
+    fullCatalogLoaded = !failed && storeSummaries.every(summary => stores.some(item => item.id === summary.id));
     applyStoreOrder();
     markDirty();
     render();
+    if (!initialViewportTouched) resetInitialViewport();
   })().catch(error => {
     console.error('后台加载全量数据失败:', error.message);
   }).finally(() => { fullCatalogLoading = null; });
@@ -2309,7 +2353,7 @@ async function switchStore(storeId) {
   if (!summary || isStoreHidden(storeId)) return;
   const loadedStore = stores.find(store => store.id === storeId);
   const loadedDataIsStale = Boolean(loadedStore && summary.lastUpdated && loadedStore.lastUpdated !== summary.lastUpdated);
-  if (!loadedStore || loadedDataIsStale || loadedStore.status === 'pending' || loadedStore.status === 'error') {
+  if (!loadedStore || loadedStore.partial || loadedDataIsStale || loadedStore.status === 'pending' || loadedStore.status === 'error') {
     showStoreLoadingOverlay('正在加载店铺数据…');
     try {
       await loadStoreWithProducts(storeId);

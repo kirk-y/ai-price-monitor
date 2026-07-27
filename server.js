@@ -74,7 +74,7 @@ app.use('/api/', apiLimiter);
 app.use(express.static(path.join(__dirname, 'public'), {
   setHeaders(res, filePath) {
     const name = path.basename(filePath).toLowerCase();
-    if (name === 'index.html' || name === 'app.js') {
+    if (name === 'index.html' || name === 'app.js' || name === 'style.css') {
       res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
       res.setHeader('Pragma', 'no-cache');
       res.setHeader('Expires', '0');
@@ -359,6 +359,28 @@ function compactProductLabels(labels) {
   }));
 }
 
+function buildInitialStorePreviews(storeIds, productLimit = 8) {
+  const fullStores = store.getStoresByIds(storeIds);
+  const labels = compactProductLabels(store.getProductLabelsForStores(storeIds));
+  const labelsByKey = new Map(labels.map(label => [label.product_key, label]));
+  const selectedKeys = new Set();
+  const stores = fullStores.map(item => {
+    const products = (item.products || []).map(product => {
+      const productKey = `${item.id}:${product.id}`;
+      return { product, productKey, label: labelsByKey.get(productKey) };
+    }).filter(entry => {
+      const category = entry.label?.classification?.category || entry.label?.category || '';
+      return category === 'gpt_plus' && entry.product.stock > 0 && entry.product.price > 0;
+    }).sort((a, b) => a.product.price - b.product.price).slice(0, productLimit);
+    for (const entry of products) selectedKeys.add(entry.productKey);
+    return { ...item, products: products.map(entry => entry.product), partial: true };
+  });
+  return {
+    stores,
+    productLabels: labels.filter(label => selectedKeys.has(label.product_key)),
+  };
+}
+
 app.get('/api/bootstrap', (req, res) => {
   const summaries = store.getStoreSummaries();
   const preferences = req.user.id ? store.getUserPreferences(req.user.id) : {};
@@ -372,6 +394,7 @@ app.get('/api/bootstrap', (req, res) => {
   const safeFilterConfig = req.role === 'viewer' && filterConfig.aiClassify
     ? { ...filterConfig, aiClassify: { ...filterConfig.aiClassify, key: '' } }
     : filterConfig;
+  const initialCatalog = buildInitialStorePreviews(initialStoreIds);
   res.json({
     filterConfig: safeFilterConfig,
     preferences,
@@ -379,8 +402,8 @@ app.get('/api/bootstrap', (req, res) => {
     refreshConfig: { ...store.getRefreshConfig(), nextRefreshAt },
     summaries,
     storeOrder: sharedOrder,
-    stores: store.getStoresByIds(initialStoreIds),
-    productLabels: compactProductLabels(store.getProductLabelsForStores(initialStoreIds)),
+    stores: initialCatalog.stores,
+    productLabels: initialCatalog.productLabels,
   });
 });
 
