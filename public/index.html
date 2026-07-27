@@ -129,18 +129,19 @@
       <div class="settings-body">
         <div class="settings-sidebar">
           <div class="settings-option admin-only" data-option="keywords">关键词管理</div>
-          <div class="settings-option active" data-option="export">导出数据</div>
-          <div class="settings-option" data-option="storeexport">店铺导出</div>
+          <div class="settings-option viewer-hidden active" data-option="export">导出数据</div>
+          <div class="settings-option viewer-hidden" data-option="storeexport">店铺导出</div>
           <div class="settings-option admin-only" data-option="labels">分类管理</div>
           <div class="settings-option admin-only" data-option="classification">分类规则 V2</div>
           <div class="settings-option superadmin-only" data-option="refresh">刷新间隔</div>
+          <div class="settings-option" data-option="browsing">浏览设置</div>
           <div class="settings-option" data-option="hiddenstores">隐藏店铺</div>
           <div class="settings-option admin-only" data-option="aiclassify">大模型分类</div>
           <div class="settings-option superadmin-only" data-option="users">用户管理</div>
           <div class="settings-option superadmin-only danger-option" data-option="cleardata">清除数据</div>
         </div>
         <div class="settings-panel">
-          <div id="settingsPanelExport" class="settings-panel-item active">
+          <div id="settingsPanelExport" class="settings-panel-item viewer-hidden active">
             <button id="settingsExportBtn" class="settings-action-btn superadmin-only">导出 JSON 数据</button>
             <p class="settings-desc superadmin-only">将所有店铺数据、价格历史、配置导出为 JSON 文件，便于迁移备份。</p>
             <div class="settings-divider superadmin-only"></div>
@@ -222,7 +223,7 @@
             <div class="settings-divider"></div>
             <div id="classificationPreview" class="classification-preview"></div>
           </div>
-          <div id="settingsPanelStoreexport" class="settings-panel-item">
+          <div id="settingsPanelStoreexport" class="settings-panel-item viewer-hidden">
             <p class="settings-desc">导出店铺列表（仅包含店铺名称和链接，不含商品数据），在新环境一键导入。</p>
             <button id="storeListExportBtn" class="settings-action-btn">导出店铺列表</button>
             <span id="storeListExportMsg" class="settings-msg"></span>
@@ -278,6 +279,16 @@
             <div class="settings-divider"></div>
             <button id="saveRefreshBtn" class="settings-action-btn">保存设置</button>
             <span id="refreshSaveMsg" class="settings-msg"></span>
+          </div>
+          <div id="settingsPanelBrowsing" class="settings-panel-item">
+            <p class="settings-desc">选择分类后，店铺可以按该分类当前最低在售价格排列，也可以始终保持手动设置的固定顺序。</p>
+            <div class="settings-section">
+              <label class="settings-radio"><input type="radio" name="storeSortMode" value="price"><span>按低价自动排序（默认）</span></label>
+            </div>
+            <div class="settings-divider"></div>
+            <div class="settings-section">
+              <label class="settings-radio"><input type="radio" name="storeSortMode" value="fixed"><span>固定店铺顺序</span></label>
+            </div>
           </div>
           <div id="settingsPanelHiddenstores" class="settings-panel-item">
             <p class="settings-desc">已隐藏的店铺会暂时从商品列表中移除，可在这里恢复显示。</p>

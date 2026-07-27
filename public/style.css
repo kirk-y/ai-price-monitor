@@ -25,6 +25,8 @@
   --shadow: 0 1px 2px rgba(20, 24, 32, .05);
   --shadow-md: 0 5px 18px rgba(20, 24, 32, .08);
   --shadow-lg: 0 18px 50px rgba(20, 24, 32, .18);
+  --store-shadow: 0 2px 5px rgba(20, 24, 32, .06), 0 10px 24px rgba(20, 24, 32, .045);
+  --store-shadow-hover: 0 3px 8px rgba(20, 24, 32, .08), 0 14px 30px rgba(20, 24, 32, .065);
   --header-height: 56px;
 }
 
@@ -52,6 +54,8 @@ body.dark {
   --shadow: 0 1px 2px rgba(0, 0, 0, .22);
   --shadow-md: 0 8px 24px rgba(0, 0, 0, .28);
   --shadow-lg: 0 22px 60px rgba(0, 0, 0, .45);
+  --store-shadow: 0 3px 8px rgba(0, 0, 0, .24), 0 12px 28px rgba(0, 0, 0, .18);
+  --store-shadow-hover: 0 4px 10px rgba(0, 0, 0, .3), 0 16px 34px rgba(0, 0, 0, .24);
 }
 
 * {
@@ -836,32 +840,39 @@ button:disabled {
 }
 
 .store-card {
-  margin-bottom: 14px;
-  border-bottom: 1px solid var(--border);
-  padding: 0 0 16px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--card-bg);
+  padding: 12px;
+  box-shadow: var(--store-shadow);
+  transition: border-color .18s ease, box-shadow .18s ease;
+}
+
+.store-card:hover {
+  border-color: var(--border2);
+  box-shadow: var(--store-shadow-hover);
 }
 
 .store-card:last-child {
   margin-bottom: 0;
-  border-bottom: 0;
-  padding-bottom: 0;
 }
 
 .sc-header {
   display: flex;
   min-height: 34px;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   margin-bottom: 10px;
 }
 
 .sc-name {
-  max-width: min(360px, 45%);
-  overflow: hidden;
+  max-width: 100%;
   font-size: 13px;
   font-weight: 700;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .sc-store-link {
@@ -880,12 +891,9 @@ button:disabled {
   font-size: 10px;
 }
 
-.sc-meta {
-  margin-left: auto;
-}
-
 .sc-actions {
   display: flex;
+  margin-left: auto;
   gap: 4px;
 }
 
@@ -894,7 +902,8 @@ button:disabled {
 .del-btn,
 .hide-btn,
 .history-store-btn,
-.copy-store-btn {
+.copy-store-btn,
+.visitor-more-btn {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   background: var(--card-bg);
@@ -922,7 +931,8 @@ button:disabled {
 
 .ref-btn:hover,
 .history-store-btn:hover,
-.copy-store-btn:hover {
+.copy-store-btn:hover,
+.visitor-more-btn:hover {
   border-color: var(--primary);
   background: var(--primary-light);
   color: var(--primary);
@@ -2543,6 +2553,7 @@ body.dark .tag-gptk12 { background: color-mix(in srgb, #167e8d 28%, transparent)
 /* Role-based visibility */
 body.role-viewer .admin-only,
 body.role-viewer .superadmin-only,
+body.role-viewer .viewer-hidden,
 body.role-operator .superadmin-only { display: none !important; }
 .role-badge { font-size: 11px; padding: 2px 8px; border-radius: 10px; margin-left: 8px; font-weight: 500; vertical-align: middle; }
 .role-badge.admin { background: var(--success-light); color: var(--success); }
@@ -2572,6 +2583,108 @@ body.role-operator .superadmin-only { display: none !important; }
   background: var(--panel);
   box-shadow: 0 18px 50px rgba(15, 23, 42, .16);
 }
+
+.store-link-control {
+  position: relative;
+  min-width: 0;
+}
+
+button.sc-store-link {
+  display: block;
+  border: 0;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.store-link-popover {
+  position: absolute;
+  z-index: 8;
+  top: calc(100% + 7px);
+  left: 0;
+  display: none;
+  width: max-content;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card-bg);
+  box-shadow: var(--shadow-lg);
+}
+
+.store-link-popover.visible {
+  display: flex;
+}
+
+.store-link-popover button {
+  border: 0;
+  border-right: 1px solid var(--border);
+  background: transparent;
+  padding: 7px 10px;
+  color: var(--text2);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.store-link-popover button:last-child {
+  border-right: 0;
+}
+
+.store-link-popover button:hover {
+  background: var(--primary-light);
+  color: var(--primary);
+}
+
+.store-link-popover .store-link-hide {
+  color: var(--danger);
+}
+
+.visitor-more-btn {
+  display: flex;
+  align-items: center;
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  cursor: pointer;
+  gap: 8px;
+}
+
+.visitor-expand-row::before,
+.visitor-expand-row::after {
+  height: 1px;
+  width: 56px;
+  flex: 0 0 56px;
+  background: var(--border);
+  content: '';
+}
+
+.visitor-expand-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-top: 8px;
+  gap: 8px;
+}
+
+.visitor-more-btn span {
+  font-size: 11px;
+}
+
+.visitor-more-btn i {
+  width: 7px;
+  height: 7px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: translateY(-2px) rotate(45deg);
+}
+
+.visitor-more-btn.collapse i {
+  transform: translateY(2px) rotate(225deg);
+}
+
 
 .sc-sync-status {
   display: none;

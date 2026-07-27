@@ -18,6 +18,8 @@ let activePlusDetail = localStorage.getItem('activePlusDetail') || 'all';
 let bestPricePlusExpanded = localStorage.getItem('bestPricePlusExpanded') === 'true';
 let renderLimit = 30;
 let expandedNoStock = {};
+let visitorStoreExpansion = {};
+let openStoreLinkMenuId = '';
 let includeWords = [];
 let excludeWords = [];
 let lastActiveSearch = 'include';
@@ -35,6 +37,7 @@ let productLabels = {};
 let cachedProducts = [];
 let productsDirty = true;
 let storeOrder = [];
+let storeLowestPriceIndex = new Map();
 let dragDropPosition = 'before';
 let priceRange = { min: 0, max: 0 };
 let _priceTimer = null;
@@ -247,9 +250,13 @@ function toggleFilterDrawer() {
 
 function handleActionClick(event) {
   const target = event.target.closest('[data-action]');
-  if (!target) return;
+  if (!target) {
+    if (!event.target.closest('.store-link-popover')) closeStoreLinkMenu();
+    return;
+  }
 
   const { action } = target.dataset;
+  if (action !== 'toggle-store-link-menu' && !event.target.closest('.store-link-popover')) closeStoreLinkMenu();
   const handlers = {
     'add-suggest-key': () => addSuggestKey(target.dataset.key),
     'remove-word': () => removeWord(target.dataset.word, target.dataset.type),
@@ -268,7 +275,10 @@ function handleActionClick(event) {
     'exit-history-best': () => exitHistoricalBestView(),
     'delete-store': () => deleteStore(target.dataset.storeId),
     'toggle-no-stock': () => toggleNoStock(target.dataset.storeId),
-    'hide-store': () => hideStore(target.dataset.storeId),
+    'set-visitor-store-expansion': () => setVisitorStoreExpansion(target.dataset.storeId, Number(target.dataset.level)),
+    'hide-store': () => { closeStoreLinkMenu(); hideStore(target.dataset.storeId); },
+    'toggle-store-link-menu': () => toggleStoreLinkMenu(target.dataset.storeId),
+    'open-store-link': () => openStoreLink(target.dataset.storeUrl),
     'copy-store-link': () => copyStoreLink(target.dataset.storeUrl),
     'restore-store': () => restoreStore(target.dataset.storeId),
     'save-user': () => saveManagedUser(target.dataset.userId),
@@ -527,16 +537,24 @@ function initSettings() {
   document.getElementById('createUserBtn').addEventListener('click', createManagedUser);
   document.getElementById('clearDataConfirmation').addEventListener('input', updateClearDataButton);
   document.getElementById('clearSystemDataBtn').addEventListener('click', clearSystemData);
+  document.querySelectorAll('input[name="storeSortMode"]').forEach(input => {
+    input.addEventListener('change', () => setStoreSortMode(input.value));
+  });
   document.querySelectorAll('.settings-option').forEach(el => {
     el.addEventListener('click', () => switchSettingsOption(el.dataset.option));
   });
 }
 
 function openSettings() {
-  if (!isAdmin() && document.querySelector('.settings-option.active')?.dataset.option === 'export') {
+  if (_userRole === 'viewer') {
+    switchSettingsOption('browsing');
+  } else if (!isAdmin() && document.querySelector('.settings-option.active')?.dataset.option === 'export') {
     switchSettingsOption('storeexport');
   }
   const cfg = refreshConfig;
+  const sortMode = userPreferences.storeSortMode === 'fixed' ? 'fixed' : 'price';
+  const sortInput = document.querySelector(`input[name="storeSortMode"][value="${sortMode}"]`);
+  if (sortInput) sortInput.checked = true;
   if (cfg.mode === 'fixed') {
     document.querySelector('input[name="refreshMode"][value="fixed"]').checked = true;
   } else {
@@ -1523,10 +1541,73 @@ function getAllProducts() {
   }
   cachedProducts = all;
   productsDirty = false;
+  rebuildStoreLowestPriceIndex(all);
   return all;
 }
 
-function markDirty() { productsDirty = true; }
+function markDirty() {
+  productsDirty = true;
+  storeLowestPriceIndex = new Map();
+}
+
+function cacheStoreLowestPrice(indexKey, product) {
+  if (!(product.stock > 0) || !(product.price > 0)) return;
+  if (!storeLowestPriceIndex.has(indexKey)) storeLowestPriceIndex.set(indexKey, new Map());
+  const prices = storeLowestPriceIndex.get(indexKey);
+  const current = prices.get(product.storeId);
+  if (current === undefined || product.price < current) prices.set(product.storeId, product.price);
+}
+
+function rebuildStoreLowestPriceIndex(products) {
+  storeLowestPriceIndex = new Map();
+  for (const product of products) {
+    cacheStoreLowestPrice('all', product);
+    cacheStoreLowestPrice(`l1:${catL1Display(catL1FromFull(product.category))}`, product);
+    cacheStoreLowestPrice(`l2:${product.category}`, product);
+    if (product.category === 'gpt_plus') {
+      for (const [detail] of PLUS_DETAIL_OPTIONS) {
+        if (detail === 'all' || matchesPlusDetail(product, detail)) cacheStoreLowestPrice(`plus:${detail}`, product);
+      }
+    }
+  }
+}
+
+function activeStorePriceIndex() {
+  getAllProducts();
+  if (includeWords.length || excludeWords.length) {
+    const prices = new Map();
+    for (const product of getFilteredProducts()) {
+      if (!(product.stock > 0) || !(product.price > 0)) continue;
+      const current = prices.get(product.storeId);
+      if (current === undefined || product.price < current) prices.set(product.storeId, product.price);
+    }
+    return prices;
+  }
+  if (activeCatL2 === 'gpt_plus') return storeLowestPriceIndex.get(`plus:${activePlusDetail}`) || new Map();
+  if (activeCatL2) return storeLowestPriceIndex.get(`l2:${activeCatL2}`) || new Map();
+  if (activeCatL1) return storeLowestPriceIndex.get(`l1:${activeCatL1}`) || new Map();
+  return storeLowestPriceIndex.get('all') || new Map();
+}
+
+function storeSortMode() {
+  return userPreferences.storeSortMode === 'fixed' ? 'fixed' : 'price';
+}
+
+function setStoreSortMode(mode) {
+  userPreferences.storeSortMode = mode === 'fixed' ? 'fixed' : 'price';
+  saveUserPreferences();
+  activeBrowseStoreId = '';
+  render();
+}
+
+function renderAfterCategoryChange() {
+  visitorStoreExpansion = {};
+  if (storeSortMode() === 'price') activeBrowseStoreId = '';
+  render();
+  if (storeSortMode() === 'price') {
+    requestAnimationFrame(() => document.getElementById('storesContainer')?.scrollTo({ top: 0, behavior: 'auto' }));
+  }
+}
 
 function applyStoreOrder() {
   const knownIds = new Set([...storeSummaries, ...stores].map(store => store.id));
@@ -1746,7 +1827,7 @@ function setCatL1(l1) {
   plusDetailsExpanded = false;
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
-  render();
+  renderAfterCategoryChange();
 }
 
 function setAllCategories() {
@@ -1758,7 +1839,7 @@ function setAllCategories() {
   plusDetailsExpanded = false;
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
-  render();
+  renderAfterCategoryChange();
 }
 
 function setCatL2(full) {
@@ -1773,7 +1854,7 @@ function setCatL2(full) {
   activeCategory = full;
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
-  render();
+  renderAfterCategoryChange();
 }
 
 const PLUS_DETAIL_OPTIONS = [
@@ -1819,7 +1900,7 @@ function setPlusDetail(detail) {
   localStorage.setItem('activePlusDetail', detail);
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
-  render();
+  renderAfterCategoryChange();
   requestAnimationFrame(ensurePlusDetailsVisible);
 }
 
@@ -1916,7 +1997,15 @@ function isStoreHidden(storeId) {
 }
 
 function visibleStoreSummaries() {
-  return storeSummaries.filter(summary => !isStoreHidden(summary.id));
+  const visible = storeSummaries.filter(summary => !isStoreHidden(summary.id));
+  if (storeSortMode() !== 'price') return visible;
+  const prices = activeStorePriceIndex();
+  return visible.sort((a, b) => {
+    const aPrice = prices.get(a.id) ?? Infinity;
+    const bPrice = prices.get(b.id) ?? Infinity;
+    if (aPrice !== bPrice) return aPrice - bPrice;
+    return storeOrder.indexOf(a.id) - storeOrder.indexOf(b.id);
+  });
 }
 
 function browseStoreIsActive(storeId) {
@@ -1942,8 +2031,9 @@ function renderStoreList() {
     const rowClass = `${isRefreshing ? ' is-refreshing' : ''}${isPending ? ' store-row-pending' : ''}${isError ? ' store-row-error' : ''}`;
     const badge = isError ? '<span class="badge badge-error">失败</span>' : isPending ? '<span class="badge badge-pending">获取中</span>' : `<span class="badge">${s.productCount||0}</span>`;
     const title = isError ? escapeHtml(s.error || '刷新失败') : isPending ? '获取中...' : formatTime(s.lastUpdated);
-    return `<div class="store-row${rowClass}" draggable="true" data-drag-type="store" data-id="${sid}">
-      <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${title}"><span class="drag-handle">⠿</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span>${badge}</button>
+    const fixedOrder = storeSortMode() === 'fixed';
+    return `<div class="store-row${rowClass}${fixedOrder ? '' : ' auto-sorted'}" draggable="${fixedOrder}" data-drag-type="store" data-id="${sid}">
+      <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${title}"><span class="drag-handle">${fixedOrder ? '⠿' : '¥'}</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span>${badge}</button>
       ${isRefreshing ? '<div class="refresh-bar"><div class="refresh-bar-inner"></div></div>' : ''}
     </div>`;
   }).join('')}`;
@@ -2062,6 +2152,7 @@ function dragOver(e, targetId) {
 
 function dropStore(e, targetId) {
   e.preventDefault();
+  if (storeSortMode() !== 'fixed') return;
   if (!dragId || dragId === targetId) return;
   applyStoreOrder();
   const order = [...storeOrder];
@@ -2562,7 +2653,7 @@ function renderStores() {
   const filtered = getFilteredProducts();
   const allIds = visibleStoreSummaries().map(s => s.id);
   const ids = allIds.slice(storeWindowStart, storeWindowEnd + 1);
-  if (storeOrder.length) ids.sort((a, b) => { const ai = storeOrder.indexOf(a); const bi = storeOrder.indexOf(b); if (ai === -1 && bi === -1) return 0; if (ai === -1) return 1; if (bi === -1) return -1; return ai - bi; });
+  if (storeSortMode() === 'fixed' && storeOrder.length) ids.sort((a, b) => { const ai = storeOrder.indexOf(a); const bi = storeOrder.indexOf(b); if (ai === -1 && bi === -1) return 0; if (ai === -1) return 1; if (bi === -1) return -1; return ai - bi; });
 
   if (!stores.length && !storeSummaries.length) { container.innerHTML = '<div class="empty-state">请添加店铺开始监控</div>'; return; }
   if (!stores.length && storeSummaries.length) { container.innerHTML = '<div class="empty-state">请选择店铺查看商品</div>'; return; }
@@ -2577,7 +2668,10 @@ function renderStores() {
     const summary = storeSummaries.find(item => item.id === id) || s;
     const displayStatus = visibleStoreStatus(summary.status ? summary : s);
     const storeLink = safeUrl(s.url);
-    const storeName = storeLink ? `<a class="sc-name sc-store-link" href="${storeLink}" target="_blank" rel="noopener noreferrer" title="打开店铺">${escapeHtml(s.name||s.id)}</a>` : `<span class="sc-name">${escapeHtml(s.name||s.id)}</span>`;
+    const storeLinkActions = storeLink
+      ? `<button data-action="open-store-link" data-store-url="${escapeHtml(storeLink)}">跳转店铺</button><button data-action="copy-store-link" data-store-url="${escapeHtml(storeLink)}">复制链接</button>`
+      : '';
+    const storeName = `<span class="store-link-control"><button class="sc-name sc-store-link" data-action="toggle-store-link-menu" data-store-id="${escapeHtml(s.id)}" aria-expanded="${openStoreLinkMenuId === s.id}" title="店铺操作">${escapeHtml(s.name||s.id)}</button><span class="store-link-popover ${openStoreLinkMenuId === s.id ? 'visible' : ''}">${storeLinkActions}<button class="store-link-hide" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏店铺</button></span></span>`;
     if (!(s.products || []).length && displayStatus === 'pending') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-loading">正在获取商品数据...</div></div>`;
     if (!(s.products || []).length && displayStatus === 'error') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(summary.error||s.error||'获取失败')}</div><div class="sc-actions"><button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
 
@@ -2586,22 +2680,42 @@ function renderStores() {
     const storePriceMin = storePrices.length ? Math.min(...storePrices) : 0;
     const storePriceMax = storePrices.length ? Math.max(...storePrices) : 100;
     let gridItems = [];
+    let visitorExpandButton = '';
     if (!products.length) {
       gridItems.push('<div class="empty-grid">该分类下无商品</div>');
     } else {
       const inStock = products.filter(p => p.stock > 0);
       const noStock = products.filter(p => !(p.stock > 0));
-      const expanded = expandedNoStock[id];
-      const showNoStock = expanded ? noStock : noStock.slice(0, 3);
+      const visitorPreview = _userRole === 'viewer';
+      const rowLimit = visitorPreview ? visitorProductRowLimit(container) : Infinity;
+      const visitorLevel = Math.min(2, Math.max(0, Number(visitorStoreExpansion[id] || 0)));
+      const visitorProducts = inStock.concat(noStock);
+      const visitorLimit = visitorLevel === 0 ? rowLimit : visitorLevel === 1 ? rowLimit * 2 : Infinity;
+      const visibleVisitorProducts = visitorPreview ? visitorProducts.slice(0, visitorLimit) : [];
+      const expanded = !visitorPreview && expandedNoStock[id];
+      const showNoStock = visitorPreview
+        ? []
+        : (expanded ? noStock : noStock.slice(0, 3));
       const hidden = noStock.length - showNoStock.length;
-      const allCards = inStock.map(p => renderProductCard(p)).concat(showNoStock.map(p => renderProductCard(p)));
+      const allCards = visitorPreview
+        ? visibleVisitorProducts.map(p => renderProductCard(p))
+        : inStock.map(p => renderProductCard(p)).concat(showNoStock.map(p => renderProductCard(p)));
+      if (visitorPreview && visitorProducts.length > rowLimit) {
+        const allVisible = visibleVisitorProducts.length >= visitorProducts.length;
+        const collapseButton = `<button class="visitor-more-btn collapse" data-action="set-visitor-store-expansion" data-store-id="${escapeHtml(id)}" data-level="0"><span>收起</span><i aria-hidden="true"></i></button>`;
+        const moreButton = `<button class="visitor-more-btn" data-action="set-visitor-store-expansion" data-store-id="${escapeHtml(id)}" data-level="${Math.min(2, visitorLevel + 1)}"><span>更多商品</span><i aria-hidden="true"></i></button>`;
+        const controls = visitorLevel === 0
+          ? moreButton
+          : allVisible ? collapseButton : `${moreButton}${collapseButton}`;
+        visitorExpandButton = `<div class="visitor-expand-row">${controls}</div>`;
+      }
       for (const card of allCards) {
         if (cardCount >= renderLimit) { reachedLimit = true; break; }
         gridItems.push(card);
         cardCount++;
       }
       if (!reachedLimit) {
-        if (hidden > 0) gridItems.push(`<div class="ns-toggle" data-action="toggle-no-stock" data-store-id="${escapeHtml(id)}">展开 ${noStock.length} 个无货商品...</div>`);
+        if (!visitorPreview && hidden > 0) gridItems.push(`<div class="ns-toggle" data-action="toggle-no-stock" data-store-id="${escapeHtml(id)}">展开 ${noStock.length} 个无货商品...</div>`);
         if (expanded && noStock.length > 0) gridItems.push(`<div class="ns-toggle" data-action="toggle-no-stock" data-store-id="${escapeHtml(id)}">收起无货商品</div>`);
       }
     }
@@ -2609,18 +2723,17 @@ function renderStores() {
     return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">
       <div class="sc-header">
         ${storeName}
-        <span class="sc-time">${formatTime(summary.lastUpdated || s.lastUpdated)}</span>
         <span class="sc-meta">${products.length} 个商品</span>
+        <span class="sc-time">${formatTime(summary.lastUpdated || s.lastUpdated)}</span>
         <span class="sc-sync-status ${displayStatus}" title="${displayStatus === 'error' ? escapeHtml(summary.error || '更新失败') : ''}">${displayStatus === 'pending' ? '更新中' : displayStatus === 'error' ? '更新失败' : ''}</span>
         <div class="sc-actions">
           <button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button>
-          <button class="history-store-btn" data-action="open-history-store" data-store-id="${escapeHtml(s.id)}" title="查看该店铺历史最低价">历史最低</button>
-          <button class="copy-store-btn" data-action="copy-store-link" data-store-url="${escapeHtml(s.url || '')}" title="复制店铺链接">复制链接</button>
-          <button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button>
+          <button class="history-store-btn" data-action="open-history-store" data-store-id="${escapeHtml(s.id)}" title="查看该店铺历史最低价">史低</button>
           <button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button>
         </div>
       </div>
       <div class="product-grid">${gridItems.join('')}</div>
+      ${visitorExpandButton}
     </div>`;
   }).join('');
   const hasMore = cardCount >= renderLimit && filtered.length > cardCount;
@@ -2639,6 +2752,22 @@ function renderStores() {
     button.setAttribute('title', '查看价格走势');
   });
   observeSentinel();
+}
+
+function visitorProductRowLimit(container) {
+  if (window.matchMedia('(max-width: 420px)').matches) return 1;
+  if (window.matchMedia('(max-width: 760px)').matches) return 2;
+  const availableWidth = Math.max(210, container.clientWidth - 48);
+  return Math.max(1, Math.floor((availableWidth + 8) / 218));
+}
+
+function setVisitorStoreExpansion(storeId, level) {
+  if (_userRole !== 'viewer' || !storeId) return;
+  visitorStoreExpansion[storeId] = Math.min(2, Math.max(0, Number(level) || 0));
+  if (visitorStoreExpansion[storeId] === 2) {
+    renderLimit = Math.max(renderLimit, getFilteredProducts().length + 1);
+  }
+  renderStores();
 }
 
 function updateRenderedStoreStatuses() {
@@ -2675,7 +2804,32 @@ async function copyStoreLink(url) {
     document.execCommand('copy');
     input.remove();
   }
+  closeStoreLinkMenu();
   showToast('店铺链接已复制');
+}
+
+function toggleStoreLinkMenu(storeId) {
+  openStoreLinkMenuId = openStoreLinkMenuId === storeId ? '' : storeId;
+  document.querySelectorAll('.store-link-popover').forEach(popover => {
+    popover.classList.toggle('visible', popover.closest('.store-card')?.dataset.storeId === openStoreLinkMenuId);
+  });
+  document.querySelectorAll('[data-action="toggle-store-link-menu"]').forEach(button => {
+    button.setAttribute('aria-expanded', String(button.dataset.storeId === openStoreLinkMenuId));
+  });
+}
+
+function closeStoreLinkMenu() {
+  if (!openStoreLinkMenuId) return;
+  openStoreLinkMenuId = '';
+  document.querySelectorAll('.store-link-popover.visible').forEach(popover => popover.classList.remove('visible'));
+  document.querySelectorAll('[data-action="toggle-store-link-menu"][aria-expanded="true"]').forEach(button => button.setAttribute('aria-expanded', 'false'));
+}
+
+function openStoreLink(url) {
+  const normalized = safeUrl(url);
+  if (!normalized) return;
+  closeStoreLinkMenu();
+  window.open(normalized, '_blank', 'noopener,noreferrer');
 }
 
 let _loadingMore = false;
