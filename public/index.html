@@ -6,7 +6,7 @@
   <script>if ('scrollRestoration' in history) history.scrollRestoration = 'manual';</script>
   <title>AI价格监控</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/style.css?v=20260727-mobile-scroll">
+  <link rel="stylesheet" href="/style.css?v=20260727-refresh-fallback">
 </head>
 <body>
   <header class="app-header">
@@ -268,6 +268,10 @@
           </div>
           <div id="settingsPanelRefresh" class="settings-panel-item">
             <div class="settings-section">
+              <label class="settings-radio"><input type="radio" name="refreshMode" value="disabled"><span>停止自动刷新</span></label>
+            </div>
+            <div class="settings-divider"></div>
+            <div class="settings-section">
               <label class="settings-radio"><input type="radio" name="refreshMode" value="random"><span>随机区间</span></label>
               <div class="settings-inline">最小 <input type="number" id="refreshMin" class="settings-num" min="1"> 分钟 &nbsp; 最大 <input type="number" id="refreshMax" class="settings-num" min="1"> 分钟</div>
             </div>
@@ -357,6 +361,6 @@
   </div>
 
   <script src="/chart.umd.min.js"></script>
-  <script src="/app.js?v=20260727-mobile-scroll"></script>
+  <script src="/app.js?v=20260727-disable-auto-refresh"></script>
 </body>
 </html>

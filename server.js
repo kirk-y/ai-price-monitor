@@ -763,7 +763,9 @@ app.get('/api/refresh-config', (req, res) => {
 
 app.put('/api/refresh-config', requireAdmin, (req, res) => {
   try {
-    res.json(store.updateRefreshConfig(req.body));
+    const config = store.updateRefreshConfig(req.body);
+    resetAutoRefreshSchedule(config);
+    res.json({ ...config, nextRefreshAt });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
@@ -914,7 +916,7 @@ function recoverInterruptedRefreshes() {
 const server = app.listen(PORT, HOST, () => {
   console.log(`AI价格监控服务已启动: http://${HOST}:${PORT}`);
   recoverInterruptedRefreshes();
-  startAutoRefresh();
+  resetAutoRefreshSchedule(store.getRefreshConfig());
 });
 
 server.on('error', (err) => {
@@ -925,22 +927,57 @@ server.on('error', (err) => {
 });
 
 let nextRefreshAt = null;
+let autoRefreshTimer = null;
+let autoRefreshScheduleVersion = 0;
 const autoRefreshAttempts = new Map();
 
 function randomBetween(min, max) {
   return Math.floor(Math.random() * (max - min + 1) + min) * 60 * 1000;
 }
 
-function scheduleNextRefresh(delay) {
-  nextRefreshAt = Date.now() + delay;
-  console.log(`下次自动刷新: ${Math.round(delay/60000)} 分钟后`);
-  setTimeout(startAutoRefresh, delay);
+function cancelQueuedAutoRefreshes() {
+  for (let index = refreshQueue.length - 1; index >= 0; index--) {
+    const job = refreshQueue[index];
+    if (job.reason !== 'auto') continue;
+    refreshQueue.splice(index, 1);
+    queuedRefreshes.delete(job.storeId);
+    job.resolve();
+  }
 }
 
-async function startAutoRefresh() {
+function autoRefreshDelay(config) {
+  return config.mode === 'fixed'
+    ? config.fixedMinutes * 60 * 1000
+    : randomBetween(config.minMinutes || 60, config.maxMinutes || 360);
+}
+
+function resetAutoRefreshSchedule(config, { immediate = false } = {}) {
+  autoRefreshScheduleVersion++;
+  clearTimeout(autoRefreshTimer);
+  autoRefreshTimer = null;
+  nextRefreshAt = null;
+  if (config.mode === 'disabled') {
+    cancelQueuedAutoRefreshes();
+    console.log('自动刷新已停止');
+    return;
+  }
+  if (immediate) startAutoRefresh(autoRefreshScheduleVersion);
+  else scheduleNextRefresh(autoRefreshDelay(config), autoRefreshScheduleVersion);
+}
+
+function scheduleNextRefresh(delay, version = autoRefreshScheduleVersion) {
+  clearTimeout(autoRefreshTimer);
+  nextRefreshAt = Date.now() + delay;
+  console.log(`下次自动刷新: ${Math.round(delay/60000)} 分钟后`);
+  autoRefreshTimer = setTimeout(() => startAutoRefresh(version), delay);
+}
+
+async function startAutoRefresh(version = autoRefreshScheduleVersion) {
+  if (version !== autoRefreshScheduleVersion) return;
   nextRefreshAt = null;
   const all = store.getAllStores();
   const cfg = store.getRefreshConfig();
+  if (cfg.mode === 'disabled') return;
   const thresholdMinutes = cfg.mode === 'fixed'
     ? cfg.fixedMinutes
     : Math.max(1, cfg.minMinutes || 60);
@@ -958,11 +995,8 @@ async function startAutoRefresh() {
   // 自动刷新批次仍使用统一队列，逐店执行；手动任务可优先插入。
   await Promise.all(due.map(item => enqueueStoreRefresh(item.id, item.url, 'auto')));
 
-  let delay;
-  if (cfg.mode === 'fixed') {
-    delay = cfg.fixedMinutes * 60 * 1000;
-  } else {
-    delay = randomBetween(cfg.minMinutes || 60, cfg.maxMinutes || 360);
-  }
-  scheduleNextRefresh(delay);
+  if (version !== autoRefreshScheduleVersion) return;
+  const latestConfig = store.getRefreshConfig();
+  if (latestConfig.mode === 'disabled') return;
+  scheduleNextRefresh(autoRefreshDelay(latestConfig), version);
 }

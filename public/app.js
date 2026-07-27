@@ -17,8 +17,7 @@ let plusDetailsExpanded = activeCatL2 === 'gpt_plus';
 let activePlusDetail = localStorage.getItem('activePlusDetail') || 'all';
 let bestPricePlusExpanded = localStorage.getItem('bestPricePlusExpanded') === 'true';
 let renderLimit = 30;
-let expandedNoStock = {};
-let visitorStoreExpansion = {};
+let storeProductExpansion = {};
 let openStoreLinkMenuId = '';
 let includeWords = [];
 let excludeWords = [];
@@ -300,8 +299,7 @@ function handleActionClick(event) {
     'toggle-history-cat': () => toggleHistoryBestCategory(target.dataset.category),
     'exit-history-best': () => exitHistoricalBestView(),
     'delete-store': () => deleteStore(target.dataset.storeId),
-    'toggle-no-stock': () => toggleNoStock(target.dataset.storeId),
-    'set-visitor-store-expansion': () => setVisitorStoreExpansion(target.dataset.storeId, Number(target.dataset.level)),
+    'set-store-expansion': () => setStoreExpansion(target.dataset.storeId, Number(target.dataset.level)),
     'hide-store': () => { closeStoreLinkMenu(); hideStore(target.dataset.storeId); },
     'toggle-store-link-menu': () => toggleStoreLinkMenu(target.dataset.storeId),
     'open-store-link': () => openStoreLink(target.dataset.storeUrl),
@@ -583,6 +581,7 @@ function initSettings() {
   document.getElementById('settingsImportBtn').addEventListener('click', () => document.getElementById('settingsImportFile').click());
   document.getElementById('settingsImportFile').addEventListener('change', importData);
   document.getElementById('saveRefreshBtn').addEventListener('click', saveRefreshConfig);
+  document.querySelectorAll('input[name="refreshMode"]').forEach(input => input.addEventListener('change', syncRefreshModeControls));
   document.getElementById('saveKeywordsBtn').addEventListener('click', saveKeywords);
   document.getElementById('storeExportBtn').addEventListener('click', exportSingleStore);
   document.getElementById('storeListExportBtn').addEventListener('click', () => downloadBlob('/api/stores/export-list', 'stores-list.json'));
@@ -624,14 +623,12 @@ function openSettings() {
   const sortMode = userPreferences.storeSortMode === 'fixed' ? 'fixed' : 'price';
   const sortInput = document.querySelector(`input[name="storeSortMode"][value="${sortMode}"]`);
   if (sortInput) sortInput.checked = true;
-  if (cfg.mode === 'fixed') {
-    document.querySelector('input[name="refreshMode"][value="fixed"]').checked = true;
-  } else {
-    document.querySelector('input[name="refreshMode"][value="random"]').checked = true;
-  }
+  const refreshMode = ['fixed', 'random', 'disabled'].includes(cfg.mode) ? cfg.mode : 'random';
+  document.querySelector(`input[name="refreshMode"][value="${refreshMode}"]`).checked = true;
   document.getElementById('refreshMin').value = cfg.minMinutes || 60;
   document.getElementById('refreshMax').value = cfg.maxMinutes || 360;
   document.getElementById('refreshFixed').value = cfg.fixedMinutes || 120;
+  syncRefreshModeControls();
   document.getElementById('refreshSaveMsg').textContent = '';
   document.getElementById('keywordsTextarea').value = (filterConfig.suggestedKeywords || suggestedKeywords).join('\n');
   document.getElementById('keywordsSaveMsg').textContent = '';
@@ -652,8 +649,16 @@ function openSettings() {
 let _nextRefreshTimer = null;
 let _refreshConfigReloading = false;
 
+function syncRefreshModeControls() {
+  const mode = document.querySelector('input[name="refreshMode"]:checked')?.value || 'random';
+  document.getElementById('refreshMin').disabled = mode !== 'random';
+  document.getElementById('refreshMax').disabled = mode !== 'random';
+  document.getElementById('refreshFixed').disabled = mode !== 'fixed';
+}
+
 function renderNextRefresh(ts) {
   const el = document.getElementById('nextRefreshInfo');
+  if (refreshConfig.mode === 'disabled') { el.textContent = '自动刷新已停止'; return; }
   if (!ts) { el.textContent = '暂无下次刷新安排'; return; }
   const diff = ts - Date.now();
   if (diff <= 0) { el.textContent = '即将刷新...'; return; }
@@ -664,7 +669,7 @@ function renderNextRefresh(ts) {
 
 function startNextRefreshTimer(ts) {
   clearInterval(_nextRefreshTimer);
-  if (!ts) return;
+  if (!ts || refreshConfig.mode === 'disabled') return;
   _nextRefreshTimer = setInterval(() => {
     const el = document.getElementById('nextRefreshInfo');
     if (!el || document.getElementById('settingsModal').style.display !== 'block') {
@@ -1481,7 +1486,13 @@ async function loadStoreBatch(storeIds, force = false) {
   if (!response.ok) throw new Error(data.error || '店铺数据加载失败');
   for (const full of data.stores || []) {
     const index = stores.findIndex(store => store.id === full.id);
-    if (index >= 0) stores[index] = full; else stores.push(full);
+    if (index >= 0) {
+      const previous = stores[index];
+      const preserveProducts = full.status === 'error'
+        && !(full.products || []).length
+        && (previous.products || []).length;
+      stores[index] = preserveProducts ? { ...full, products: previous.products, partial: false } : full;
+    } else stores.push(full);
   }
   for (const label of data.productLabels || []) productLabels[label.product_key] = label;
   applyStoreOrder();
@@ -1631,6 +1642,14 @@ function cacheStoreLowestPrice(indexKey, product) {
   if (current === undefined || product.price < current) prices.set(product.storeId, product.price);
 }
 
+function storeEligibleForCurrentPrice(storeId) {
+  return storeSummaries.find(store => store.id === storeId)?.status !== 'error';
+}
+
+function eligibleStorePriceMap(prices) {
+  return new Map([...prices].filter(([storeId]) => storeEligibleForCurrentPrice(storeId)));
+}
+
 function rebuildStoreLowestPriceIndex(products) {
   storeLowestPriceIndex = new Map();
   for (const product of products) {
@@ -1650,16 +1669,16 @@ function activeStorePriceIndex() {
   if (includeWords.length || excludeWords.length) {
     const prices = new Map();
     for (const product of getFilteredProducts()) {
-      if (!(product.stock > 0) || !(product.price > 0)) continue;
+      if (!storeEligibleForCurrentPrice(product.storeId) || !(product.stock > 0) || !(product.price > 0)) continue;
       const current = prices.get(product.storeId);
       if (current === undefined || product.price < current) prices.set(product.storeId, product.price);
     }
     return prices;
   }
-  if (activeCatL2 === 'gpt_plus') return storeLowestPriceIndex.get(`plus:${activePlusDetail}`) || new Map();
-  if (activeCatL2) return storeLowestPriceIndex.get(`l2:${activeCatL2}`) || new Map();
-  if (activeCatL1) return storeLowestPriceIndex.get(`l1:${activeCatL1}`) || new Map();
-  return storeLowestPriceIndex.get('all') || new Map();
+  if (activeCatL2 === 'gpt_plus') return eligibleStorePriceMap(storeLowestPriceIndex.get(`plus:${activePlusDetail}`) || new Map());
+  if (activeCatL2) return eligibleStorePriceMap(storeLowestPriceIndex.get(`l2:${activeCatL2}`) || new Map());
+  if (activeCatL1) return eligibleStorePriceMap(storeLowestPriceIndex.get(`l1:${activeCatL1}`) || new Map());
+  return eligibleStorePriceMap(storeLowestPriceIndex.get('all') || new Map());
 }
 
 function storeSortMode() {
@@ -1674,7 +1693,7 @@ function setStoreSortMode(mode) {
 }
 
 function renderAfterCategoryChange() {
-  visitorStoreExpansion = {};
+  storeProductExpansion = {};
   if (storeSortMode() === 'price') activeBrowseStoreId = '';
   render();
   if (storeSortMode() === 'price') {
@@ -1719,7 +1738,8 @@ function getFilteredProducts() {
 
 function computeBestPrices() {
   const cats = ['gpt_plus', 'gpt_pro', 'gpt_team', 'sms'];
-  const all = (includeWords.length || excludeWords.length) ? getFilteredProducts() : getAllProducts().filter(p => !isStoreHidden(p.storeId));
+  const all = ((includeWords.length || excludeWords.length) ? getFilteredProducts() : getAllProducts().filter(p => !isStoreHidden(p.storeId)))
+    .filter(product => storeEligibleForCurrentPrice(product.storeId));
   const result = {};
   for (const cat of cats) {
     const detail = cat === 'gpt_plus' && activeCatL2 === 'gpt_plus' ? activePlusDetail : 'all';
@@ -2457,7 +2477,7 @@ function hideStoreLoadingOverlay() {
 }
 
 function renderBestPrices() {
-  let pool = getAllProducts().filter(p => !isStoreHidden(p.storeId));
+  let pool = getAllProducts().filter(p => !isStoreHidden(p.storeId) && storeEligibleForCurrentPrice(p.storeId));
   if (includeWords.length || excludeWords.length) pool = pool.filter(p => matchesSearch(p.name));
   const gptEntries = visibleCatEntries().filter(([k]) => isGptCategory(k) && pool.some(product => product.category === k));
   const renderItem = (category, label, detail = 'all', child = false) => {
@@ -2763,54 +2783,42 @@ function renderStores() {
       : '';
     const storeName = `<span class="store-link-control"><button class="sc-name sc-store-link" data-action="toggle-store-link-menu" data-store-id="${escapeHtml(s.id)}" aria-expanded="${openStoreLinkMenuId === s.id}" title="店铺操作">${escapeHtml(s.name||s.id)}</button><span class="store-link-popover ${openStoreLinkMenuId === s.id ? 'visible' : ''}">${storeLinkActions}<button class="store-link-hide" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏店铺</button></span></span>`;
     if (!(s.products || []).length && displayStatus === 'pending') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-loading">正在获取商品数据...</div></div>`;
-    if (!(s.products || []).length && displayStatus === 'error') return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(summary.error||s.error||'获取失败')}</div><div class="sc-actions"><button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
+    if (!(s.products || []).length && displayStatus === 'error') return `<div class="store-card store-status-error" data-store-id="${escapeHtml(s.id)}">${storeName}<div class="store-error">${escapeHtml(summary.error||s.error||'获取失败')}</div><div class="sc-actions"><button class="ref-btn" data-action="refresh-store" data-store-id="${escapeHtml(s.id)}">更新</button><button class="hide-btn" data-action="hide-store" data-store-id="${escapeHtml(s.id)}">隐藏</button><button class="del-btn admin-only" data-action="delete-store" data-store-id="${escapeHtml(s.id)}">删除</button></div></div>`;
 
     let products = filtered.filter(p => p.storeId === id);
     const storePrices = products.map(p => p.price).filter(v => v > 0);
     const storePriceMin = storePrices.length ? Math.min(...storePrices) : 0;
     const storePriceMax = storePrices.length ? Math.max(...storePrices) : 100;
     let gridItems = [];
-    let visitorExpandButton = '';
+    let productExpandButton = '';
     if (!products.length) {
       gridItems.push('<div class="empty-grid">该分类下无商品</div>');
     } else {
       const inStock = products.filter(p => p.stock > 0);
       const noStock = products.filter(p => !(p.stock > 0));
-      const visitorPreview = _userRole === 'viewer';
-      const rowLimit = visitorPreview ? visitorProductRowLimit(container) : Infinity;
-      const visitorLevel = Math.min(2, Math.max(0, Number(visitorStoreExpansion[id] || 0)));
-      const visitorProducts = inStock.concat(noStock);
-      const visitorLimit = visitorLevel === 0 ? rowLimit : visitorLevel === 1 ? rowLimit * 2 : Infinity;
-      const visibleVisitorProducts = visitorPreview ? visitorProducts.slice(0, visitorLimit) : [];
-      const expanded = !visitorPreview && expandedNoStock[id];
-      const showNoStock = visitorPreview
-        ? []
-        : (expanded ? noStock : noStock.slice(0, 3));
-      const hidden = noStock.length - showNoStock.length;
-      const allCards = visitorPreview
-        ? visibleVisitorProducts.map(p => renderProductCard(p))
-        : inStock.map(p => renderProductCard(p)).concat(showNoStock.map(p => renderProductCard(p)));
-      if (visitorPreview && visitorProducts.length > rowLimit) {
-        const allVisible = visibleVisitorProducts.length >= visitorProducts.length;
-        const collapseButton = `<button class="visitor-more-btn collapse" data-action="set-visitor-store-expansion" data-store-id="${escapeHtml(id)}" data-level="0"><span>收起</span><i aria-hidden="true"></i></button>`;
-        const moreButton = `<button class="visitor-more-btn" data-action="set-visitor-store-expansion" data-store-id="${escapeHtml(id)}" data-level="${Math.min(2, visitorLevel + 1)}"><span>更多商品</span><i aria-hidden="true"></i></button>`;
-        const controls = visitorLevel === 0
+      const rowLimit = storeProductRowLimit(container);
+      const expansionLevel = Math.min(2, Math.max(0, Number(storeProductExpansion[id] || 0)));
+      const orderedProducts = inStock.concat(noStock);
+      const productLimit = expansionLevel === 0 ? rowLimit : expansionLevel === 1 ? rowLimit * 2 : Infinity;
+      const visibleProducts = orderedProducts.slice(0, productLimit);
+      const allCards = visibleProducts.map(p => renderProductCard(p));
+      if (orderedProducts.length > rowLimit) {
+        const allVisible = visibleProducts.length >= orderedProducts.length;
+        const collapseButton = `<button class="visitor-more-btn collapse" data-action="set-store-expansion" data-store-id="${escapeHtml(id)}" data-level="0"><span>收起</span><i aria-hidden="true"></i></button>`;
+        const moreButton = `<button class="visitor-more-btn" data-action="set-store-expansion" data-store-id="${escapeHtml(id)}" data-level="${Math.min(2, expansionLevel + 1)}"><span>更多商品</span><i aria-hidden="true"></i></button>`;
+        const controls = expansionLevel === 0
           ? moreButton
           : allVisible ? collapseButton : `${moreButton}${collapseButton}`;
-        visitorExpandButton = `<div class="visitor-expand-row">${controls}</div>`;
+        productExpandButton = `<div class="visitor-expand-row">${controls}</div>`;
       }
       for (const card of allCards) {
         if (cardCount >= renderLimit) { reachedLimit = true; break; }
         gridItems.push(card);
         cardCount++;
       }
-      if (!reachedLimit) {
-        if (!visitorPreview && hidden > 0) gridItems.push(`<div class="ns-toggle" data-action="toggle-no-stock" data-store-id="${escapeHtml(id)}">展开 ${noStock.length} 个无货商品...</div>`);
-        if (expanded && noStock.length > 0) gridItems.push(`<div class="ns-toggle" data-action="toggle-no-stock" data-store-id="${escapeHtml(id)}">收起无货商品</div>`);
-      }
     }
     if (reachedLimit && !gridItems.length) return '';
-    return `<div class="store-card" data-store-id="${escapeHtml(s.id)}">
+    return `<div class="store-card store-status-${displayStatus}" data-store-id="${escapeHtml(s.id)}">
       <div class="sc-header">
         <div class="sc-store-info">
           ${storeName}
@@ -2825,7 +2833,7 @@ function renderStores() {
         </div>
       </div>
       <div class="product-grid">${gridItems.join('')}</div>
-      ${visitorExpandButton}
+      ${productExpandButton}
     </div>`;
   }).join('');
   const hasMore = cardCount >= renderLimit && filtered.length > cardCount;
@@ -2846,17 +2854,17 @@ function renderStores() {
   observeSentinel();
 }
 
-function visitorProductRowLimit(container) {
+function storeProductRowLimit(container) {
   if (window.matchMedia('(max-width: 420px)').matches) return 1;
   if (window.matchMedia('(max-width: 760px)').matches) return 2;
   const availableWidth = Math.max(210, container.clientWidth - 48);
   return Math.max(1, Math.floor((availableWidth + 8) / 218));
 }
 
-function setVisitorStoreExpansion(storeId, level) {
-  if (_userRole !== 'viewer' || !storeId) return;
-  visitorStoreExpansion[storeId] = Math.min(2, Math.max(0, Number(level) || 0));
-  if (visitorStoreExpansion[storeId] === 2) {
+function setStoreExpansion(storeId, level) {
+  if (!storeId) return;
+  storeProductExpansion[storeId] = Math.min(2, Math.max(0, Number(level) || 0));
+  if (storeProductExpansion[storeId] === 2) {
     renderLimit = Math.max(renderLimit, getFilteredProducts().length + 1);
   }
   renderStores();
@@ -2868,6 +2876,8 @@ function updateRenderedStoreStatuses() {
     const summary = summaries.get(card.dataset.storeId);
     if (!summary) return;
     const status = visibleStoreStatus(summary);
+    card.classList.remove('store-status-ok', 'store-status-pending', 'store-status-error');
+    card.classList.add(`store-status-${status}`);
     const indicator = card.querySelector('.sc-sync-status');
     if (indicator) {
       indicator.className = `sc-sync-status ${status}`;
@@ -3430,8 +3440,12 @@ async function refreshStore(id, silent) {
     flashSuccess(id);
     if (!silent) render();
   } catch (error) {
+    storeSummaries = storeSummaries.map(store => store.id === id
+      ? { ...store, status: 'error', error: error.message || '店铺更新失败' }
+      : store);
     if (!silent) alert('刷新失败: ' + error.message);
     renderStoreList();
+    renderBestPrices();
     updateRenderedStoreStatuses();
   } finally {
     refreshingStores.delete(id);
@@ -3498,6 +3512,10 @@ function startStoreStatusPolling() {
         return !prev || prev.status !== next.status || prev.lastUpdated !== next.lastUpdated || prev.productCount !== next.productCount;
       });
       if (!changed) return;
+      const priceEligibilityChanged = summary.some(next => {
+        const previous = storeSummaries.find(store => store.id === next.id);
+        return previous && (previous.status === 'error') !== (next.status === 'error');
+      });
       storeSummaries = summary;
       applyStoreOrder();
       if (refreshedStoreIds.length) {
@@ -3506,6 +3524,7 @@ function startStoreStatusPolling() {
         renderBestPrices();
         renderPriceRange();
       }
+      if (priceEligibilityChanged && !refreshedStoreIds.length) renderBestPrices();
       renderStoreList();
       renderActiveStoreCard();
       updateRenderedStoreStatuses();
@@ -3711,11 +3730,6 @@ function applyPriceFilter() {
     const show = (!priceRange.min || p >= priceRange.min) && (!priceRange.max || p <= priceRange.max) || p > 200;
     el.style.display = show ? '' : 'none';
   });
-}
-
-function toggleNoStock(id) {
-  expandedNoStock[id] = !expandedNoStock[id];
-  renderStores();
 }
 
 async function deleteStore(id) {

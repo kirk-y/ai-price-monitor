@@ -898,6 +898,10 @@ button:disabled {
   text-decoration: underline;
 }
 
+.store-card.store-status-error .sc-name {
+  color: var(--danger);
+}
+
 .sc-time,
 .sc-meta {
   flex-shrink: 0;

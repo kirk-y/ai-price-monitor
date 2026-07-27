@@ -41,8 +41,8 @@ function validateCategory(value) {
 
 function normalizeRefreshConfig(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('刷新配置格式错误');
-  const mode = value.mode === 'fixed' ? 'fixed' : value.mode === 'random' ? 'random' : null;
-  if (!mode) throw new Error('刷新模式必须为 fixed 或 random');
+  const mode = ['fixed', 'random', 'disabled'].includes(value.mode) ? value.mode : null;
+  if (!mode) throw new Error('刷新模式必须为 fixed、random 或 disabled');
 
   const toMinutes = (input, field) => {
     const n = Number(input);

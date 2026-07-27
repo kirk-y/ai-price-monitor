@@ -27,6 +27,9 @@ test('refresh config prevents zero-delay and inverted schedules', () => {
   assert.deepEqual(normalizeRefreshConfig({ mode: 'fixed', fixedMinutes: 30 }), {
     mode: 'fixed', minMinutes: 60, maxMinutes: 360, fixedMinutes: 30,
   });
+  assert.deepEqual(normalizeRefreshConfig({ mode: 'disabled' }), {
+    mode: 'disabled', minMinutes: 60, maxMinutes: 360, fixedMinutes: 120,
+  });
 });
 
 test('category and store order validation reject injection-shaped input', () => {
