@@ -2526,6 +2526,23 @@ body.dark .tag-gptk12 { background: color-mix(in srgb, #167e8d 28%, transparent)
     gap: 6px;
   }
 }
+
+.refresh-center-content { width: min(680px, calc(100% - 32px)); }
+.refresh-center-content h2 { margin: 0 40px 18px 0; font-size: 20px; }
+.refresh-center-status { padding: 14px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); color: var(--text2); line-height: 1.7; }
+.refresh-log-list { display: grid; gap: 5px; margin-top: 10px; border-top: 1px solid var(--border); padding-top: 8px; font-size: 11px; }
+.refresh-log-row { display: grid; grid-template-columns: 58px 32px minmax(70px, .8fr) minmax(0, 1.4fr); gap: 8px; align-items: baseline; }
+.refresh-log-row time, .refresh-log-row em { overflow: hidden; color: var(--text3); font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.refresh-center-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 10px; }
+.refresh-center-note { color: var(--text3); font-size: 12px; }
+.refresh-advanced { margin-top: 20px; border-top: 1px solid var(--border); padding-top: 18px; }
+.refresh-advanced h3 { margin: 0 0 14px; font-size: 14px; }
+.refresh-advanced-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.refresh-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 18px; margin-bottom: 16px; }
+.refresh-fields label { display: grid; gap: 6px; color: var(--text2); font-size: 12px; }
+.refresh-fields input, .refresh-fields select { width: 100%; min-width: 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--card-bg); color: var(--text); padding: 8px 10px; }
+.refresh-fields label > span { display: grid; grid-template-columns: 1fr 12px 1fr; align-items: center; text-align: center; }
+@media (max-width: 600px) { .refresh-fields { grid-template-columns: 1fr; } }
 .category-manager { margin: 8px 0 12px; }
 .category-manager-title { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
 .category-manager-form { display: flex; gap: 6px; flex-wrap: wrap; }

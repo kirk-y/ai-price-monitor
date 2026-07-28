@@ -573,7 +573,14 @@ function trackNewKeyword(key) {
 }
 
 function initSettings() {
-  document.getElementById('refreshAllBtn').addEventListener('click', refreshAllStores);
+  const refreshCenterButton = document.getElementById('refreshAllBtn');
+  refreshCenterButton.innerHTML = '<span class="button-icon" aria-hidden="true">&#9881;</span><span>刷新设置</span>';
+  refreshCenterButton.addEventListener('click', openRefreshCenter);
+  document.querySelector('.close-refresh-center').addEventListener('click', closeRefreshCenter);
+  document.querySelectorAll('[data-refresh-type]').forEach(button => button.addEventListener('click', () => runRefreshCenterBatch(button.dataset.refreshType)));
+  document.getElementById('stopRefreshQueueBtn').addEventListener('click', stopRefreshCenterBatch);
+  document.getElementById('saveRefreshCenterBtn').addEventListener('click', saveRefreshCenterConfig);
+  document.getElementById('resetRefreshBudgetBtn').addEventListener('click', resetRefreshBudget);
   document.getElementById('historyBestBtn').addEventListener('click', openHistoricalBestGlobal);
   document.getElementById('settingsBtn').addEventListener('click', openSettings);
   document.querySelector('.close-settings').addEventListener('click', closeSettings);
@@ -654,6 +661,125 @@ function syncRefreshModeControls() {
   document.getElementById('refreshMin').disabled = mode !== 'random';
   document.getElementById('refreshMax').disabled = mode !== 'random';
   document.getElementById('refreshFixed').disabled = mode !== 'fixed';
+}
+
+let refreshCenterTimer = null;
+
+function fillRefreshCenterConfig() {
+  const cfg = refreshConfig || {};
+  document.getElementById('centerRefreshMode').value = cfg.mode === 'disabled' ? 'disabled' : 'random';
+  document.getElementById('centerPlusCycle').value = cfg.plusCycleMinutes || 60;
+  document.getElementById('centerProbeHours').value = cfg.typeProbeHours || 24;
+  document.getElementById('centerDelayMin').value = cfg.requestDelayMinSeconds || 20;
+  document.getElementById('centerDelayMax').value = cfg.requestDelayMaxSeconds || 60;
+  document.getElementById('centerRiskThreshold').value = cfg.riskThreshold || 2;
+  document.getElementById('centerRiskCooldown').value = cfg.riskCooldownMinutes || 60;
+  document.getElementById('centerHourlyLimit').value = cfg.hourlyRequestLimit || 60;
+}
+
+async function loadRefreshCenterStatus() {
+  try {
+    const response = await apiFetch('/api/refresh-status');
+    const status = await readApiResponse(response, '读取刷新状态失败');
+    const cooldown = status.riskCooldownUntil > Date.now()
+      ? `风控冷却至 ${new Date(status.riskCooldownUntil).toLocaleTimeString()}`
+      : (status.mode === 'disabled' ? '自动刷新已停止' : '自动刷新运行中');
+    const next = status.nextRefreshAt ? new Date(status.nextRefreshAt).toLocaleTimeString() : '暂无';
+    const eventLabels = { 'store.succeeded': '成功', 'store.failed': '失败', 'store.skipped': '跳过', 'store.started': '开始', 'batch.queued': '批次' };
+    const logs = (status.recentEvents || []).slice(0, 5).map(event => {
+      const time = new Date(event.time).toLocaleTimeString();
+      const target = event.storeId || `${event.stores || 0} 家店铺`;
+      const detail = event.error || event.reason || (event.products !== undefined ? `${event.products} 件商品` : '');
+      return `<div class="refresh-log-row"><time>${escapeHtml(time)}</time><strong>${escapeHtml(eventLabels[event.event] || event.event)}</strong><span>${escapeHtml(target)}</span><em>${escapeHtml(detail)}</em></div>`;
+    }).join('');
+    document.getElementById('refreshCenterStatus').innerHTML = `${escapeHtml(cooldown)}<br>队列 ${status.queueLength}，正在刷新 ${status.active.length} 家<br>本小时预算 ${status.hourlyRequests}/${status.hourlyRequestLimit}，下次巡检 ${escapeHtml(next)}${logs ? `<div class="refresh-log-list">${logs}</div>` : ''}`;
+  } catch (error) {
+    document.getElementById('refreshCenterStatus').textContent = error.message;
+  }
+}
+
+function openRefreshCenter() {
+  fillRefreshCenterConfig();
+  document.getElementById('refreshCenterMsg').textContent = '';
+  document.getElementById('refreshCenterModal').style.display = 'block';
+  loadRefreshCenterStatus();
+  clearInterval(refreshCenterTimer);
+  refreshCenterTimer = setInterval(loadRefreshCenterStatus, 3000);
+}
+
+function closeRefreshCenter() {
+  document.getElementById('refreshCenterModal').style.display = 'none';
+  clearInterval(refreshCenterTimer);
+}
+
+async function runRefreshCenterBatch(refreshType) {
+  const msg = document.getElementById('refreshCenterMsg');
+  const labels = { plus: 'Plus 刷新', probe: '类型探测', full: '完整扫描' };
+  if (refreshType === 'full' && !confirm('完整扫描请求量较大，确定继续吗？')) return;
+  try {
+    msg.textContent = `正在加入${labels[refreshType]}队列...`;
+    const storeIds = storeSummaries.filter(store => !isStoreHidden(store.id)).map(store => store.id);
+    const response = await apiFetch('/api/stores/refresh-all', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ storeIds, refreshType }),
+    });
+    const result = await readApiResponse(response, '创建刷新任务失败');
+    if (!response.ok) throw new Error(result.error || '创建刷新任务失败');
+    _refreshBatchId = result.batchId;
+    msg.textContent = `${labels[refreshType]}已加入队列`;
+    loadRefreshCenterStatus();
+  } catch (error) { msg.textContent = error.message; }
+}
+
+async function stopRefreshCenterBatch() {
+  if (!_refreshBatchId) return showToast('当前没有可停止的批次');
+  await apiFetch('/api/stores/refresh-all/cancel', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ batchId: _refreshBatchId }),
+  });
+  _refreshBatchId = '';
+  document.getElementById('refreshCenterMsg').textContent = '已停止尚未开始的刷新任务';
+  loadRefreshCenterStatus();
+}
+
+async function saveRefreshCenterConfig() {
+  const msg = document.getElementById('refreshCenterMsg');
+  const mode = document.getElementById('centerRefreshMode').value;
+  const config = {
+    ...refreshConfig,
+    mode,
+    minMinutes: Number(document.getElementById('centerPlusCycle').value),
+    maxMinutes: Number(document.getElementById('centerPlusCycle').value),
+    fixedMinutes: Number(document.getElementById('centerPlusCycle').value),
+    plusCycleMinutes: Number(document.getElementById('centerPlusCycle').value),
+    typeProbeHours: Number(document.getElementById('centerProbeHours').value),
+    requestDelayMinSeconds: Number(document.getElementById('centerDelayMin').value),
+    requestDelayMaxSeconds: Number(document.getElementById('centerDelayMax').value),
+    riskThreshold: Number(document.getElementById('centerRiskThreshold').value),
+    riskCooldownMinutes: Number(document.getElementById('centerRiskCooldown').value),
+    hourlyRequestLimit: Number(document.getElementById('centerHourlyLimit').value),
+  };
+  try {
+    const response = await apiFetch('/api/refresh-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
+    const result = await readApiResponse(response, '保存失败');
+    if (!response.ok) throw new Error(result.error || '保存失败');
+    refreshConfig = result;
+    msg.textContent = '刷新参数已保存';
+    loadRefreshCenterStatus();
+  } catch (error) { msg.textContent = error.message; }
+}
+
+async function resetRefreshBudget() {
+  const msg = document.getElementById('refreshCenterMsg');
+  try {
+    const response = await apiFetch('/api/refresh-budget/reset', { method: 'POST' });
+    const result = await readApiResponse(response, '重置失败');
+    if (!response.ok) throw new Error(result.error || '重置失败');
+    msg.textContent = `本小时请求计数已清零（原计数 ${result.cleared}）`;
+    await loadRefreshCenterStatus();
+  } catch (error) {
+    msg.textContent = error.message;
+  }
 }
 
 function renderNextRefresh(ts) {
@@ -1109,7 +1235,7 @@ async function saveRefreshConfig() {
   const minMinutes = parseInt(document.getElementById('refreshMin').value) || 60;
   const maxMinutes = parseInt(document.getElementById('refreshMax').value) || 360;
   const fixedMinutes = parseInt(document.getElementById('refreshFixed').value) || 120;
-  const config = { mode, minMinutes, maxMinutes, fixedMinutes };
+  const config = { ...refreshConfig, mode, minMinutes, maxMinutes, fixedMinutes };
   try {
     const res = await apiFetch('/api/refresh-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
     if (res.ok) {

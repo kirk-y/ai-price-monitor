@@ -27,11 +27,12 @@ async function requestWithBackoff(config) {
   let attempt = 0;
   while (true) {
     try {
+      if (config.beforeAttempt) await config.beforeAttempt();
       return await axios.request(config);
     } catch (err) {
       if (config.signal?.aborted) throw err;
       const status = err.response?.status;
-      const retryable = status === 429 || status === 502 || status === 503 || status === 504 || !status;
+      const retryable = (!config.noRetryRisk && status === 429) || status === 502 || status === 503 || status === 504 || !status;
       if (!retryable || attempt >= 2) throw err;
       await sleep((2 ** attempt) * 1000 + randomDelay(200, 800));
       attempt++;
@@ -60,6 +61,107 @@ function headers(cookies) {
     'Cookie': cookies || '',
     'Accept': 'application/json, text/plain, */*',
   };
+}
+
+function riskError(message) {
+  const error = new Error(message);
+  error.code = 'UPSTREAM_RISK_CONTROL';
+  return error;
+}
+
+function validateGoodsResponse(response) {
+  const contentType = String(response.headers?.['content-type'] || '');
+  if (typeof response.data === 'string' || contentType.includes('text/html')) {
+    throw riskError('目标站返回了风控验证页，刷新已暂停');
+  }
+  if (!response.data || response.data.code !== 1 || !Array.isArray(response.data.data?.list)) {
+    const message = String(response.data?.msg || '商品接口返回异常');
+    if (response.status === 403 || response.status === 429) throw riskError(message);
+    throw new Error(message);
+  }
+  return response.data.data;
+}
+
+function normalizeRemoteProduct(item) {
+  return {
+    id: item.goods_key || String(item.id || `g_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`),
+    name: item.name || '',
+    price: typeof item.price === 'number' ? item.price : parseFloat(item.price) || 0,
+    stock: item.extend?.stock_count !== undefined ? item.extend.stock_count : -1,
+    purchaseUrl: normalizeHttpUrl(item.link),
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+async function fetchTargetProducts(token, goodsType, { keywords, signal, beforeAttempt } = {}) {
+  const products = [];
+  const pageSize = 100;
+  let current = 1;
+  let total = Infinity;
+  while (current <= MAX_PAGES && products.length < total) {
+    const data = { token, goods_type: goodsType, current, pageSize };
+    if (keywords) data.keywords = keywords;
+    let response;
+    try {
+      response = await requestWithBackoff({
+        method: 'post', url: `${BASE}/shopApi/Shop/goodsList`, data,
+        headers: headers(''), timeout: REQ_TIMEOUT, signal, noRetryRisk: true, beforeAttempt,
+      });
+    } catch (error) {
+      if ([403, 429].includes(error.response?.status)) throw riskError(`目标站限制请求 (${error.response.status})`);
+      throw error;
+    }
+    const payload = validateGoodsResponse(response);
+    total = Number.isFinite(Number(payload.total)) ? Number(payload.total) : products.length + payload.list.length;
+    products.push(...payload.list.map(normalizeRemoteProduct));
+    if (!payload.list.length || payload.list.length < pageSize) break;
+    current++;
+    await sleep(randomDelay(PAGE_DELAY_MIN, PAGE_DELAY_MAX));
+  }
+  return products;
+}
+
+async function scrapePlusProducts(url, preferredTypes = [], beforeAttempt) {
+  const token = extractToken(url);
+  if (!token) throw new Error(`无法从 URL 提取店铺标识: ${url}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SHOP_TIMEOUT);
+  try {
+    const candidates = [...new Set((preferredTypes.length ? preferredTypes : GOODS_TYPES).filter(type => GOODS_TYPES.includes(type)))];
+    const products = [];
+    const activeTypes = [];
+    for (const type of candidates) {
+      const found = await fetchTargetProducts(token, type, { keywords: 'plus', signal: controller.signal, beforeAttempt });
+      if (found.length) activeTypes.push(type);
+      products.push(...found);
+      if (preferredTypes.length) continue;
+      await sleep(randomDelay(TYPE_DELAY_MIN, TYPE_DELAY_MAX));
+    }
+    return {
+      products: [...new Map(products.map(product => [product.id, product])).values()],
+      goodsTypes: activeTypes.length ? activeTypes : ['card'],
+      probed: !preferredTypes.length,
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function scrapeCatalogProducts(url, beforeAttempt) {
+  const token = extractToken(url);
+  if (!token) throw new Error(`无法从 URL 提取店铺标识: ${url}`);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), SHOP_TIMEOUT);
+  try {
+    const products = [];
+    for (const type of GOODS_TYPES) {
+      products.push(...await fetchTargetProducts(token, type, { signal: controller.signal, beforeAttempt }));
+      await sleep(randomDelay(TYPE_DELAY_MIN, TYPE_DELAY_MAX));
+    }
+    return { products: [...new Map(products.map(product => [product.id, product])).values()] };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function fetchProducts(token, goodsType, cookies, signal) {
@@ -205,4 +307,4 @@ async function classifyProducts(products, storeId) {
   }
 }
 
-module.exports = { scrapeShop, classifyProducts, classifyProduct, normalizeHttpUrl };
+module.exports = { scrapeShop, scrapePlusProducts, scrapeCatalogProducts, fetchTargetProducts, classifyProducts, classifyProduct, normalizeHttpUrl };

@@ -346,3 +346,32 @@ test('store list import is transactional and deduplicates entries', () => {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
+
+test('Plus refresh merges products and confirms missing items twice', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-plus-merge-'));
+  const dbPath = path.join(tempDir, 'stores.db');
+  const script = `
+    const assert = require('node:assert/strict');
+    const store = require('./store');
+    const shop = store.addStore('https://pay.ldxp.cn/shop/plus_merge');
+    store.updateStore(shop.id, { products: [
+      { id: 'plus1', name: 'ChatGPT Plus unverified', price: 10, stock: 2 },
+      { id: 'other1', name: 'Claude Pro', price: 20, stock: 3 }
+    ] });
+    store.mergePlusProducts(shop.id, [{ id: 'plus2', name: 'ChatGPT Plus verified', price: 12, stock: 1 }], { plusGoodsTypes: ['card'] });
+    let updated = store.getStore(shop.id);
+    assert.equal(updated.products.find(item => item.id === 'other1').stock, 3);
+    assert.equal(updated.products.find(item => item.id === 'plus1').plusMissingCount, 1);
+    assert.deepEqual(updated.refreshMeta.plusGoodsTypes, ['card']);
+    store.mergePlusProducts(shop.id, [{ id: 'plus2', name: 'ChatGPT Plus verified', price: 11, stock: 4 }]);
+    updated = store.getStore(shop.id);
+    assert.equal(updated.products.find(item => item.id === 'plus1').stock, 0);
+    assert.equal(updated.products.find(item => item.id === 'plus1').refreshUnavailable, true);
+    assert.equal(updated.products.find(item => item.id === 'plus2').price, 11);
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'), env: { ...process.env, DB_PATH: dbPath }, encoding: 'utf8',
+  });
+  try { assert.equal(result.status, 0, result.stderr || result.stdout); }
+  finally { fs.rmSync(tempDir, { recursive: true, force: true }); }
+});

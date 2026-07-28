@@ -93,7 +93,8 @@ function initSchema() {
       lastUpdated TEXT,
       status TEXT DEFAULT 'ok',
       error TEXT DEFAULT '',
-      products TEXT DEFAULT '[]'
+      products TEXT DEFAULT '[]',
+      refresh_meta TEXT DEFAULT '{}'
     );
     CREATE TABLE IF NOT EXISTS price_history (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -176,6 +177,7 @@ function initSchema() {
     "ALTER TABLE product_labels ADD COLUMN classification_json TEXT DEFAULT '{}'",
     "ALTER TABLE product_labels ADD COLUMN classification_version INTEGER DEFAULT 1",
     "ALTER TABLE product_labels ADD COLUMN classification_source TEXT DEFAULT 'legacy'",
+    "ALTER TABLE stores ADD COLUMN refresh_meta TEXT DEFAULT '{}'",
   ]) {
     try { db.exec(statement); } catch (_) { /* Existing databases already contain the column. */ }
   }
@@ -233,7 +235,10 @@ function migrateFromJson() {
 
 function serializeStore(row) {
   if (!row) return null;
-  return { ...row, products: JSON.parse(row.products || '[]') };
+  const { refresh_meta: refreshMetaJson, ...plain } = row;
+  let refreshMeta = {};
+  try { refreshMeta = JSON.parse(refreshMetaJson || '{}'); } catch (_) { refreshMeta = {}; }
+  return { ...plain, products: JSON.parse(row.products || '[]'), refreshMeta };
 }
 
 function getAllStores() {
@@ -252,7 +257,7 @@ function getStoresByIds(storeIds) {
 function getStoreSummaries() {
   return getDb().prepare('SELECT * FROM stores ORDER BY addedAt ASC').all().map(r => {
     const products = JSON.parse(r.products || '[]');
-    const { products: _, ...rest } = r;
+    const { products: _, refresh_meta: __, ...rest } = r;
     return { ...rest, productCount: products.length };
   });
 }
@@ -324,9 +329,10 @@ function updateStore(storeId, updates) {
 
   const merged = { ...existing, ...updates };
   merged.products = updates.products ? JSON.stringify(updates.products) : existing.products;
+  merged.refresh_meta = updates.refreshMeta ? JSON.stringify(updates.refreshMeta) : existing.refresh_meta;
 
-  db.prepare('UPDATE stores SET url=?, name=?, addedAt=?, lastUpdated=?, status=?, error=?, products=? WHERE id=?').run(
-    merged.url, merged.name, merged.addedAt, merged.lastUpdated, merged.status, merged.error, merged.products, storeId
+  db.prepare('UPDATE stores SET url=?, name=?, addedAt=?, lastUpdated=?, status=?, error=?, products=?, refresh_meta=? WHERE id=?').run(
+    merged.url, merged.name, merged.addedAt, merged.lastUpdated, merged.status, merged.error, merged.products, merged.refresh_meta, storeId
   );
   return serializeStore(db.prepare('SELECT * FROM stores WHERE id = ?').get(storeId));
 }
@@ -381,6 +387,13 @@ function updateClassificationConfig(config) {
 }
 
 const DEFAULT_REFRESH_CONFIG = {
+  plusCycleMinutes: 60,
+  typeProbeHours: 24,
+  requestDelayMinSeconds: 20,
+  requestDelayMaxSeconds: 60,
+  riskThreshold: 2,
+  riskCooldownMinutes: 60,
+  hourlyRequestLimit: 60,
   mode: 'random',
   minMinutes: 60,
   maxMinutes: 360,
@@ -761,6 +774,12 @@ function normalizeStoreRecord(input) {
   if (shop.id !== id) throw new Error('店铺ID与URL不匹配');
   if (!Array.isArray(input.products) || input.products.length > 10000) throw new Error('商品列表格式错误或数量超过限制');
   const status = ['ok', 'pending', 'error'].includes(input.status) ? input.status : 'ok';
+  const rawMeta = input.refreshMeta && typeof input.refreshMeta === 'object' && !Array.isArray(input.refreshMeta) ? input.refreshMeta : {};
+  const refreshMeta = {
+    plusGoodsTypes: Array.isArray(rawMeta.plusGoodsTypes) ? rawMeta.plusGoodsTypes.filter(type => ['card', 'article', 'resource', 'equity'].includes(type)).slice(0, 4) : [],
+    plusLastUpdated: rawMeta.plusLastUpdated && !Number.isNaN(Date.parse(rawMeta.plusLastUpdated)) ? new Date(rawMeta.plusLastUpdated).toISOString() : null,
+    lastTypeProbeAt: rawMeta.lastTypeProbeAt && !Number.isNaN(Date.parse(rawMeta.lastTypeProbeAt)) ? new Date(rawMeta.lastTypeProbeAt).toISOString() : null,
+  };
   return {
     ...input,
     id,
@@ -771,6 +790,7 @@ function normalizeStoreRecord(input) {
     status,
     error: String(input.error || '').slice(0, 1000),
     products: input.products.map(normalizeProduct),
+    refreshMeta,
   };
 }
 
@@ -859,9 +879,9 @@ function importAllData(data) {
   }
   const transaction = db.transaction(() => {
     db.exec('DELETE FROM price_history; DELETE FROM stores; DELETE FROM config');
-    const insertStore = db.prepare('INSERT INTO stores (id, url, name, addedAt, lastUpdated, status, error, products) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    const insertStore = db.prepare('INSERT INTO stores (id, url, name, addedAt, lastUpdated, status, error, products, refresh_meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
     for (const s of stores) {
-      insertStore.run(s.id, s.url, s.name || '', s.addedAt || '', s.lastUpdated || null, s.status || 'ok', s.error || '', JSON.stringify(s.products || []));
+      insertStore.run(s.id, s.url, s.name || '', s.addedAt || '', s.lastUpdated || null, s.status || 'ok', s.error || '', JSON.stringify(s.products || []), JSON.stringify(s.refreshMeta || {}));
     }
     if (storeOrder.length) {
       db.prepare("INSERT OR REPLACE INTO config (key, value) VALUES ('storeOrder', ?)").run(JSON.stringify(storeOrder));
@@ -965,12 +985,12 @@ function importSingleStore(data) {
   const transaction = db.transaction(() => {
     const existing = db.prepare('SELECT id FROM stores WHERE id = ?').get(s.id);
     if (existing) {
-      db.prepare('UPDATE stores SET url=?, name=?, lastUpdated=?, status=?, error=?, products=? WHERE id=?')
-        .run(s.url, s.name, s.lastUpdated, s.status, s.error, JSON.stringify(s.products), s.id);
+      db.prepare('UPDATE stores SET url=?, name=?, lastUpdated=?, status=?, error=?, products=?, refresh_meta=? WHERE id=?')
+        .run(s.url, s.name, s.lastUpdated, s.status, s.error, JSON.stringify(s.products), JSON.stringify(s.refreshMeta || {}), s.id);
       db.prepare('DELETE FROM price_history WHERE product_key LIKE ?').run(s.id + ':%');
     } else {
-      db.prepare('INSERT INTO stores (id, url, name, addedAt, lastUpdated, status, error, products) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-        .run(s.id, s.url, s.name, s.addedAt, s.lastUpdated, s.status, s.error, JSON.stringify(s.products));
+      db.prepare('INSERT INTO stores (id, url, name, addedAt, lastUpdated, status, error, products, refresh_meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(s.id, s.url, s.name, s.addedAt, s.lastUpdated, s.status, s.error, JSON.stringify(s.products), JSON.stringify(s.refreshMeta || {}));
     }
     const insertHistory = db.prepare('INSERT OR IGNORE INTO price_history (product_key, price, stock, date) VALUES (?, ?, ?, ?)');
     for (const row of historyRows) insertHistory.run(row.productKey, row.price, row.stock ?? null, row.date);
@@ -1057,6 +1077,30 @@ function importAllHistory(data) {
   return true;
 }
 
+function mergePlusProducts(storeId, fetchedProducts, metaUpdates = {}) {
+  const current = getStore(storeId);
+  if (!current) return null;
+  const fetchedById = new Map(fetchedProducts.map(product => [String(product.id), product]));
+  const labels = new Map(getProductLabelsForStores([storeId]).map(label => [label.product_key, label.category]));
+  const isPlus = product => /\bplus\b/i.test(String(product.name || ''))
+    || String(labels.get(`${storeId}:${product.id}`) || '').startsWith('plus_')
+    || labels.get(`${storeId}:${product.id}`) === 'gpt_plus';
+  const products = current.products.map(product => {
+    const fresh = fetchedById.get(String(product.id));
+    if (fresh) {
+      fetchedById.delete(String(product.id));
+      return { ...product, ...fresh, plusMissingCount: 0, refreshUnavailable: false };
+    }
+    if (!isPlus(product)) return product;
+    const plusMissingCount = Math.min(2, Number(product.plusMissingCount || 0) + 1);
+    return plusMissingCount >= 2 ? { ...product, plusMissingCount, stock: 0, refreshUnavailable: true } : { ...product, plusMissingCount };
+  });
+  for (const product of fetchedById.values()) products.push({ ...product, plusMissingCount: 0, refreshUnavailable: false });
+  const now = new Date().toISOString();
+  const refreshMeta = { ...(current.refreshMeta || {}), ...metaUpdates, plusLastUpdated: now };
+  return updateStore(storeId, { products, refreshMeta, lastUpdated: now, status: 'pending', error: '' });
+}
+
 function getProductLabelsForStores(storeIds) {
   const ids = [...new Set((storeIds || []).map(String))].slice(0, 20);
   if (!ids.length) return [];
@@ -1104,7 +1148,7 @@ function clearSystemData() {
 }
 
 module.exports = {
-  getAllStores, getStoresByIds, getStoreSummaries, getStore, addStore, importStoreList, removeStore, updateStore,
+  getAllStores, getStoresByIds, getStoreSummaries, getStore, addStore, importStoreList, removeStore, updateStore, mergePlusProducts,
   recordPrices, getPriceHistory,
   getFilterConfig, updateFilterConfig,
   getClassificationConfig, updateClassificationConfig,

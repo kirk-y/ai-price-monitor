@@ -5,5 +5,7 @@ node_modules/
 data/stores.db
 data/stores.db-shm
 data/stores.db-wal
+data/refresh-events.jsonl
+data/refresh-events.jsonl.old
 data/model.pkl
 release/

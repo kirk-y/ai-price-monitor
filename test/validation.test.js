@@ -24,12 +24,14 @@ test('normalizeShopUrl rejects other hosts and ambiguous URLs', () => {
 test('refresh config prevents zero-delay and inverted schedules', () => {
   assert.throws(() => normalizeRefreshConfig({ mode: 'fixed', fixedMinutes: 0 }), /1 到 1440/);
   assert.throws(() => normalizeRefreshConfig({ mode: 'random', minMinutes: 20, maxMinutes: 10 }), /不能大于/);
-  assert.deepEqual(normalizeRefreshConfig({ mode: 'fixed', fixedMinutes: 30 }), {
-    mode: 'fixed', minMinutes: 60, maxMinutes: 360, fixedMinutes: 30,
-  });
-  assert.deepEqual(normalizeRefreshConfig({ mode: 'disabled' }), {
-    mode: 'disabled', minMinutes: 60, maxMinutes: 360, fixedMinutes: 120,
-  });
+  const fixed = normalizeRefreshConfig({ mode: 'fixed', fixedMinutes: 30 });
+  assert.equal(fixed.fixedMinutes, 30);
+  assert.equal(fixed.plusCycleMinutes, 60);
+  assert.equal(fixed.requestDelayMinSeconds, 20);
+  const disabled = normalizeRefreshConfig({ mode: 'disabled' });
+  assert.equal(disabled.mode, 'disabled');
+  assert.equal(disabled.hourlyRequestLimit, 60);
+  assert.throws(() => normalizeRefreshConfig({ mode: 'fixed', requestDelayMinSeconds: 80, requestDelayMaxSeconds: 20 }), /cannot exceed/);
 });
 
 test('category and store order validation reject injection-shaped input', () => {

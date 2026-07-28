@@ -52,8 +52,21 @@ function normalizeRefreshConfig(value) {
     return n;
   };
 
+  const toRangeInt = (input, fallback, min, max, field) => {
+    const n = Number(input ?? fallback);
+    if (!Number.isInteger(n) || n < min || n > max) throw new Error(`${field} must be between ${min} and ${max}`);
+    return n;
+  };
+
   const normalized = {
     mode,
+    plusCycleMinutes: toRangeInt(value.plusCycleMinutes, 60, 5, 1440, 'Plus cycle'),
+    typeProbeHours: toRangeInt(value.typeProbeHours, 24, 1, 720, 'Type probe interval'),
+    requestDelayMinSeconds: toRangeInt(value.requestDelayMinSeconds, 20, 1, 600, 'Minimum request delay'),
+    requestDelayMaxSeconds: toRangeInt(value.requestDelayMaxSeconds, 60, 1, 900, 'Maximum request delay'),
+    riskThreshold: toRangeInt(value.riskThreshold, 2, 1, 10, 'Risk threshold'),
+    riskCooldownMinutes: toRangeInt(value.riskCooldownMinutes, 60, 5, 1440, 'Risk cooldown'),
+    hourlyRequestLimit: toRangeInt(value.hourlyRequestLimit, 60, 1, 1000, 'Hourly request limit'),
     minMinutes: toMinutes(value.minMinutes ?? 60, '最小刷新间隔'),
     maxMinutes: toMinutes(value.maxMinutes ?? 360, '最大刷新间隔'),
     fixedMinutes: toMinutes(value.fixedMinutes ?? 120, '固定刷新间隔'),
@@ -61,6 +74,7 @@ function normalizeRefreshConfig(value) {
   if (normalized.minMinutes > normalized.maxMinutes) {
     throw new Error('最小刷新间隔不能大于最大刷新间隔');
   }
+  if (normalized.requestDelayMinSeconds > normalized.requestDelayMaxSeconds) throw new Error('Minimum request delay cannot exceed maximum request delay');
   return normalized;
 }
 
