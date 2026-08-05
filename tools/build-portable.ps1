@@ -49,6 +49,7 @@ $files = @(
   'server.js',
   'store.js',
   'scraper.js',
+  'browser-collector.js',
   'validation.js',
   'classification.js',
   'hybrid-classification.js',

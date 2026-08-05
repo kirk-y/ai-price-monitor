@@ -1,6 +1,7 @@
 let filterConfig = {};
-let classificationConfig = { version: 2, taxonomy: [], rules: [] };
+let classificationConfig = { version: 3, taxonomy: [], rules: [] };
 let refreshConfig = {};
+let refreshProvider = {};
 let storeSummaries = [];
 let stores = [];
 let activeStoreId = 'all';
@@ -9,6 +10,7 @@ let hiddenStoreIds = [];
 let userPreferences = {};
 let storeWindowStart = 0;
 let storeWindowEnd = 4;
+let storeWindowIds = [];
 let storeWindowBusy = false;
 let activeCategory = 'gpt_plus';
 let activeCatL1 = 'gpt';
@@ -43,6 +45,10 @@ let _priceTimer = null;
 let fullCatalogLoaded = false;
 let fullCatalogLoading = null;
 let initialViewportTouched = false;
+let storePositioningTail = false;
+let storeOrderSnapshot = { contextKey: '', orderedIds: [], priceByStore: new Map(), revision: 0, reason: 'initial' };
+let pendingStoreRankMotion = null;
+let programmaticStoreScroll = false;
 
 localStorage.removeItem('authToken');
 let _authToken = sessionStorage.getItem('sessionToken') || sessionStorage.getItem('authToken') || '';
@@ -83,6 +89,8 @@ function canOperate() {
 }
 
 function visibleStoreStatus(store) {
+  if (canOperate() && ['queued', 'refreshing'].includes(store?.refreshState)) return 'pending';
+  if (canOperate() && store?.refreshState === 'failed') return 'error';
   const status = store?.status || 'ok';
   return status === 'pending' && !canOperate() ? 'ok' : status;
 }
@@ -406,7 +414,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   if (_currentUser?.guest) {
     try { userPreferences = JSON.parse(localStorage.getItem('guestPreferences') || '{}'); } catch (_) { userPreferences = {}; }
   }
-  classificationConfig = bootstrap.classificationConfig || { version: 2, taxonomy: [], rules: [] };
+  classificationConfig = bootstrap.classificationConfig || { version: 3, taxonomy: [], rules: [] };
   syncCategoryDefinitions();
   hiddenStoreIds = Array.isArray(userPreferences.hiddenStoreIds)
     ? userPreferences.hiddenStoreIds
@@ -414,6 +422,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   suggestedKeywords = filterConfig.suggestedKeywords || ['GPT', 'Plus', 'Pro', 'Team', '接码', '直充', '成品', '账号', 'Claude', 'Gemini', 'OpenAI', 'SMS', '谷歌', '微软', '邮箱', 'API', '订阅', '会员', 'Access'];
   keywordUsage = filterConfig.keywordUsage || {};
   refreshConfig = bootstrap.refreshConfig || {};
+  refreshProvider = bootstrap.refreshProvider || {};
   storeSummaries = Array.isArray(bootstrap.summaries) ? bootstrap.summaries : [];
   stores = Array.isArray(bootstrap.stores) ? bootstrap.stores : [];
   const sharedStoreOrder = Array.isArray(bootstrap.storeOrder) ? bootstrap.storeOrder : [];
@@ -422,6 +431,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   const labels = Array.isArray(bootstrap.productLabels) ? bootstrap.productLabels : [];
   for (const l of labels) { productLabels[l.product_key] = l; }
   markDirty();
+  rebuildStoreOrderSnapshot('bootstrap');
+  resetStoreWindow();
   render();
   resetInitialViewport();
   loadInitialStoreWindow().finally(() => {
@@ -488,7 +499,7 @@ function closeAllDrawers() {
 }
 
 async function loadInitialStoreWindow() {
-  const ids = visibleStoreSummaries().slice(storeWindowStart, storeWindowEnd + 1).map(store => store.id);
+  const ids = currentStoreWindowIds();
   try {
     await loadStoreBatch(ids);
     render();
@@ -578,9 +589,11 @@ function initSettings() {
   refreshCenterButton.addEventListener('click', openRefreshCenter);
   document.querySelector('.close-refresh-center').addEventListener('click', closeRefreshCenter);
   document.querySelectorAll('[data-refresh-type]').forEach(button => button.addEventListener('click', () => runRefreshCenterBatch(button.dataset.refreshType)));
+  document.getElementById('retryFailedStoresBtn').addEventListener('click', retryFailedStores);
   document.getElementById('stopRefreshQueueBtn').addEventListener('click', stopRefreshCenterBatch);
   document.getElementById('saveRefreshCenterBtn').addEventListener('click', saveRefreshCenterConfig);
   document.getElementById('resetRefreshBudgetBtn').addEventListener('click', resetRefreshBudget);
+  document.getElementById('clearRefreshProxyBtn').addEventListener('click', clearRefreshProxy);
   document.getElementById('historyBestBtn').addEventListener('click', openHistoricalBestGlobal);
   document.getElementById('settingsBtn').addEventListener('click', openSettings);
   document.querySelector('.close-settings').addEventListener('click', closeSettings);
@@ -664,35 +677,79 @@ function syncRefreshModeControls() {
 }
 
 let refreshCenterTimer = null;
+let refreshProxyConfigured = false;
+let refreshCenterSubmitting = false;
+let refreshCenterBatch = null;
+let latestRefreshCenterStatus = null;
+
+function failedRefreshStoreIds() {
+  return storeSummaries
+    .filter(store => store.status === 'error' || store.refreshState === 'failed')
+    .map(store => store.id);
+}
+
+function updateRefreshCenterActions(status = latestRefreshCenterStatus) {
+  const batchBusy = refreshCenterSubmitting || Boolean(_refreshBatchId) || Boolean(status?.activeBatchCount);
+  document.querySelectorAll('#refreshCenterModal [data-refresh-type]').forEach(button => { button.disabled = batchBusy; });
+  const failedCount = failedRefreshStoreIds().length;
+  const retry = document.getElementById('retryFailedStoresBtn');
+  retry.textContent = `重试失败店铺（${failedCount}）`;
+  retry.disabled = batchBusy || failedCount === 0;
+  document.getElementById('stopRefreshQueueBtn').disabled = !_refreshBatchId;
+}
 
 function fillRefreshCenterConfig() {
   const cfg = refreshConfig || {};
   document.getElementById('centerRefreshMode').value = cfg.mode === 'disabled' ? 'disabled' : 'random';
   document.getElementById('centerPlusCycle').value = cfg.plusCycleMinutes || 60;
   document.getElementById('centerProbeHours').value = cfg.typeProbeHours || 24;
+  document.getElementById('centerCatalogHours').value = cfg.catalogRefreshHours || 24;
   document.getElementById('centerDelayMin').value = cfg.requestDelayMinSeconds || 20;
   document.getElementById('centerDelayMax').value = cfg.requestDelayMaxSeconds || 60;
-  document.getElementById('centerRiskThreshold').value = cfg.riskThreshold || 2;
-  document.getElementById('centerRiskCooldown').value = cfg.riskCooldownMinutes || 60;
+  document.getElementById('centerRiskThreshold').value = cfg.riskThreshold || 3;
+  document.getElementById('centerRiskCooldown').value = cfg.riskCooldownMinutes || 15;
   document.getElementById('centerHourlyLimit').value = cfg.hourlyRequestLimit || 60;
+  document.getElementById('centerCollectorMode').value = cfg.collectorMode || 'auto';
+  document.getElementById('centerProxyUrl').value = '';
+}
+
+async function loadRefreshProxyConfig() {
+  const response = await apiFetch('/api/refresh-proxy-config');
+  const config = await readApiResponse(response, '读取代理配置失败');
+  if (!response.ok) throw new Error(config.error || '读取代理配置失败');
+  refreshProxyConfigured = config.configured === true;
+  document.getElementById('centerProxyMode').value = config.enabled ? 'on_challenge' : 'direct';
+  document.getElementById('centerProxyUrl').placeholder = refreshProxyConfigured
+    ? '已配置，留空保持不变'
+    : 'http://user:pass@host:port';
 }
 
 async function loadRefreshCenterStatus() {
   try {
     const response = await apiFetch('/api/refresh-status');
     const status = await readApiResponse(response, '读取刷新状态失败');
-    const cooldown = status.riskCooldownUntil > Date.now()
-      ? `风控冷却至 ${new Date(status.riskCooldownUntil).toLocaleTimeString()}`
-      : (status.mode === 'disabled' ? '自动刷新已停止' : '自动刷新运行中');
+    latestRefreshCenterStatus = status;
+    refreshProvider = status.provider || {};
+    const providerText = refreshProvider.state === 'blocked'
+      ? `采集通道熔断至 ${new Date(refreshProvider.blockedUntil).toLocaleTimeString()}`
+      : refreshProvider.state === 'probe-ready' ? '采集通道等待恢复探测' : '采集通道正常';
+    const scheduleText = status.mode === 'disabled' ? '自动刷新已停止' : '自动刷新运行中';
     const next = status.nextRefreshAt ? new Date(status.nextRefreshAt).toLocaleTimeString() : '暂无';
-    const eventLabels = { 'store.succeeded': '成功', 'store.failed': '失败', 'store.skipped': '跳过', 'store.started': '开始', 'batch.queued': '批次' };
+    const eventLabels = { 'store.succeeded': '成功', 'store.failed': '失败', 'store.skipped': '跳过', 'store.started': '开始', 'batch.queued': '批次', 'queue.cancelled-by-challenge': '熔断', 'auto.skipped': '巡检跳过' };
     const logs = (status.recentEvents || []).slice(0, 5).map(event => {
       const time = new Date(event.time).toLocaleTimeString();
       const target = event.storeId || `${event.stores || 0} 家店铺`;
-      const detail = event.error || event.reason || (event.products !== undefined ? `${event.products} 件商品` : '');
+      const timing = event.durationMs !== undefined
+        ? `，抓取 ${(event.durationMs / 1000).toFixed(1)}s`
+        : event.queueWaitMs !== undefined ? `，排队 ${(event.queueWaitMs / 1000).toFixed(1)}s` : '';
+      const route = event.requestRoute === 'browser' ? '，浏览器' : event.requestRoute === 'proxy' ? '，代理' : event.requestRoute === 'direct' ? '，直连' : '';
+      const detail = event.error || (event.products !== undefined ? `${event.products} 件商品${route}${timing}` : `${event.reason || ''}${timing}`);
       return `<div class="refresh-log-row"><time>${escapeHtml(time)}</time><strong>${escapeHtml(eventLabels[event.event] || event.event)}</strong><span>${escapeHtml(target)}</span><em>${escapeHtml(detail)}</em></div>`;
     }).join('');
-    document.getElementById('refreshCenterStatus').innerHTML = `${escapeHtml(cooldown)}<br>队列 ${status.queueLength}，正在刷新 ${status.active.length} 家<br>本小时预算 ${status.hourlyRequests}/${status.hourlyRequestLimit}，下次巡检 ${escapeHtml(next)}${logs ? `<div class="refresh-log-list">${logs}</div>` : ''}`;
+    const failedCount = failedRefreshStoreIds().length;
+    document.getElementById('refreshCenterStatus').innerHTML = `<div class="refresh-status-head"><strong>${escapeHtml(providerText)}</strong><span>${escapeHtml(scheduleText)}</span></div><div class="refresh-status-grid"><span>队列<strong>${status.queueLength}</strong></span><span>正在刷新<strong>${status.active.length}</strong></span><span>失败店铺<strong>${failedCount}</strong></span><span>小时请求<strong>${status.hourlyRequests}/${status.hourlyRequestLimit}</strong></span></div><div class="refresh-next-run">下次巡检：${escapeHtml(next)}</div>${logs ? `<details class="refresh-log-panel"><summary>最近事件</summary><div class="refresh-log-list">${logs}</div></details>` : ''}`;
+    updateRefreshCenterActions(status);
+    if (_refreshBatchId && status.activeBatchCount === 0) await finishRefreshCenterBatch();
   } catch (error) {
     document.getElementById('refreshCenterStatus').textContent = error.message;
   }
@@ -701,8 +758,11 @@ async function loadRefreshCenterStatus() {
 function openRefreshCenter() {
   fillRefreshCenterConfig();
   document.getElementById('refreshCenterMsg').textContent = '';
+  document.getElementById('refreshCenterQuickMsg').textContent = '';
   document.getElementById('refreshCenterModal').style.display = 'block';
+  updateRefreshCenterActions();
   loadRefreshCenterStatus();
+  loadRefreshProxyConfig().catch(error => { document.getElementById('refreshCenterMsg').textContent = error.message; });
   clearInterval(refreshCenterTimer);
   refreshCenterTimer = setInterval(loadRefreshCenterStatus, 3000);
 }
@@ -712,13 +772,17 @@ function closeRefreshCenter() {
   clearInterval(refreshCenterTimer);
 }
 
-async function runRefreshCenterBatch(refreshType) {
-  const msg = document.getElementById('refreshCenterMsg');
-  const labels = { plus: 'Plus 刷新', probe: '类型探测', full: '完整扫描' };
+async function runRefreshCenterBatch(refreshType, selectedStoreIds = null, customLabel = '') {
+  const msg = document.getElementById('refreshCenterQuickMsg');
+  const labels = { plus: 'GPT 重点刷新', probe: '类型探测', full: '完整扫描' };
   if (refreshType === 'full' && !confirm('完整扫描请求量较大，确定继续吗？')) return;
+  if (refreshCenterSubmitting || latestRefreshCenterStatus?.activeBatchCount) return showToast('已有刷新批次正在执行');
   try {
-    msg.textContent = `正在加入${labels[refreshType]}队列...`;
-    const storeIds = storeSummaries.filter(store => !isStoreHidden(store.id)).map(store => store.id);
+    refreshCenterSubmitting = true;
+    updateRefreshCenterActions();
+    const label = customLabel || labels[refreshType];
+    msg.textContent = `正在加入${label}队列...`;
+    const storeIds = selectedStoreIds || storeSummaries.filter(store => !isStoreHidden(store.id)).map(store => store.id);
     const response = await apiFetch('/api/stores/refresh-all', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ storeIds, refreshType }),
@@ -726,9 +790,39 @@ async function runRefreshCenterBatch(refreshType) {
     const result = await readApiResponse(response, '创建刷新任务失败');
     if (!response.ok) throw new Error(result.error || '创建刷新任务失败');
     _refreshBatchId = result.batchId;
-    msg.textContent = `${labels[refreshType]}已加入队列`;
+    refreshCenterBatch = { storeIds: result.storeIds || storeIds, label };
+    msg.textContent = `${label}已加入队列`;
     loadRefreshCenterStatus();
-  } catch (error) { msg.textContent = error.message; }
+  } catch (error) {
+    msg.textContent = error.message;
+  } finally {
+    refreshCenterSubmitting = false;
+    updateRefreshCenterActions();
+  }
+}
+
+function retryFailedStores() {
+  const storeIds = failedRefreshStoreIds();
+  if (!storeIds.length) return showToast('当前没有刷新失败的店铺');
+  runRefreshCenterBatch('plus', storeIds, `失败店铺重试（${storeIds.length} 家）`);
+}
+
+async function finishRefreshCenterBatch() {
+  const completed = refreshCenterBatch;
+  _refreshBatchId = '';
+  refreshCenterBatch = null;
+  if (!completed) return updateRefreshCenterActions();
+  try {
+    storeSummaries = await (await apiFetch('/api/stores/summary')).json();
+    const target = new Set(completed.storeIds);
+    const succeeded = storeSummaries.filter(store => target.has(store.id) && store.refreshState === 'succeeded').length;
+    document.getElementById('refreshCenterQuickMsg').textContent = `${completed.label}完成：成功 ${succeeded} 家，未成功 ${target.size - succeeded} 家`;
+    renderStoreList();
+    renderBestPrices();
+  } catch (error) {
+    document.getElementById('refreshCenterQuickMsg').textContent = `${completed.label}已结束，店铺状态读取失败：${error.message}`;
+  }
+  updateRefreshCenterActions();
 }
 
 async function stopRefreshCenterBatch() {
@@ -738,7 +832,9 @@ async function stopRefreshCenterBatch() {
     body: JSON.stringify({ batchId: _refreshBatchId }),
   });
   _refreshBatchId = '';
-  document.getElementById('refreshCenterMsg').textContent = '已停止尚未开始的刷新任务';
+  refreshCenterBatch = null;
+  document.getElementById('refreshCenterQuickMsg').textContent = '已停止尚未开始的刷新任务';
+  updateRefreshCenterActions();
   loadRefreshCenterStatus();
 }
 
@@ -753,20 +849,49 @@ async function saveRefreshCenterConfig() {
     fixedMinutes: Number(document.getElementById('centerPlusCycle').value),
     plusCycleMinutes: Number(document.getElementById('centerPlusCycle').value),
     typeProbeHours: Number(document.getElementById('centerProbeHours').value),
+    catalogRefreshHours: Number(document.getElementById('centerCatalogHours').value),
     requestDelayMinSeconds: Number(document.getElementById('centerDelayMin').value),
     requestDelayMaxSeconds: Number(document.getElementById('centerDelayMax').value),
     riskThreshold: Number(document.getElementById('centerRiskThreshold').value),
     riskCooldownMinutes: Number(document.getElementById('centerRiskCooldown').value),
     hourlyRequestLimit: Number(document.getElementById('centerHourlyLimit').value),
+    collectorMode: document.getElementById('centerCollectorMode').value,
   };
   try {
+    const proxyMode = document.getElementById('centerProxyMode').value;
+    const proxyUrl = document.getElementById('centerProxyUrl').value.trim();
+    const proxyResponse = await apiFetch('/api/refresh-proxy-config', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: proxyMode === 'on_challenge', proxyUrl }),
+    });
+    const proxyResult = await readApiResponse(proxyResponse, '保存代理配置失败');
+    if (!proxyResponse.ok) throw new Error(proxyResult.error || '保存代理配置失败');
+    refreshProxyConfigured = proxyResult.configured === true;
     const response = await apiFetch('/api/refresh-config', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) });
     const result = await readApiResponse(response, '保存失败');
     if (!response.ok) throw new Error(result.error || '保存失败');
     refreshConfig = result;
+    document.getElementById('centerProxyUrl').value = '';
+    document.getElementById('centerProxyUrl').placeholder = refreshProxyConfigured ? '已配置，留空保持不变' : 'http://user:pass@host:port';
     msg.textContent = '刷新参数已保存';
     loadRefreshCenterStatus();
   } catch (error) { msg.textContent = error.message; }
+}
+
+async function clearRefreshProxy() {
+  if (!refreshProxyConfigured) return showToast('当前没有已保存的代理');
+  if (!confirm('确定清除已保存的代理地址吗？')) return;
+  const response = await apiFetch('/api/refresh-proxy-config', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: false, clear: true }),
+  });
+  const result = await readApiResponse(response, '清除代理失败');
+  if (!response.ok) return showToast(result.error || '清除代理失败');
+  refreshProxyConfigured = false;
+  document.getElementById('centerProxyMode').value = 'direct';
+  document.getElementById('centerProxyUrl').value = '';
+  document.getElementById('centerProxyUrl').placeholder = 'http://user:pass@host:port';
+  document.getElementById('refreshCenterMsg').textContent = '代理配置已清除';
 }
 
 async function resetRefreshBudget() {
@@ -775,7 +900,7 @@ async function resetRefreshBudget() {
     const response = await apiFetch('/api/refresh-budget/reset', { method: 'POST' });
     const result = await readApiResponse(response, '重置失败');
     if (!response.ok) throw new Error(result.error || '重置失败');
-    msg.textContent = `本小时请求计数已清零（原计数 ${result.cleared}）`;
+    msg.textContent = `请求计数已清零（原计数 ${result.cleared}）`;
     await loadRefreshCenterStatus();
   } catch (error) {
     msg.textContent = error.message;
@@ -1644,6 +1769,8 @@ async function hydrateFullCatalog() {
     fullCatalogLoaded = !failed && storeSummaries.every(summary => stores.some(item => item.id === summary.id));
     applyStoreOrder();
     markDirty();
+    rebuildStoreOrderSnapshot('catalog-hydrated');
+    if (!initialViewportTouched) resetStoreWindow();
     render();
     if (!initialViewportTouched) resetInitialViewport();
   })().catch(error => {
@@ -1760,8 +1887,14 @@ function markDirty() {
   storeLowestPriceIndex = new Map();
 }
 
+function isProductCurrentlyAvailable(product) {
+  return !product.refreshUnavailable
+    && !(Number(product.plusMissingCount) > 0)
+    && product.stock > 0;
+}
+
 function cacheStoreLowestPrice(indexKey, product) {
-  if (!(product.stock > 0) || !(product.price > 0)) return;
+  if (!isProductCurrentlyAvailable(product) || !(product.price > 0)) return;
   if (!storeLowestPriceIndex.has(indexKey)) storeLowestPriceIndex.set(indexKey, new Map());
   const prices = storeLowestPriceIndex.get(indexKey);
   const current = prices.get(product.storeId);
@@ -1792,10 +1925,10 @@ function rebuildStoreLowestPriceIndex(products) {
 
 function activeStorePriceIndex() {
   getAllProducts();
-  if (includeWords.length || excludeWords.length) {
+  if (includeWords.length || excludeWords.length || priceRange.min || priceRange.max) {
     const prices = new Map();
     for (const product of getFilteredProducts()) {
-      if (!storeEligibleForCurrentPrice(product.storeId) || !(product.stock > 0) || !(product.price > 0)) continue;
+      if (!storeEligibleForCurrentPrice(product.storeId) || !isProductCurrentlyAvailable(product) || !(product.price > 0)) continue;
       const current = prices.get(product.storeId);
       if (current === undefined || product.price < current) prices.set(product.storeId, product.price);
     }
@@ -1815,12 +1948,17 @@ function setStoreSortMode(mode) {
   userPreferences.storeSortMode = mode === 'fixed' ? 'fixed' : 'price';
   saveUserPreferences();
   activeBrowseStoreId = '';
+  rebuildStoreOrderSnapshot('sort-mode');
+  resetStoreWindow();
   render();
 }
 
 function renderAfterCategoryChange() {
   storeProductExpansion = {};
+  storePositioningTail = false;
   if (storeSortMode() === 'price') activeBrowseStoreId = '';
+  rebuildStoreOrderSnapshot('category-change');
+  resetStoreWindow();
   render();
   if (storeSortMode() === 'price') {
     requestAnimationFrame(() => document.getElementById('storesContainer')?.scrollTo({ top: 0, behavior: 'auto' }));
@@ -1855,8 +1993,12 @@ function getFilteredProducts() {
     all = all.filter(p => catL1Display(catL1FromFull(p.category)) === activeCatL1);
   }
   if (includeWords.length || excludeWords.length) all = all.filter(p => matchesSearch(p.name));
+  if (priceRange.min || priceRange.max) {
+    all = all.filter(product => ((!priceRange.min || product.price >= priceRange.min)
+      && (!priceRange.max || product.price <= priceRange.max)) || product.price > 200);
+  }
   all.sort((a, b) => {
-    if ((a.stock > 0) !== (b.stock > 0)) return a.stock > 0 ? -1 : 1;
+    if (isProductCurrentlyAvailable(a) !== isProductCurrentlyAvailable(b)) return isProductCurrentlyAvailable(a) ? -1 : 1;
     return a.price - b.price;
   });
   return all;
@@ -1869,7 +2011,7 @@ function computeBestPrices() {
   const result = {};
   for (const cat of cats) {
     const detail = cat === 'gpt_plus' && activeCatL2 === 'gpt_plus' ? activePlusDetail : 'all';
-    const items = all.filter(product => matchesCategorySelection(product, cat, detail) && product.price > 0 && product.stock > 0);
+    const items = all.filter(product => matchesCategorySelection(product, cat, detail) && product.price > 0 && isProductCurrentlyAvailable(product));
     if (items.length) {
       items.sort((a, b) => a.price - b.price);
       result[cat] = items[0];
@@ -2124,11 +2266,13 @@ function setPlusDetail(detail) {
 }
 
 function setCategory(cat) {
-  activeCategory = cat;
+  activeCategory = cat || '';
+  activeCatL2 = cat || '';
+  activeCatL1 = cat ? catL1Display(catL1FromFull(cat)) : '';
   renderLimit = 30;
   priceRange = { min: 0, max: 0 };
-  render();
-  if (full === 'gpt_plus' && plusDetailsExpanded) requestAnimationFrame(ensurePlusDetailsVisible);
+  renderAfterCategoryChange();
+  if (cat === 'gpt_plus' && plusDetailsExpanded) requestAnimationFrame(ensurePlusDetailsVisible);
 }
 
 function ensurePlusDetailsVisible() {
@@ -2168,9 +2312,10 @@ function render() {
   }
   document.querySelectorAll('.cat-bar-row').forEach(makeDragScroll);
   renderStores();
-  if (anchor) {
+  if (anchor && !programmaticStoreScroll) {
     requestAnimationFrame(() => {
-      const el = document.querySelector(`.store-card[data-store-id="${anchor.id}"]`);
+      if (programmaticStoreScroll) return;
+      const el = document.querySelector(`.store-card[data-store-id="${CSS.escape(anchor.id)}"]`);
       const nextHostRect = scrollHost?.getBoundingClientRect();
       if (el && scrollHost && nextHostRect) scrollHost.scrollBy(0, el.getBoundingClientRect().top - nextHostRect.top - anchor.offset);
     });
@@ -2215,16 +2360,131 @@ function isStoreHidden(storeId) {
   return hiddenStoreIds.includes(storeId);
 }
 
-function visibleStoreSummaries() {
+function storeOrderContextKey() {
+  return JSON.stringify({
+    mode: storeSortMode(),
+    l1: activeCatL1,
+    l2: activeCatL2,
+    plus: activePlusDetail,
+    include: includeWords,
+    exclude: excludeWords,
+    priceMin: priceRange.min,
+    priceMax: priceRange.max,
+    hidden: hiddenStoreIds,
+    stores: storeSummaries.map(store => store.id),
+  });
+}
+
+function rebuildStoreOrderSnapshot(reason = 'data', changedStoreId = '') {
+  applyStoreOrder();
+  const previousIds = storeOrderSnapshot.orderedIds;
   const visible = storeSummaries.filter(summary => !isStoreHidden(summary.id));
-  if (storeSortMode() !== 'price') return visible;
-  const prices = activeStorePriceIndex();
-  return visible.sort((a, b) => {
-    const aPrice = prices.get(a.id) ?? Infinity;
-    const bPrice = prices.get(b.id) ?? Infinity;
-    if (aPrice !== bPrice) return aPrice - bPrice;
+  const priceByStore = storeSortMode() === 'price' ? activeStorePriceIndex() : new Map();
+  const ordered = [...visible].sort((a, b) => {
+    if (storeSortMode() === 'price') {
+      const priceDifference = (priceByStore.get(a.id) ?? Infinity) - (priceByStore.get(b.id) ?? Infinity);
+      if (priceDifference) return priceDifference;
+    }
     return storeOrder.indexOf(a.id) - storeOrder.indexOf(b.id);
   });
+  const orderedIds = ordered.map(store => store.id);
+  if (changedStoreId && previousIds.length) {
+    const from = previousIds.indexOf(changedStoreId);
+    const to = orderedIds.indexOf(changedStoreId);
+    if (from >= 0 && to >= 0 && from !== to) {
+      pendingStoreRankMotion = { id: changedStoreId, direction: to < from ? 'up' : 'down', from, to };
+    }
+  }
+  storeOrderSnapshot = {
+    contextKey: storeOrderContextKey(),
+    orderedIds,
+    priceByStore,
+    revision: storeOrderSnapshot.revision + 1,
+    reason,
+  };
+  return storeOrderSnapshot;
+}
+
+function ensureStoreOrderSnapshot(reason = 'context') {
+  if (storeOrderSnapshot.contextKey !== storeOrderContextKey()) rebuildStoreOrderSnapshot(reason);
+  return storeOrderSnapshot;
+}
+
+function visibleStoreSummaries() {
+  const snapshot = ensureStoreOrderSnapshot();
+  const byId = new Map(storeSummaries.map(store => [store.id, store]));
+  return snapshot.orderedIds.map(id => byId.get(id)).filter(Boolean);
+}
+
+function syncStoreWindowIds() {
+  const orderedIds = ensureStoreOrderSnapshot().orderedIds;
+  const max = Math.max(0, orderedIds.length - 1);
+  storeWindowStart = Math.min(Math.max(0, storeWindowStart), max);
+  storeWindowEnd = Math.min(Math.max(storeWindowStart, storeWindowEnd), max);
+  storeWindowIds = orderedIds.slice(storeWindowStart, storeWindowEnd + 1);
+  return storeWindowIds;
+}
+
+function currentStoreWindowIds() {
+  const orderedIds = ensureStoreOrderSnapshot().orderedIds;
+  const known = new Set(orderedIds);
+  const members = new Set(storeWindowIds.filter(id => known.has(id)));
+  storeWindowIds = orderedIds.filter(id => members.has(id));
+  updateStoreWindowBounds();
+  return storeWindowIds.length ? storeWindowIds : syncStoreWindowIds();
+}
+
+function updateStoreWindowBounds() {
+  const orderedIds = ensureStoreOrderSnapshot().orderedIds;
+  const ranks = storeWindowIds.map(id => orderedIds.indexOf(id)).filter(rank => rank >= 0);
+  if (!ranks.length) return;
+  storeWindowStart = Math.min(...ranks);
+  storeWindowEnd = Math.max(...ranks);
+}
+
+function expandStoreWindow(direction, count = 4) {
+  const orderedIds = ensureStoreOrderSnapshot().orderedIds;
+  const members = new Set(currentStoreWindowIds());
+  const ranks = [...members].map(id => orderedIds.indexOf(id)).filter(rank => rank >= 0);
+  if (!ranks.length) return [];
+  const added = [];
+  if (direction === 'up') {
+    for (let index = Math.max(...ranks) - 1; index >= 0 && added.length < count; index--) {
+      if (!members.has(orderedIds[index])) added.unshift(orderedIds[index]);
+    }
+  } else {
+    for (let index = Math.min(...ranks) + 1; index < orderedIds.length && added.length < count; index++) {
+      if (!members.has(orderedIds[index])) added.push(orderedIds[index]);
+    }
+  }
+  storeWindowIds = orderedIds.filter(id => members.has(id) || added.includes(id));
+  updateStoreWindowBounds();
+  return added;
+}
+
+function canExpandStoreWindow(direction) {
+  const orderedIds = ensureStoreOrderSnapshot().orderedIds;
+  const members = new Set(currentStoreWindowIds());
+  if (!members.size) return false;
+  const ranks = [...members].map(id => orderedIds.indexOf(id)).filter(rank => rank >= 0);
+  if (direction === 'up') return orderedIds.slice(0, Math.max(...ranks)).some(id => !members.has(id));
+  return orderedIds.slice(Math.min(...ranks) + 1).some(id => !members.has(id));
+}
+
+function resetStoreWindow() {
+  storeWindowStart = 0;
+  storeWindowEnd = Math.min(4, Math.max(0, ensureStoreOrderSnapshot().orderedIds.length - 1));
+  syncStoreWindowIds();
+}
+
+function centerStoreWindow(storeId, radius = 4) {
+  const orderedIds = ensureStoreOrderSnapshot().orderedIds;
+  const index = orderedIds.indexOf(storeId);
+  if (index < 0) return false;
+  storeWindowStart = Math.max(0, index - radius);
+  storeWindowEnd = Math.min(orderedIds.length - 1, index + radius);
+  syncStoreWindowIds();
+  return true;
 }
 
 function browseStoreIsActive(storeId) {
@@ -2251,11 +2511,17 @@ function renderStoreList() {
     const badge = isError ? '<span class="badge badge-error">失败</span>' : isPending ? '<span class="badge badge-pending">获取中</span>' : `<span class="badge">${s.productCount||0}</span>`;
     const title = isError ? escapeHtml(s.error || '刷新失败') : isPending ? '获取中...' : formatTime(s.lastUpdated);
     const fixedOrder = storeSortMode() === 'fixed';
-    return `<div class="store-row${rowClass}${fixedOrder ? '' : ' auto-sorted'}" draggable="${fixedOrder}" data-drag-type="store" data-id="${sid}">
+    const rankMotion = pendingStoreRankMotion?.id === s.id ? ` store-rank-${pendingStoreRankMotion.direction}` : '';
+    return `<div class="store-row${rowClass}${rankMotion}${fixedOrder ? '' : ' auto-sorted'}" draggable="${fixedOrder}" data-drag-type="store" data-id="${sid}">
       <button class="store-btn ${browseStoreIsActive(s.id) ? 'active' : ''}" data-action="switch-store" data-store-id="${sid}" title="${title}"><span class="drag-handle">${fixedOrder ? '⠿' : '¥'}</span><span class="sb-name">${escapeHtml((s.name||s.id))}</span>${badge}</button>
       ${isRefreshing ? '<div class="refresh-bar"><div class="refresh-bar-inner"></div></div>' : ''}
     </div>`;
   }).join('')}`;
+  if (pendingStoreRankMotion) {
+    const movedId = pendingStoreRankMotion.id;
+    requestAnimationFrame(() => container.querySelector(`.store-row[data-id="${CSS.escape(movedId)}"]`)?.classList.add('store-rank-settled'));
+    pendingStoreRankMotion = null;
+  }
   updateDashboardChrome(total, ok.length, error.length, pend.length);
 }
 
@@ -2339,8 +2605,13 @@ function updateDashboardChrome(totalProducts, healthyCount, errorCount, pendingC
 
   const healthText = document.getElementById('headerHealthText');
   const healthDot = document.querySelector('.health-dot');
+  const liveIndicator = document.querySelector('.live-indicator');
   healthDot.classList.remove('warning', 'error');
-  if (errorCount > 0) {
+  if (refreshProvider.state === 'blocked') {
+    healthText.textContent = '采集暂停，正在显示缓存数据';
+    healthDot.classList.add('error');
+    if (liveIndicator) liveIndicator.title = refreshProvider.lastError || '采集通道暂时不可用';
+  } else if (errorCount > 0) {
     healthText.textContent = `${errorCount} 个店铺异常`;
     healthDot.classList.add('error');
   } else if (pendingCount > 0) {
@@ -2349,6 +2620,7 @@ function updateDashboardChrome(totalProducts, healthyCount, errorCount, pendingC
   } else {
     healthText.textContent = `${healthyCount} 个店铺正常`;
   }
+  if (liveIndicator && refreshProvider.state !== 'blocked') liveIndicator.title = '监控服务在线';
 }
 
 function dragStart(e, id) {
@@ -2385,6 +2657,7 @@ function dropStore(e, targetId) {
   userPreferences.storeOrder = [...storeOrder];
   saveUserPreferences();
   applyStoreOrder();
+  rebuildStoreOrderSnapshot('manual-order', dragId);
   markDirty();
   render();
 }
@@ -2410,16 +2683,15 @@ function setupStoreScrollTracking() {
   };
   previousScrollTop = currentScrollTop();
   const expandPreviousStores = async () => {
-    if (storeWindowStart <= 0 || storeWindowBusy) return false;
+    if (!canExpandStoreWindow('up') || storeWindowBusy) return false;
     storeWindowBusy = true;
     const anchor = container.querySelector('.store-card[data-store-id]');
     const host = scrollViewport();
     const anchorId = anchor?.dataset.storeId;
     const anchorOffset = anchor ? anchor.getBoundingClientRect().top - host.top : 0;
-    storeWindowStart = Math.max(0, storeWindowStart - 4);
+    const addedIds = expandStoreWindow('up');
     try {
-      const ids = visibleStoreSummaries().slice(storeWindowStart, storeWindowEnd + 1).map(store => store.id);
-      await loadStoreBatch(ids);
+      await loadStoreBatch(addedIds);
       renderStores();
     } catch (error) {
       console.error('加载上一批店铺失败:', error.message);
@@ -2442,7 +2714,7 @@ function setupStoreScrollTracking() {
   };
   const update = () => {
     frame = 0;
-    if (storeWindowBusy) return;
+    if (storeWindowBusy || programmaticStoreScroll || storePositioningTail) return;
     const scrollTop = currentScrollTop();
     const scrollingUp = scrollTop < previousScrollTop;
     previousScrollTop = scrollTop;
@@ -2453,12 +2725,10 @@ function setupStoreScrollTracking() {
       ? window.scrollY + window.innerHeight >= document.documentElement.scrollHeight - 400
       : container.scrollTop + container.clientHeight >= container.scrollHeight - 180;
     if (nearEnd) {
-      const max = visibleStoreSummaries().length - 1;
-      if (storeWindowEnd < max) {
+      if (canExpandStoreWindow('down')) {
         storeWindowBusy = true;
-        storeWindowEnd = Math.min(max, storeWindowEnd + 4);
-        const ids = visibleStoreSummaries().slice(storeWindowStart, storeWindowEnd + 1).map(store => store.id);
-        loadStoreBatch(ids).then(() => {
+        const addedIds = expandStoreWindow('down');
+        loadStoreBatch(addedIds).then(() => {
           renderStores();
           requestAnimationFrame(() => requestAnimationFrame(() => { storeWindowBusy = false; }));
         }).catch(error => {
@@ -2466,7 +2736,7 @@ function setupStoreScrollTracking() {
           storeWindowBusy = false;
         });
       }
-    } else if ((scrollingUp || atTop) && scrollTop <= 120 && storeWindowStart > 0) {
+    } else if ((scrollingUp || atTop) && scrollTop <= 120 && canExpandStoreWindow('up')) {
       expandPreviousStores();
     }
     if (atTop) {
@@ -2478,7 +2748,7 @@ function setupStoreScrollTracking() {
       return;
     }
     const host = scrollViewport();
-    if (scrollingUp && storeWindowStart > 0) {
+    if (scrollingUp && canExpandStoreWindow('up')) {
       const firstRect = cards[0].getBoundingClientRect();
       if (firstRect.top >= host.top - 20) expandPreviousStores();
     }
@@ -2501,15 +2771,23 @@ function setupStoreScrollTracking() {
   container.addEventListener('scroll', () => {
     if (!frame) frame = requestAnimationFrame(update);
   }, { passive: true });
+  const clearPositioningTail = () => {
+    if (!storePositioningTail || programmaticStoreScroll) return;
+    storePositioningTail = false;
+    container.querySelector('.store-positioning-tail')?.remove();
+  };
+  container.addEventListener('pointerdown', clearPositioningTail, { passive: true });
+  container.addEventListener('touchstart', clearPositioningTail, { passive: true });
   window.addEventListener('scroll', () => {
     if (usesDocumentScroll() && !frame) frame = requestAnimationFrame(update);
   }, { passive: true });
   container.addEventListener('wheel', event => {
+    clearPositioningTail();
     if (storeWindowBusy) {
       event.preventDefault();
       return;
     }
-    if (event.deltaY < 0 && container.scrollTop <= 160 && storeWindowStart > 0) {
+    if (event.deltaY < 0 && container.scrollTop <= 160 && canExpandStoreWindow('up')) {
       const first = container.querySelector('.store-card[data-store-id]');
       const host = container.getBoundingClientRect();
       if (!first || first.getBoundingClientRect().top >= host.top - 20) expandPreviousStores();
@@ -2533,8 +2811,10 @@ async function switchStore(storeId) {
   historicalBestMode = false;
   if (storeId === 'all') {
     activeBrowseStoreId = '';
+    storePositioningTail = false;
     storeWindowStart = 0;
     storeWindowEnd = Math.max(4, storeWindowEnd);
+    syncStoreWindowIds();
     renderStores();
     container.scrollTo({ top: 0, behavior: 'smooth' });
     renderStoreList();
@@ -2556,12 +2836,11 @@ async function switchStore(storeId) {
     }
     hideStoreLoadingOverlay();
   }
-  const visibleIds = visibleStoreSummaries().map(s => s.id);
-  const targetIndex = visibleIds.indexOf(storeId);
-  if (targetIndex < 0) return;
-  storeWindowStart = Math.max(0, targetIndex - 4);
-  storeWindowEnd = Math.min(visibleIds.length - 1, targetIndex + 4);
+  if (!centerStoreWindow(storeId)) return;
+  storePositioningTail = true;
+  programmaticStoreScroll = true;
   renderStores();
+  await nextPaint();
   let target = container.querySelector(`.store-card[data-store-id="${CSS.escape(storeId)}"]`);
   if (!target) {
     renderLimit = Math.max(renderLimit, getFilteredProducts().length + 1);
@@ -2576,10 +2855,29 @@ async function switchStore(storeId) {
   target.classList.remove('store-target-up', 'store-target-down');
   target.classList.add(`store-target-${direction}`);
   setTimeout(() => target.classList.remove(`store-target-${direction}`), 500);
-  const targetTop = container.scrollTop + target.getBoundingClientRect().top - container.getBoundingClientRect().top - 12;
-  container.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+  try {
+    await positionStoreCard(container, target);
+    await new Promise(resolve => setTimeout(resolve, 120));
+  } finally {
+    programmaticStoreScroll = false;
+  }
   renderStoreList();
   renderActiveStoreCard();
+}
+
+async function positionStoreCard(container, card) {
+  if (window.matchMedia('(max-width: 760px)').matches) {
+    const headerHeight = document.querySelector('.app-header')?.getBoundingClientRect().height || 0;
+    const targetTop = window.scrollY + card.getBoundingClientRect().top - headerHeight - 12;
+    window.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+    await waitForWindowScrollSettled();
+    window.scrollTo({ top: Math.max(0, targetTop), behavior: 'auto' });
+    return;
+  }
+  const targetTop = card.offsetTop - 12;
+  container.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+  await waitForScrollSettled(container);
+  container.scrollTo({ top: Math.max(0, targetTop), behavior: 'auto' });
 }
 
 function showStoreLoadingOverlay(message, failed = false) {
@@ -2607,7 +2905,7 @@ function renderBestPrices() {
   if (includeWords.length || excludeWords.length) pool = pool.filter(p => matchesSearch(p.name));
   const gptEntries = visibleCatEntries().filter(([k]) => isGptCategory(k) && pool.some(product => product.category === k));
   const renderItem = (category, label, detail = 'all', child = false) => {
-    const items = pool.filter(product => matchesCategorySelection(product, category, detail) && product.price > 0 && product.stock > 0).sort((a, b) => a.price - b.price);
+    const items = pool.filter(product => matchesCategorySelection(product, category, detail) && product.price > 0 && isProductCurrentlyAvailable(product)).sort((a, b) => a.price - b.price);
     if (!items.length) return `<div class="bp-item ${child ? 'bp-detail-item' : ''}"><div class="bp-cat">${label}</div><div class="bp-na">暂无</div></div>`;
     const item = items[0];
     return `<div class="bp-item ${child ? 'bp-detail-item' : ''}" data-action="go-best-price" data-store-id="${escapeHtml(item.storeId)}" data-category="${escapeHtml(category)}" data-detail="${escapeHtml(detail)}" data-product-id="${escapeHtml(item.id)}">
@@ -2887,8 +3185,7 @@ function waitForScrollSettled(element, timeoutMs = 900) {
 function renderStores() {
   const container = document.getElementById('storesContainer');
   const filtered = getFilteredProducts();
-  const allIds = visibleStoreSummaries().map(s => s.id);
-  const ids = allIds.slice(storeWindowStart, storeWindowEnd + 1);
+  const ids = currentStoreWindowIds();
   if (storeSortMode() === 'fixed' && storeOrder.length) ids.sort((a, b) => { const ai = storeOrder.indexOf(a); const bi = storeOrder.indexOf(b); if (ai === -1 && bi === -1) return 0; if (ai === -1) return 1; if (bi === -1) return -1; return ai - bi; });
 
   if (!stores.length && !storeSummaries.length) { container.innerHTML = '<div class="empty-state">请添加店铺开始监控</div>'; return; }
@@ -2920,8 +3217,8 @@ function renderStores() {
     if (!products.length) {
       gridItems.push('<div class="empty-grid">该分类下无商品</div>');
     } else {
-      const inStock = products.filter(p => p.stock > 0);
-      const noStock = products.filter(p => !(p.stock > 0));
+      const inStock = products.filter(isProductCurrentlyAvailable);
+      const noStock = products.filter(p => !isProductCurrentlyAvailable(p));
       const rowLimit = storeProductRowLimit(container);
       const expansionLevel = Math.min(2, Math.max(0, Number(storeProductExpansion[id] || 0)));
       const orderedProducts = inStock.concat(noStock);
@@ -2963,7 +3260,9 @@ function renderStores() {
     </div>`;
   }).join('');
   const hasMore = cardCount >= renderLimit && filtered.length > cardCount;
-  container.innerHTML = html + (hasMore ? '<div class="scroll-sentinel"></div>' : '');
+  container.innerHTML = html
+    + (hasMore ? '<div class="scroll-sentinel"></div>' : '')
+    + (storePositioningTail ? '<div class="store-positioning-tail" aria-hidden="true"></div>' : '');
   container.querySelectorAll('.product-card').forEach(card => {
     const mid = card.querySelector('.pc-mid');
     const bot = card.querySelector('.pc-bot');
@@ -3100,7 +3399,7 @@ function safeCssToken(value) {
 }
 
 function renderProductCard(p) {
-  const inStock = p.stock > 0;
+  const inStock = isProductCurrentlyAvailable(p);
   const stockText = p.stock < 0 ? '未知' : inStock ? `有货 ${p.stock}` : `无货`;
   const confidence = Number.isFinite(Number(p.confidence)) ? Number(p.confidence) : 0;
   const confPct = confidence > 0 ? Math.round(confidence * 100) : 0;
@@ -3380,6 +3679,8 @@ async function saveLabelFromSettings(productKey, name, category, previousCategor
       if (sibling?.dataset) sibling.dataset.previousCategory = category;
     }
     markDirty();
+    rebuildStoreOrderSnapshot('label-change', productKey.split(':')[0]);
+    renderStoreList();
     renderCatBar();
     renderBestPrices();
   }
@@ -3404,6 +3705,7 @@ async function saveLabel(productKey, name, previousCategory) {
     const result = await res.json();
     productLabels[productKey] = result.label || { product_key: productKey, name, category, confidence: 1.0 };
     markDirty();
+    rebuildStoreOrderSnapshot('label-change', productKey.split(':')[0]);
     document.getElementById('labelOverlay')?.remove();
     render();
     restoreProductViewport(viewportAnchor);
@@ -3537,8 +3839,9 @@ async function waitForStoreRefresh(id, maxAttempts = 60) {
     storeSummaries = summary;
     applyStoreOrder();
     renderStoreList();
-    if (updated.status === 'error') throw new Error(updated.error || '店铺刷新失败');
-    if (updated.status !== 'pending') {
+    if (updated.refreshState === 'failed') throw new Error(updated.refreshError || updated.error || '店铺刷新失败');
+    if (updated.refreshState === 'cancelled') throw new Error(updated.refreshError || '刷新任务已取消');
+    if (updated.refreshState === 'succeeded') {
       await loadStoreWithProducts(id);
       markDirty();
       return updated;
@@ -3552,22 +3855,24 @@ async function refreshStore(id, silent) {
   if (refreshingStores.has(id) && !_refreshingAll) {
     return;
   }
+  const viewportAnchor = silent ? null : captureStoreViewport(id);
   refreshingStores.add(id);
-  storeSummaries = storeSummaries.map(store => store.id === id
-    ? { ...store, status: 'pending', error: '' }
-    : store);
   renderStoreList();
   updateRenderedStoreStatuses();
   try {
     const response = await apiFetch(`/api/stores/${id}/refresh`, { method: 'POST' });
     const result = await readApiResponse(response, '店铺更新失败');
     if (!response.ok) throw new Error(result.error || '店铺更新失败');
+    storeSummaries = storeSummaries.map(store => store.id === id
+      ? { ...store, refreshState: 'queued', refreshError: '' }
+      : store);
+    renderStoreList();
     await waitForStoreRefresh(id);
     flashSuccess(id);
-    if (!silent) render();
+    if (!silent) await followRefreshedStore(id, viewportAnchor);
   } catch (error) {
     storeSummaries = storeSummaries.map(store => store.id === id
-      ? { ...store, status: 'error', error: error.message || '店铺更新失败' }
+      ? { ...store, refreshState: 'failed', refreshError: error.message || '店铺更新失败' }
       : store);
     if (!silent) alert('刷新失败: ' + error.message);
     renderStoreList();
@@ -3635,7 +3940,9 @@ function startStoreStatusPolling() {
       }).map(store => store.id);
       const changed = summary.length !== storeSummaries.length || summary.some(next => {
         const prev = storeSummaries.find(store => store.id === next.id);
-        return !prev || prev.status !== next.status || prev.lastUpdated !== next.lastUpdated || prev.productCount !== next.productCount;
+        return !prev || prev.status !== next.status || prev.refreshState !== next.refreshState
+          || prev.refreshError !== next.refreshError || prev.lastUpdated !== next.lastUpdated
+          || prev.productCount !== next.productCount;
       });
       if (!changed) return;
       const priceEligibilityChanged = summary.some(next => {
@@ -3647,6 +3954,10 @@ function startStoreStatusPolling() {
       if (refreshedStoreIds.length) {
         await loadStoreBatch(refreshedStoreIds, true);
         markDirty();
+        if (refreshedStoreIds.some(id => !refreshingStores.has(id))) {
+          rebuildStoreOrderSnapshot('background-update');
+          renderStores();
+        }
         renderBestPrices();
         renderPriceRange();
       }
@@ -3657,6 +3968,81 @@ function startStoreStatusPolling() {
     } catch (_) { /* A later poll will retry. */ }
     finally { _storeStatusPolling = false; }
   }, 5000);
+}
+
+function captureStoreViewport(storeId) {
+  return {
+    storeId,
+    rank: visibleStoreSummaries().findIndex(store => store.id === storeId),
+  };
+}
+
+async function followRefreshedStore(storeId, anchor) {
+  rebuildStoreOrderSnapshot('single-store-update', storeId);
+  const visible = visibleStoreSummaries();
+  const targetIndex = visible.findIndex(store => store.id === storeId);
+  if (targetIndex < 0) {
+    render();
+    return;
+  }
+
+  const previousRank = anchor?.rank ?? -1;
+  activeBrowseStoreId = storeId;
+  centerStoreWindow(storeId);
+  storePositioningTail = true;
+  programmaticStoreScroll = true;
+  render();
+  await nextPaint();
+
+  const container = document.getElementById('storesContainer');
+  const card = container?.querySelector(`.store-card[data-store-id="${CSS.escape(storeId)}"]`);
+  if (container && card) {
+    try {
+      await positionStoreCard(container, card);
+      await new Promise(resolve => setTimeout(resolve, 120));
+    } finally {
+      programmaticStoreScroll = false;
+    }
+    activeBrowseStoreId = storeId;
+    renderStoreList();
+    card.classList.add('store-refresh-follow');
+    setTimeout(() => card.classList.remove('store-refresh-follow'), 3600);
+  } else {
+    programmaticStoreScroll = false;
+  }
+
+  const storeList = document.getElementById('storeList');
+  const row = storeList?.querySelector(`.store-row[data-id="${CSS.escape(storeId)}"]`);
+  if (storeList && row) {
+    const rowTop = row.offsetTop;
+    const rowBottom = rowTop + row.offsetHeight;
+    if (rowTop < storeList.scrollTop) storeList.scrollTo({ top: rowTop - 8, behavior: 'smooth' });
+    else if (rowBottom > storeList.scrollTop + storeList.clientHeight) {
+      storeList.scrollTo({ top: rowBottom - storeList.clientHeight + 8, behavior: 'smooth' });
+    }
+  }
+
+  const summary = storeSummaries.find(store => store.id === storeId);
+  const rankText = previousRank >= 0 && previousRank !== targetIndex
+    ? `，价格排序后位于第 ${targetIndex + 1} 位`
+    : '';
+  showToast(`已定位到 ${summary?.name || storeId}${rankText}`);
+}
+
+function waitForWindowScrollSettled(timeoutMs = 1000) {
+  return new Promise(resolve => {
+    const started = Date.now();
+    let previous = window.scrollY;
+    let stableFrames = 0;
+    const check = () => {
+      const current = window.scrollY;
+      stableFrames = Math.abs(current - previous) < 1 ? stableFrames + 1 : 0;
+      previous = current;
+      if ((Date.now() - started >= 120 && stableFrames >= 4) || Date.now() - started >= timeoutMs) resolve();
+      else requestAnimationFrame(check);
+    };
+    requestAnimationFrame(check);
+  });
 }
 
 async function refreshAllStores() {
@@ -3671,9 +4057,6 @@ async function refreshAllStores() {
   const order = [...storeSummaries].filter(store => !isStoreHidden(store.id));
   try {
     const ids = order.map(store => store.id);
-    storeSummaries = storeSummaries.map(store => ids.includes(store.id)
-      ? { ...store, status: 'pending', error: '' }
-      : store);
     ids.forEach(id => refreshingStores.add(id));
     renderStoreList();
     updateRenderedStoreStatuses();
@@ -3851,11 +4234,10 @@ function onPriceInputNum(input, which) {
 }
 
 function applyPriceFilter() {
-  document.querySelectorAll('.product-card').forEach(el => {
-    const p = parseFloat(el.dataset.price);
-    const show = (!priceRange.min || p >= priceRange.min) && (!priceRange.max || p <= priceRange.max) || p > 200;
-    el.style.display = show ? '' : 'none';
-  });
+  rebuildStoreOrderSnapshot('price-filter');
+  resetStoreWindow();
+  renderStoreList();
+  renderStores();
 }
 
 async function deleteStore(id) {

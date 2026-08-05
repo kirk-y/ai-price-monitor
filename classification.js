@@ -1,6 +1,6 @@
 'use strict';
 
-const RULE_VERSION = 2;
+const RULE_VERSION = 3;
 
 function normalizeText(value) {
   return String(value || '')
@@ -59,7 +59,7 @@ function evaluateRule(text, inputRule) {
   }
 
   const anyHits = rule.any.filter(term => termMatches(text, term));
-  if (!rule.all.length && rule.any.length && !anyHits.length) {
+  if (rule.any.length && !anyHits.length) {
     return { ...rule, matched: false, score: -Infinity, hits: [], reason: 'no-positive-hit' };
   }
   if (!rule.all.length && !rule.any.length) {
@@ -109,8 +109,15 @@ function classifyProduct(name, config = DEFAULT_CLASSIFICATION_CONFIG) {
   const text = normalizeText(name);
   const rules = (config.rules || []).map(normalizeRule);
   const dimensions = [...new Set(rules.map(rule => rule.dimension))];
-  const productResult = classifyDimension(text, rules, 'product');
-  const product = productResult.value || 'other';
+  let productResult = classifyDimension(text, rules, 'product');
+  let product = productResult.value || 'other';
+  const implicitGptPlus = /\bplus\b.*(?:已接码|未接码|不接码|无需接码|成品号?|账号|账户|自助开通|自助充值|\brt\b|refresh\s*token|uip|oa渠道|质保首登|反代)/i.test(text)
+    || /(?:已接码|未接码|不接码|无需接码|成品号?|账号|账户|自助开通|自助充值|\brt\b|refresh\s*token|uip|oa渠道|质保首登|反代).*\bplus\b/i.test(text);
+  const explicitGpt = /(?:chat\s*gpt|open\s*ai|\bgpt\b|gptplus)/i.test(text) || implicitGptPlus;
+  if (product === 'gpt' && !explicitGpt) {
+    product = 'other';
+    productResult = { ...productResult, value: null, label: null, confidence: 0, ambiguous: false, reason: 'missing-explicit-gpt-subject' };
+  }
   const results = { product: productResult };
   for (const dimension of dimensions) {
     if (dimension !== 'product') results[dimension] = classifyDimension(text, rules, dimension, product);
@@ -144,6 +151,7 @@ const DEFAULT_CLASSIFICATION_CONFIG = {
   version: RULE_VERSION,
   taxonomy: [
     { id: 'gpt', label: 'GPT', children: ['free', 'plus', 'pro', 'team', 'k12', 'go', 'other'] },
+    { id: 'gpt_service', label: 'GPT 周边服务', children: ['link', 'scan', 'reset', 'other'] },
     { id: 'claude', label: 'Claude', children: ['free', 'pro', 'max', 'team', 'enterprise', 'other'] },
     { id: 'gemini', label: 'Gemini', children: ['free', 'ai_pro', 'ai_ultra', 'workspace', 'other'] },
     { id: 'grok', label: 'Grok', children: ['free', 'supergrok', 'other'] },
@@ -158,6 +166,7 @@ const DEFAULT_CLASSIFICATION_CONFIG = {
     { id: 'other', label: '其他', children: ['tutorial', 'enterprise_service', 'review', 'other'] },
   ],
   rules: [
+    { id: 'gpt_service', dimension: 'product', label: 'GPT 周边服务', priority: 180, all: ['gpt'], any: ['提链', '提取链接', '长链提取', '扫码对接', '代付代扫', '支付二维码', '重置额度', '额度重置', '恢复额度', '刷新额度'], exclude: ['成品号', '账号', '账户', '账密', '会员', '订阅', '代充', '充值到', '自助开通'] },
     { id: 'gpt', dimension: 'product', label: 'GPT', priority: 80, any: ['chatgpt', 'gpt', 'plus', 'team', 'k12'], exclude: ['claude', 'gemini', 'grok'] },
     { id: 'claude', dimension: 'product', label: 'Claude', priority: 80, any: ['claude', '克劳德'], exclude: ['chatgpt'] },
     { id: 'gemini', dimension: 'product', label: 'Gemini', priority: 80, any: ['gemini', '谷歌ai'], exclude: ['chatgpt'] },
@@ -183,6 +192,9 @@ const DEFAULT_CLASSIFICATION_CONFIG = {
     { id: 'cursor', dimension: 'subtype', label: 'Cursor', products: ['developer_tools'], priority: 50, any: ['cursor'] },
     { id: 'codex', dimension: 'subtype', label: 'Codex', products: ['developer_tools'], priority: 50, any: ['codex'] },
     { id: 'kiro', dimension: 'subtype', label: 'Kiro', products: ['developer_tools'], priority: 50, any: ['kiro'] },
+    { id: 'link', dimension: 'subtype', label: '提链', products: ['gpt_service'], priority: 60, any: ['提链', '提取链接', '长链提取'] },
+    { id: 'scan', dimension: 'subtype', label: '扫码', products: ['gpt_service'], priority: 60, any: ['扫码对接', '代付代扫', '支付二维码'] },
+    { id: 'reset', dimension: 'subtype', label: '额度重置', products: ['gpt_service'], priority: 60, any: ['重置额度', '额度重置', '恢复额度', '刷新额度'] },
     { id: 'gmail', dimension: 'subtype', label: 'Gmail', products: ['email'], priority: 50, any: ['gmail'] },
     { id: 'outlook', dimension: 'subtype', label: 'Outlook', products: ['email'], priority: 50, any: ['outlook', 'hotmail'] },
     { id: 'api_relay', dimension: 'subtype', label: 'API中转', products: ['relay'], priority: 50, any: ['api中转', '中转额度'] },
@@ -201,6 +213,33 @@ const DEFAULT_CLASSIFICATION_CONFIG = {
     { id: 'higher_education', dimension: 'qualification', label: '高校', priority: 50, any: ['高校', '大学', 'edu'] },
   ],
 };
+
+const MIGRATION_RULE_KEYS = new Set([
+  'product:gpt_service',
+  'subtype:link',
+  'subtype:scan',
+  'subtype:reset',
+]);
+
+function migrateClassificationConfig(config) {
+  const source = config && typeof config === 'object' && !Array.isArray(config) ? config : {};
+  const sourceVersion = Number(source.version) || 0;
+  const normalized = validateClassificationConfig(source);
+  if (sourceVersion >= RULE_VERSION) return normalized;
+
+  const existingRules = new Set(normalized.rules.map(rule => `${rule.dimension}:${rule.id}`));
+  const rules = [...normalized.rules];
+  for (const rule of DEFAULT_CLASSIFICATION_CONFIG.rules) {
+    const key = `${rule.dimension}:${rule.id}`;
+    if (MIGRATION_RULE_KEYS.has(key) && !existingRules.has(key)) rules.push(rule);
+  }
+  const existingTaxonomy = new Set(normalized.taxonomy.map(item => item.id));
+  const taxonomy = [...normalized.taxonomy];
+  for (const item of DEFAULT_CLASSIFICATION_CONFIG.taxonomy) {
+    if (item.id === 'gpt_service' && !existingTaxonomy.has(item.id)) taxonomy.push(item);
+  }
+  return validateClassificationConfig({ ...normalized, taxonomy, rules, version: RULE_VERSION });
+}
 
 function validateClassificationConfig(config) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('分类配置格式错误');
@@ -268,6 +307,7 @@ module.exports = {
   classifyProduct,
   buildFeedbackSuggestions,
   evaluateRule,
+  migrateClassificationConfig,
   normalizeText,
   validateClassificationConfig,
 };

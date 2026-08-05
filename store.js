@@ -2,9 +2,10 @@ const Database = require('better-sqlite3');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
-const { DEFAULT_CLASSIFICATION_CONFIG, validateClassificationConfig } = require('./classification');
+const { DEFAULT_CLASSIFICATION_CONFIG, RULE_VERSION, migrateClassificationConfig, validateClassificationConfig } = require('./classification');
 const {
   normalizeRefreshConfig,
+  normalizeRefreshProxyConfig,
   normalizeShopUrl,
   normalizeStoreOrder,
   validateCategory,
@@ -132,7 +133,7 @@ function initSchema() {
       dimension TEXT NOT NULL,
       old_value TEXT,
       new_value TEXT NOT NULL,
-      classification_version INTEGER DEFAULT 2,
+      classification_version INTEGER DEFAULT 3,
       created_at TEXT DEFAULT (datetime('now','localtime'))
     );
     CREATE INDEX IF NOT EXISTS idx_classification_feedback_product
@@ -257,8 +258,18 @@ function getStoresByIds(storeIds) {
 function getStoreSummaries() {
   return getDb().prepare('SELECT * FROM stores ORDER BY addedAt ASC').all().map(r => {
     const products = JSON.parse(r.products || '[]');
+    let refreshMeta = {};
+    try { refreshMeta = JSON.parse(r.refresh_meta || '{}'); } catch (_) { refreshMeta = {}; }
     const { products: _, refresh_meta: __, ...rest } = r;
-    return { ...rest, productCount: products.length };
+    return {
+      ...rest,
+      productCount: products.length,
+      refreshState: refreshMeta.refreshState || 'idle',
+      refreshError: refreshMeta.refreshError || '',
+      lastAttemptAt: refreshMeta.lastAttemptAt || null,
+      lastSuccessAt: refreshMeta.lastSuccessAt || r.lastUpdated || null,
+      collectorRoute: refreshMeta.collectorRoute || '',
+    };
   });
 }
 
@@ -358,6 +369,19 @@ function getPriceHistory(productKey) {
   return getDb().prepare('SELECT price, stock, date FROM price_history WHERE product_key = ? ORDER BY date ASC').all(productKey);
 }
 
+function getPriceHistoryForProducts(productKeys, since = 0) {
+  const keys = [...new Set((productKeys || []).filter(Boolean).map(String))];
+  if (!keys.length) return [];
+  const placeholders = keys.map(() => '?').join(',');
+  const params = [...keys];
+  let query = `SELECT product_key, price, stock, date FROM price_history WHERE product_key IN (${placeholders})`;
+  if (Number.isFinite(Number(since)) && Number(since) > 0) {
+    query += ' AND date >= ?';
+    params.push(new Date(Number(since)).toISOString());
+  }
+  return getDb().prepare(`${query} ORDER BY date ASC`).all(...params);
+}
+
 function getFilterConfig() {
   const row = getDb().prepare('SELECT value FROM config WHERE key = ?').get('filterConfig');
   return row ? JSON.parse(row.value) : { ...DEFAULT_CONFIG };
@@ -373,26 +397,36 @@ function getClassificationConfig() {
   const row = getDb().prepare('SELECT value FROM config WHERE key = ?').get('classificationConfig');
   if (!row) return validateClassificationConfig(DEFAULT_CLASSIFICATION_CONFIG);
   try {
-    return validateClassificationConfig(JSON.parse(row.value));
+    const raw = JSON.parse(row.value);
+    const normalized = migrateClassificationConfig(raw);
+    if (Number(raw?.version) !== normalized.version || JSON.stringify(raw) !== JSON.stringify(normalized)) {
+      getDb().prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)')
+        .run('classificationConfig', JSON.stringify(normalized));
+    }
+    return normalized;
   } catch (_) {
     return validateClassificationConfig(DEFAULT_CLASSIFICATION_CONFIG);
   }
 }
 
 function updateClassificationConfig(config) {
-  const normalized = validateClassificationConfig(config);
+  const normalized = Number(config?.version) < RULE_VERSION
+    ? migrateClassificationConfig(config)
+    : validateClassificationConfig(config);
   getDb().prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)')
     .run('classificationConfig', JSON.stringify(normalized));
   return normalized;
 }
 
 const DEFAULT_REFRESH_CONFIG = {
+  collectorMode: 'auto',
   plusCycleMinutes: 60,
   typeProbeHours: 24,
+  catalogRefreshHours: 24,
   requestDelayMinSeconds: 20,
   requestDelayMaxSeconds: 60,
-  riskThreshold: 2,
-  riskCooldownMinutes: 60,
+  riskThreshold: 3,
+  riskCooldownMinutes: 15,
   hourlyRequestLimit: 60,
   mode: 'random',
   minMinutes: 60,
@@ -414,6 +448,59 @@ function updateRefreshConfig(config) {
   const normalized = normalizeRefreshConfig(config);
   getDb().prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)').run('refreshConfig', JSON.stringify(normalized));
   return normalized;
+}
+
+function getRefreshProxyConfig() {
+  const row = getDb().prepare('SELECT value FROM config WHERE key = ?').get('refreshProxyConfig');
+  if (!row) return { enabled: false, proxyUrl: '' };
+  try { return normalizeRefreshProxyConfig(JSON.parse(row.value)); }
+  catch (_) { return { enabled: false, proxyUrl: '' }; }
+}
+
+function updateRefreshProxyConfig(config) {
+  const current = getRefreshProxyConfig();
+  const normalized = normalizeRefreshProxyConfig(config, current.proxyUrl);
+  getDb().prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)')
+    .run('refreshProxyConfig', JSON.stringify(normalized));
+  return normalized;
+}
+
+function getRefreshRuntimeState() {
+  const row = getDb().prepare('SELECT value FROM config WHERE key = ?').get('refreshRuntimeState');
+  const fallback = { circuitState: 'closed', blockedUntil: 0, lastErrorCode: '', lastError: '', lastErrorAt: null, preferredRoute: '', routeVerifiedAt: null, requestTimestamps: [] };
+  if (!row) return fallback;
+  try {
+    const value = JSON.parse(row.value);
+    return {
+      circuitState: value.circuitState === 'open' ? 'open' : 'closed',
+      blockedUntil: Math.max(0, Number(value.blockedUntil) || 0),
+      lastErrorCode: String(value.lastErrorCode || '').slice(0, 100),
+      lastError: String(value.lastError || '').slice(0, 1000),
+      lastErrorAt: value.lastErrorAt && !Number.isNaN(Date.parse(value.lastErrorAt)) ? new Date(value.lastErrorAt).toISOString() : null,
+      preferredRoute: ['direct', 'browser'].includes(value.preferredRoute) ? value.preferredRoute : '',
+      routeVerifiedAt: value.routeVerifiedAt && !Number.isNaN(Date.parse(value.routeVerifiedAt)) ? new Date(value.routeVerifiedAt).toISOString() : null,
+      requestTimestamps: Array.isArray(value.requestTimestamps)
+        ? value.requestTimestamps.map(Number).filter(Number.isFinite).slice(-1000)
+        : [],
+    };
+  } catch (_) {
+    return fallback;
+  }
+}
+
+function updateRefreshRuntimeState(patch) {
+  const next = { ...getRefreshRuntimeState(), ...patch };
+  getDb().prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)')
+    .run('refreshRuntimeState', JSON.stringify(next));
+  return getRefreshRuntimeState();
+}
+
+function updateStoreRefreshMeta(storeId, patch) {
+  const current = getStore(storeId);
+  if (!current) return null;
+  const refreshMeta = { ...(current.refreshMeta || {}), ...patch };
+  getDb().prepare('UPDATE stores SET refresh_meta = ? WHERE id = ?').run(JSON.stringify(refreshMeta), storeId);
+  return refreshMeta;
 }
 
 function getProductLabel(productKey) {
@@ -629,8 +716,8 @@ function getAllProductLabels() {
   `).all().map(serializeProductLabel);
 }
 
-function saveClassificationResult(productKey, name, result, source = 'rules-v2') {
-  if (!result || typeof result !== 'object' || result.version !== 2) throw new Error('分类结果格式错误');
+function saveClassificationResult(productKey, name, result, source = 'rules-v3') {
+  if (!result || typeof result !== 'object' || result.version !== RULE_VERSION) throw new Error('分类结果格式错误');
   validateCategory(result.category);
   const existing = getProductLabel(productKey);
   if (existing?.manual) return { label: existing, skipped: true };
@@ -650,7 +737,7 @@ function saveClassificationResult(productKey, name, result, source = 'rules-v2')
     Number(result.dimensions?.product?.confidence || 0),
     JSON.stringify(result),
     result.version,
-    String(source || 'rules-v2').slice(0, 40),
+    String(source || 'rules-v3').slice(0, 40),
   );
   return { label: getProductLabel(productKey), skipped: false };
 }
@@ -659,9 +746,9 @@ function recordClassificationFeedback(productKey, name, dimension, oldValue, new
   if (!/^[a-z][a-z0-9_-]{0,39}$/.test(String(dimension || ''))) throw new Error('反馈维度格式错误');
   if (!/^[a-z][a-z0-9_-]{0,79}$/.test(String(newValue || ''))) throw new Error('反馈值格式错误');
   getDb().prepare(`
-    INSERT INTO classification_feedback (product_key, name, dimension, old_value, new_value)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(productKey, String(name || '').slice(0, 1000), dimension, oldValue || null, newValue);
+    INSERT INTO classification_feedback (product_key, name, dimension, old_value, new_value, classification_version)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(productKey, String(name || '').slice(0, 1000), dimension, oldValue || null, newValue, RULE_VERSION);
 }
 
 const CLASSIFICATION_ATTRIBUTE_VALUES = {
@@ -691,14 +778,14 @@ function setProductClassificationAttributes(productKey, name, attributes) {
   }
   const classification = {
     ...previous,
-    version: 2,
+    version: RULE_VERSION,
     category: existing.category,
     attributes: normalized,
   };
   const transaction = db.transaction(() => {
-    db.prepare(`UPDATE product_labels SET classification_json=?, classification_version=2,
+    db.prepare(`UPDATE product_labels SET classification_json=?, classification_version=?,
       classification_source='manual', manual=1 WHERE product_key=?`)
-      .run(JSON.stringify(classification), productKey);
+      .run(JSON.stringify(classification), RULE_VERSION, productKey);
     for (const change of changes) {
       recordClassificationFeedback(productKey, name, change.dimension, change.oldValue, change.newValue);
     }
@@ -777,8 +864,11 @@ function normalizeStoreRecord(input) {
   const rawMeta = input.refreshMeta && typeof input.refreshMeta === 'object' && !Array.isArray(input.refreshMeta) ? input.refreshMeta : {};
   const refreshMeta = {
     plusGoodsTypes: Array.isArray(rawMeta.plusGoodsTypes) ? rawMeta.plusGoodsTypes.filter(type => ['card', 'article', 'resource', 'equity'].includes(type)).slice(0, 4) : [],
+    focusGoodsTypes: Array.isArray(rawMeta.focusGoodsTypes) ? rawMeta.focusGoodsTypes.filter(type => ['card', 'article', 'resource', 'equity'].includes(type)).slice(0, 4) : [],
     plusLastUpdated: rawMeta.plusLastUpdated && !Number.isNaN(Date.parse(rawMeta.plusLastUpdated)) ? new Date(rawMeta.plusLastUpdated).toISOString() : null,
     lastTypeProbeAt: rawMeta.lastTypeProbeAt && !Number.isNaN(Date.parse(rawMeta.lastTypeProbeAt)) ? new Date(rawMeta.lastTypeProbeAt).toISOString() : null,
+    lastCatalogAttemptAt: rawMeta.lastCatalogAttemptAt && !Number.isNaN(Date.parse(rawMeta.lastCatalogAttemptAt)) ? new Date(rawMeta.lastCatalogAttemptAt).toISOString() : null,
+    lastCatalogRefreshAt: rawMeta.lastCatalogRefreshAt && !Number.isNaN(Date.parse(rawMeta.lastCatalogRefreshAt)) ? new Date(rawMeta.lastCatalogRefreshAt).toISOString() : null,
   };
   return {
     ...input,
@@ -845,7 +935,7 @@ function importAllData(data) {
   const historyRows = normalizeHistory(data, storeIds);
   const refreshConfig = data.refreshConfig ? normalizeRefreshConfig(data.refreshConfig) : null;
   const classificationConfig = data.classificationConfig
-    ? validateClassificationConfig(data.classificationConfig)
+    ? migrateClassificationConfig(data.classificationConfig)
     : null;
   const productLabels = data.productLabels === undefined ? [] : data.productLabels;
   if (!Array.isArray(productLabels) || productLabels.length > 100000) throw new Error('商品标签格式错误');
@@ -913,7 +1003,7 @@ function importAllData(data) {
         (product_key, name, dimension, old_value, new_value, classification_version, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?)`);
       for (const feedback of classificationFeedback) {
-        insertFeedback.run(feedback.product_key, String(feedback.name || '').slice(0, 1000), feedback.dimension, feedback.old_value || null, feedback.new_value, Number(feedback.classification_version) || 2, feedback.created_at || new Date().toISOString());
+        insertFeedback.run(feedback.product_key, String(feedback.name || '').slice(0, 1000), feedback.dimension, feedback.old_value || null, feedback.new_value, Number(feedback.classification_version) || RULE_VERSION, feedback.created_at || new Date().toISOString());
       }
     }
   });
@@ -1017,7 +1107,7 @@ function importSingleStore(data) {
       (product_key, name, dimension, old_value, new_value, classification_version, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)`);
     for (const feedback of classificationFeedback) {
-      insertFeedback.run(feedback.product_key, String(feedback.name || '').slice(0, 1000), feedback.dimension, feedback.old_value || null, feedback.new_value, Number(feedback.classification_version) || 2, feedback.created_at || new Date().toISOString());
+        insertFeedback.run(feedback.product_key, String(feedback.name || '').slice(0, 1000), feedback.dimension, feedback.old_value || null, feedback.new_value, Number(feedback.classification_version) || RULE_VERSION, feedback.created_at || new Date().toISOString());
     }
   });
   transaction();
@@ -1077,29 +1167,30 @@ function importAllHistory(data) {
   return true;
 }
 
-function mergePlusProducts(storeId, fetchedProducts, metaUpdates = {}) {
+function mergeFocusedProducts(storeId, fetchedProducts, metaUpdates = {}) {
   const current = getStore(storeId);
   if (!current) return null;
   const fetchedById = new Map(fetchedProducts.map(product => [String(product.id), product]));
-  const labels = new Map(getProductLabelsForStores([storeId]).map(label => [label.product_key, label.category]));
-  const isPlus = product => /\bplus\b/i.test(String(product.name || ''))
-    || String(labels.get(`${storeId}:${product.id}`) || '').startsWith('plus_')
-    || labels.get(`${storeId}:${product.id}`) === 'gpt_plus';
+  const isFocused = product => /plus|k12/i.test(String(product.name || ''));
   const products = current.products.map(product => {
     const fresh = fetchedById.get(String(product.id));
     if (fresh) {
       fetchedById.delete(String(product.id));
       return { ...product, ...fresh, plusMissingCount: 0, refreshUnavailable: false };
     }
-    if (!isPlus(product)) return product;
+    if (!isFocused(product)) return product;
     const plusMissingCount = Math.min(2, Number(product.plusMissingCount || 0) + 1);
-    return plusMissingCount >= 2 ? { ...product, plusMissingCount, stock: 0, refreshUnavailable: true } : { ...product, plusMissingCount };
+    return plusMissingCount >= 2
+      ? { ...product, plusMissingCount, stock: 0, refreshUnavailable: true }
+      : { ...product, plusMissingCount, refreshUnavailable: true };
   });
   for (const product of fetchedById.values()) products.push({ ...product, plusMissingCount: 0, refreshUnavailable: false });
   const now = new Date().toISOString();
   const refreshMeta = { ...(current.refreshMeta || {}), ...metaUpdates, plusLastUpdated: now };
   return updateStore(storeId, { products, refreshMeta, lastUpdated: now, status: 'pending', error: '' });
 }
+
+const mergePlusProducts = mergeFocusedProducts;
 
 function getProductLabelsForStores(storeIds) {
   const ids = [...new Set((storeIds || []).map(String))].slice(0, 20);
@@ -1148,11 +1239,12 @@ function clearSystemData() {
 }
 
 module.exports = {
-  getAllStores, getStoresByIds, getStoreSummaries, getStore, addStore, importStoreList, removeStore, updateStore, mergePlusProducts,
-  recordPrices, getPriceHistory,
+  getAllStores, getStoresByIds, getStoreSummaries, getStore, addStore, importStoreList, removeStore, updateStore, mergeFocusedProducts, mergePlusProducts,
+  recordPrices, getPriceHistory, getPriceHistoryForProducts,
   getFilterConfig, updateFilterConfig,
   getClassificationConfig, updateClassificationConfig,
-  getRefreshConfig, updateRefreshConfig,
+  getRefreshConfig, updateRefreshConfig, getRefreshProxyConfig, updateRefreshProxyConfig,
+  getRefreshRuntimeState, updateRefreshRuntimeState, updateStoreRefreshMeta,
   exportAllData, importAllData, exportStore, importSingleStore,
   getProductLabel, upsertProductLabel, setProductLabel, getLabeledData, getAllProductLabels, getProductLabelsForStores, recordLabelChange, getLabelChanges,
   saveClassificationResult, recordClassificationFeedback, getClassificationFeedback,

@@ -166,7 +166,7 @@ test('all product labels include low-confidence classifications used by the UI',
     const assert = require('node:assert/strict');
     const store = require('./store');
     store.saveClassificationResult('shop:uncertain', 'Ambiguous GPT item', {
-      version: 2,
+      version: 3,
       category: 'gpt_plus',
       dimensions: { product: { value: 'gpt', confidence: 0.2 } },
       attributes: {},
@@ -241,7 +241,7 @@ test('structured classifications and per-dimension feedback survive backups', ()
     assert.equal(label.classification.attributes.verification, 'verified');
     assert.equal(store.getClassificationFeedback()[0].new_value, 'verified');
     const backup = store.exportAllData();
-    assert.equal(backup.classificationConfig.version, 2);
+    assert.equal(backup.classificationConfig.version, 3);
     assert.equal(backup.classificationFeedback.length, 1);
     store.importAllData(backup);
     assert.equal(store.getProductLabel('rules:p1').classification.attributes.verification, 'verified');
@@ -281,10 +281,19 @@ test('full and single store backups preserve labels, history, and store order', 
       'beta:p2': [{ price: 22, stock: 2, date: '2026-07-23T00:00:00.000Z' }]
     }});
     store.updateStoreOrder(['beta', 'alpha']);
+    store.updateStoreRefreshMeta('alpha', { refreshState: 'failed', refreshError: 'temporary', lastAttemptAt: '2026-07-23T01:00:00.000Z' });
+    store.updateRefreshRuntimeState({ circuitState: 'open', blockedUntil: Date.now() + 60000, lastErrorCode: 'UPSTREAM_CHALLENGE' });
+    store.updateRefreshProxyConfig({ enabled: true, proxyUrl: 'http://user:secret@127.0.0.1:18080' });
     const backup = store.exportAllData();
     assert.deepEqual(backup.storeOrder, ['beta', 'alpha']);
     assert.equal(backup.productLabels.length, 2);
     assert.equal(backup.labelChanges.length, 1);
+    assert.equal(backup.refreshProxyConfig, undefined);
+    assert.equal(backup.refreshRuntimeState, undefined);
+    assert.equal(JSON.stringify(backup).includes('secret'), false);
+    const alphaSummary = store.getStoreSummaries().find(item => item.id === 'alpha');
+    assert.equal(alphaSummary.refreshState, 'failed');
+    assert.equal(alphaSummary.refreshError, 'temporary');
 
     store.removeStore('alpha');
     store.importAllData(backup);
@@ -347,7 +356,7 @@ test('store list import is transactional and deduplicates entries', () => {
   }
 });
 
-test('Plus refresh merges products and confirms missing items twice', () => {
+test('focused refresh merges Plus and K12 products and confirms missing items twice', () => {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ai-price-monitor-plus-merge-'));
   const dbPath = path.join(tempDir, 'stores.db');
   const script = `
@@ -356,17 +365,22 @@ test('Plus refresh merges products and confirms missing items twice', () => {
     const shop = store.addStore('https://pay.ldxp.cn/shop/plus_merge');
     store.updateStore(shop.id, { products: [
       { id: 'plus1', name: 'ChatGPT Plus unverified', price: 10, stock: 2 },
+      { id: 'k12-1', name: 'GPT K12 成品', price: 8, stock: 2 },
       { id: 'other1', name: 'Claude Pro', price: 20, stock: 3 }
     ] });
-    store.mergePlusProducts(shop.id, [{ id: 'plus2', name: 'ChatGPT Plus verified', price: 12, stock: 1 }], { plusGoodsTypes: ['card'] });
+    store.mergeFocusedProducts(shop.id, [{ id: 'plus2', name: 'ChatGPT Plus verified', price: 12, stock: 1 }], { focusGoodsTypes: ['card'] });
     let updated = store.getStore(shop.id);
     assert.equal(updated.products.find(item => item.id === 'other1').stock, 3);
     assert.equal(updated.products.find(item => item.id === 'plus1').plusMissingCount, 1);
-    assert.deepEqual(updated.refreshMeta.plusGoodsTypes, ['card']);
-    store.mergePlusProducts(shop.id, [{ id: 'plus2', name: 'ChatGPT Plus verified', price: 11, stock: 4 }]);
+    assert.equal(updated.products.find(item => item.id === 'k12-1').plusMissingCount, 1);
+    assert.equal(updated.products.find(item => item.id === 'plus1').refreshUnavailable, true);
+    assert.equal(updated.products.find(item => item.id === 'plus1').stock, 2);
+    assert.deepEqual(updated.refreshMeta.focusGoodsTypes, ['card']);
+    store.mergeFocusedProducts(shop.id, [{ id: 'plus2', name: 'ChatGPT Plus verified', price: 11, stock: 4 }]);
     updated = store.getStore(shop.id);
     assert.equal(updated.products.find(item => item.id === 'plus1').stock, 0);
     assert.equal(updated.products.find(item => item.id === 'plus1').refreshUnavailable, true);
+    assert.equal(updated.products.find(item => item.id === 'k12-1').stock, 0);
     assert.equal(updated.products.find(item => item.id === 'plus2').price, 11);
   `;
   const result = spawnSync(process.execPath, ['-e', script], {

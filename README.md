@@ -31,6 +31,8 @@ AI 价格监控是一个面向 [链动小铺](https://pay.ldxp.cn) 的本地商�
 
 使用期间请保留后台服务窗口。需要停止服务时，关闭对应的 Node.js 服务窗口即可。
 
+价格刷新默认使用“自动选择”：先尝试轻量接口，遇到 JavaScript 验证时改用本机 Chrome 或 Edge 的持久浏览器会话。Windows 便携版无需附带 Chromium，但电脑上需要安装 Chrome 或 Edge。Linux 云端若需要浏览器采集，应安装 Chrome/Chromium，并在虚拟显示环境中设置 `SHOP_BROWSER_HEADLESS=false`；纯无头模式可能被目标站拒绝。
+
 ### 便携版数据位置
 
 所有持久化数据位于便携目录的 `data` 文件夹，主要数据库文件为：

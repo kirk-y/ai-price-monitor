@@ -129,30 +129,41 @@
       <button type="button" class="close close-refresh-center" aria-label="关闭">&times;</button>
       <h2>刷新中心</h2>
       <div id="refreshCenterStatus" class="refresh-center-status">正在读取刷新状态...</div>
+      <h3 class="refresh-section-title">快速操作</h3>
       <div class="refresh-center-actions admin-only">
-        <button type="button" class="settings-action-btn" data-refresh-type="plus">刷新 Plus</button>
-        <button type="button" class="settings-action-btn superadmin-only" data-refresh-type="probe">探测商品类型</button>
-        <button type="button" class="settings-action-btn superadmin-only" data-refresh-type="full">完整扫描</button>
+        <button type="button" class="settings-action-btn" data-refresh-type="plus">全部店铺重点刷新</button>
+        <button type="button" class="settings-action-btn refresh-retry-btn" id="retryFailedStoresBtn">重试失败店铺（0）</button>
         <button type="button" class="settings-action-btn subtle" id="stopRefreshQueueBtn">停止当前批次</button>
       </div>
-      <div class="refresh-center-note">店铺卡片上的“更新”仅刷新该店铺的 GPT Plus 商品。</div>
-      <div class="refresh-advanced superadmin-only">
-        <h3>自动计划与高级参数</h3>
+      <div class="refresh-center-note">重点刷新包含 GPT Plus 与 GPT K12；其他商品由完整扫描低频更新。</div>
+      <details class="refresh-advanced superadmin-only">
+        <summary>自动计划与高级参数</summary>
+        <div class="refresh-risk-actions">
+          <button type="button" class="settings-action-btn subtle" data-refresh-type="probe">探测商品类型</button>
+          <button type="button" class="settings-action-btn subtle" data-refresh-type="full">完整扫描</button>
+          <span>请求量较大，仅在分类或商品结构变化时使用。</span>
+        </div>
         <div class="refresh-fields">
           <label>自动巡检<select id="centerRefreshMode"><option value="random">启用</option><option value="disabled">停止</option></select></label>
-          <label>一轮周期 (min)<input id="centerPlusCycle" type="number" min="5" max="1440"></label>
+          <label>重点刷新周期 (min)<input id="centerPlusCycle" type="number" min="5" max="1440"></label>
           <label>类型探测周期 (h)<input id="centerProbeHours" type="number" min="1" max="720"></label>
+          <label>全部商品周期 (h)<input id="centerCatalogHours" type="number" min="1" max="720"></label>
           <label>请求间隔 (s)<span><input id="centerDelayMin" type="number" min="1" max="600"> - <input id="centerDelayMax" type="number" min="1" max="900"></span></label>
           <label>连续风控阈值<input id="centerRiskThreshold" type="number" min="1" max="10"></label>
           <label>冷却时间 (min)<input id="centerRiskCooldown" type="number" min="5" max="1440"></label>
           <label>每小时请求上限<input id="centerHourlyLimit" type="number" min="1" max="1000"></label>
+          <label>采集方式<select id="centerCollectorMode"><option value="auto">自动选择（推荐）</option><option value="browser">浏览器会话</option><option value="direct">仅直连接口</option></select></label>
+          <label>代理模式<select id="centerProxyMode"><option value="direct">直连（默认）</option><option value="on_challenge">风控后使用代理</option></select></label>
+          <label>代理地址<input id="centerProxyUrl" type="password" autocomplete="new-password" placeholder="http://user:pass@host:port"></label>
         </div>
         <div class="refresh-advanced-actions">
           <button id="saveRefreshCenterBtn" type="button" class="settings-action-btn">保存参数</button>
-          <button id="resetRefreshBudgetBtn" type="button" class="settings-action-btn subtle">重置本小时计数</button>
+          <button id="resetRefreshBudgetBtn" type="button" class="settings-action-btn subtle">重置请求计数</button>
+          <button id="clearRefreshProxyBtn" type="button" class="settings-action-btn subtle">清除代理</button>
         </div>
         <span id="refreshCenterMsg" class="settings-msg"></span>
-      </div>
+      </details>
+      <span id="refreshCenterQuickMsg" class="settings-msg refresh-center-quick-msg"></span>
     </div>
   </div>
 

@@ -6,7 +6,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "start": "node server.js",
+    "start": "node --env-file-if-exists=.env server.js",
     "test": "node --test"
   },
   "dependencies": {
@@ -15,6 +15,7 @@
     "cheerio": "^1.0.0",
     "express": "^4.21.0",
     "express-rate-limit": "^8.6.0",
-    "helmet": "^8.3.0"
+    "helmet": "^8.3.0",
+    "playwright-core": "^1.62.1"
   }
 }

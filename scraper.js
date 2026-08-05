@@ -1,13 +1,17 @@
 const axios = require('axios');
+const crypto = require('crypto');
 const { classifyProduct: classifyStructuredProduct } = require('./classification');
 const {
   classifyHybridProduct,
+  guardClassificationSubject,
   isKnownGptClassification,
   preClassifyProduct,
 } = require('./hybrid-classification');
+const { RULE_VERSION } = require('./classification');
 
-const BASE = 'https://pay.ldxp.cn';
+const BASE = process.env.SHOP_API_BASE || 'https://pay.ldxp.cn';
 const GOODS_TYPES = ['card', 'article', 'resource', 'equity'];
+const FOCUS_KEYWORDS = ['plus', 'k12'];
 const REQ_TIMEOUT = 10000;
 const MAX_PAGES = 30;
 const PAGE_DELAY_MIN = Number(process.env.SCRAPER_PAGE_DELAY_MIN || 200);
@@ -31,6 +35,7 @@ async function requestWithBackoff(config) {
       return await axios.request(config);
     } catch (err) {
       if (config.signal?.aborted) throw err;
+      if (err.code === 'REQUEST_BUDGET_EXHAUSTED') throw err;
       const status = err.response?.status;
       const retryable = (!config.noRetryRisk && status === 429) || status === 502 || status === 503 || status === 504 || !status;
       if (!retryable || attempt >= 2) throw err;
@@ -54,32 +59,83 @@ async function getCookies(token, signal) {
   return (res.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
 }
 
-function headers(cookies) {
+function headers(cookies, context = {}) {
   return {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     'Content-Type': 'application/json',
     'Cookie': cookies || '',
     'Accept': 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.6',
+    'Referer': context.referer || BASE,
+    'visitorid': crypto.randomBytes(12).toString('hex'),
   };
 }
 
-function riskError(message) {
+function upstreamError(code, message) {
   const error = new Error(message);
-  error.code = 'UPSTREAM_RISK_CONTROL';
+  error.code = code;
   return error;
 }
 
-function validateGoodsResponse(response) {
+function proxyConfigFromOptions(options = {}) {
+  const raw = String(options.proxyUrl || process.env.SHOP_API_PROXY_URL || '').trim();
+  if (!raw) return null;
+  const url = new URL(raw);
+  if (!['http:', 'https:'].includes(url.protocol)) throw new Error('SHOP_API_PROXY_URL 仅支持 HTTP(S) 代理');
+  return {
+    protocol: url.protocol.slice(0, -1),
+    host: url.hostname,
+    port: Number(url.port || (url.protocol === 'https:' ? 443 : 80)),
+    ...(url.username ? { auth: { username: decodeURIComponent(url.username), password: decodeURIComponent(url.password) } } : {}),
+  };
+}
+
+function createShopRequestContext(token, signal, beforeAttempt, options = {}) {
+  const proxy = proxyConfigFromOptions(options);
+  const mode = String(options.proxyMode || process.env.SHOP_API_PROXY_MODE || 'on_challenge').toLowerCase();
+  return {
+    token,
+    signal,
+    beforeAttempt,
+    referer: `${BASE}/shop/${token}`,
+    proxy,
+    useProxy: mode === 'always' && Boolean(proxy),
+    allowProxyFallback: mode !== 'never' && mode !== 'direct' && Boolean(proxy),
+  };
+}
+
+function validateJsonResponse(response) {
   const contentType = String(response.headers?.['content-type'] || '');
   if (typeof response.data === 'string' || contentType.includes('text/html')) {
-    throw riskError('目标站返回了风控验证页，刷新已暂停');
+    throw upstreamError('UPSTREAM_CHALLENGE', '目标站返回了 JavaScript 验证页，刷新已暂停');
   }
-  if (!response.data || response.data.code !== 1 || !Array.isArray(response.data.data?.list)) {
-    const message = String(response.data?.msg || '商品接口返回异常');
-    if (response.status === 403 || response.status === 429) throw riskError(message);
-    throw new Error(message);
+  return response.data;
+}
+
+async function requestShopApi(context, path, data) {
+  const request = async () => {
+    try {
+      const response = await requestWithBackoff({
+        method: 'post', url: `${BASE}${path}`, data,
+        headers: headers('', context), timeout: REQ_TIMEOUT, signal: context.signal,
+        noRetryRisk: true, beforeAttempt: context.beforeAttempt,
+        ...(context.useProxy ? { proxy: context.proxy } : {}),
+      });
+      return validateJsonResponse(response);
+    } catch (error) {
+      if (error.response?.status === 403) throw upstreamError('UPSTREAM_CHALLENGE', '目标站拒绝服务端访问 (403)');
+      if (error.response?.status === 429) throw upstreamError('UPSTREAM_RATE_LIMIT', '目标站限制请求 (429)');
+      throw error;
+    }
+  };
+
+  try {
+    return await request();
+  } catch (error) {
+    if (error.code !== 'UPSTREAM_CHALLENGE' || context.useProxy || !context.allowProxyFallback) throw error;
+    context.useProxy = true;
+    return request();
   }
-  return response.data.data;
 }
 
 function normalizeRemoteProduct(item) {
@@ -93,25 +149,19 @@ function normalizeRemoteProduct(item) {
   };
 }
 
-async function fetchTargetProducts(token, goodsType, { keywords, signal, beforeAttempt } = {}) {
+async function fetchTargetProducts(context, goodsType, { keywords } = {}) {
   const products = [];
   const pageSize = 100;
   let current = 1;
   let total = Infinity;
   while (current <= MAX_PAGES && products.length < total) {
-    const data = { token, goods_type: goodsType, current, pageSize };
+    const data = { token: context.token, category_id: 0, goods_type: goodsType, current, pageSize };
     if (keywords) data.keywords = keywords;
-    let response;
-    try {
-      response = await requestWithBackoff({
-        method: 'post', url: `${BASE}/shopApi/Shop/goodsList`, data,
-        headers: headers(''), timeout: REQ_TIMEOUT, signal, noRetryRisk: true, beforeAttempt,
-      });
-    } catch (error) {
-      if ([403, 429].includes(error.response?.status)) throw riskError(`目标站限制请求 (${error.response.status})`);
-      throw error;
+    const response = await requestShopApi(context, '/shopApi/Shop/goodsList', data);
+    if (!response || response.code !== 1 || !Array.isArray(response.data?.list)) {
+      throw new Error(String(response?.msg || '商品接口返回异常'));
     }
-    const payload = validateGoodsResponse(response);
+    const payload = response.data;
     total = Number.isFinite(Number(payload.total)) ? Number(payload.total) : products.length + payload.list.length;
     products.push(...payload.list.map(normalizeRemoteProduct));
     if (!payload.list.length || payload.list.length < pageSize) break;
@@ -121,19 +171,24 @@ async function fetchTargetProducts(token, goodsType, { keywords, signal, beforeA
   return products;
 }
 
-async function scrapePlusProducts(url, preferredTypes = [], beforeAttempt) {
+async function scrapeFocusProducts(url, preferredTypes = [], beforeAttempt, options = {}) {
   const token = extractToken(url);
   if (!token) throw new Error(`无法从 URL 提取店铺标识: ${url}`);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SHOP_TIMEOUT);
   try {
+    const context = createShopRequestContext(token, controller.signal, beforeAttempt, options);
+    const info = await requestShopApi(context, '/shopApi/Shop/info', { token, category_key: '' });
+    if (!info || info.code !== 1 || !info.data) throw new Error(String(info?.msg || '店铺信息接口返回异常'));
     const candidates = [...new Set((preferredTypes.length ? preferredTypes : GOODS_TYPES).filter(type => GOODS_TYPES.includes(type)))];
     const products = [];
     const activeTypes = [];
     for (const type of candidates) {
-      const found = await fetchTargetProducts(token, type, { keywords: 'plus', signal: controller.signal, beforeAttempt });
-      if (found.length) activeTypes.push(type);
-      products.push(...found);
+      for (const keywords of FOCUS_KEYWORDS) {
+        const found = await fetchTargetProducts(context, type, { keywords });
+        if (found.length && !activeTypes.includes(type)) activeTypes.push(type);
+        products.push(...found);
+      }
       if (preferredTypes.length) continue;
       await sleep(randomDelay(TYPE_DELAY_MIN, TYPE_DELAY_MAX));
     }
@@ -141,24 +196,33 @@ async function scrapePlusProducts(url, preferredTypes = [], beforeAttempt) {
       products: [...new Map(products.map(product => [product.id, product])).values()],
       goodsTypes: activeTypes.length ? activeTypes : ['card'],
       probed: !preferredTypes.length,
+      requestRoute: context.useProxy ? 'proxy' : 'direct',
     };
   } finally {
     clearTimeout(timeout);
   }
 }
 
-async function scrapeCatalogProducts(url, beforeAttempt) {
+const scrapePlusProducts = scrapeFocusProducts;
+
+async function scrapeCatalogProducts(url, beforeAttempt, options = {}) {
   const token = extractToken(url);
   if (!token) throw new Error(`无法从 URL 提取店铺标识: ${url}`);
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), SHOP_TIMEOUT);
   try {
+    const context = createShopRequestContext(token, controller.signal, beforeAttempt, options);
+    const info = await requestShopApi(context, '/shopApi/Shop/info', { token, category_key: '' });
+    if (!info || info.code !== 1 || !info.data) throw new Error(String(info?.msg || '店铺信息接口返回异常'));
     const products = [];
     for (const type of GOODS_TYPES) {
-      products.push(...await fetchTargetProducts(token, type, { signal: controller.signal, beforeAttempt }));
+      products.push(...await fetchTargetProducts(context, type));
       await sleep(randomDelay(TYPE_DELAY_MIN, TYPE_DELAY_MAX));
     }
-    return { products: [...new Map(products.map(product => [product.id, product])).values()] };
+    return {
+      products: [...new Map(products.map(product => [product.id, product])).values()],
+      requestRoute: context.useProxy ? 'proxy' : 'direct',
+    };
   } finally {
     clearTimeout(timeout);
   }
@@ -286,16 +350,22 @@ async function classifyProducts(products, storeId) {
     const existing = store.getProductLabel(pk);
     if (existing?.manual) continue;
     const knownGpt = isKnownGptClassification(existing);
-    const currentHybrid = String(existing?.classification_source || '').startsWith('hybrid-v1-');
+    const currentHybrid = String(existing?.classification_source || '').startsWith('hybrid-v2-');
+    const currentVersion = Number(existing?.classification_version) || 0;
     // Upgrade legacy GPT labels once. Afterwards, unchanged products do not need inference.
-    if (existing && existing.name === p.name && (!knownGpt || currentHybrid)) continue;
+    if (existing && existing.name === p.name && currentVersion >= RULE_VERSION && (!knownGpt || currentHybrid)) continue;
 
     const baseResult = classifyStructuredProduct(p.name, classificationConfig);
     const pre = preClassifyProduct(p.name);
+    if (!pre.eligible && pre.product) {
+      const guarded = guardClassificationSubject(baseResult, pre);
+      store.saveClassificationResult(pk, p.name, guarded, 'rules-v3-subject-guard');
+      continue;
+    }
     if (knownGpt || pre.eligible) {
       const hybridResult = classifyHybridProduct(p.name, baseResult, { knownProduct: knownGpt });
       if (hybridResult.hybrid?.accepted) {
-        store.saveClassificationResult(pk, p.name, hybridResult, `hybrid-v1-${hybridResult.hybrid.source}`);
+        store.saveClassificationResult(pk, p.name, hybridResult, `hybrid-v2-${hybridResult.hybrid.source}`);
         continue;
       }
     }
@@ -307,4 +377,4 @@ async function classifyProducts(products, storeId) {
   }
 }
 
-module.exports = { scrapeShop, scrapePlusProducts, scrapeCatalogProducts, fetchTargetProducts, classifyProducts, classifyProduct, normalizeHttpUrl };
+module.exports = { scrapeShop, scrapeFocusProducts, scrapePlusProducts, scrapeCatalogProducts, fetchTargetProducts, classifyProducts, classifyProduct, normalizeHttpUrl };

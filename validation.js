@@ -60,12 +60,14 @@ function normalizeRefreshConfig(value) {
 
   const normalized = {
     mode,
+    collectorMode: ['auto', 'direct', 'browser'].includes(value.collectorMode) ? value.collectorMode : 'auto',
     plusCycleMinutes: toRangeInt(value.plusCycleMinutes, 60, 5, 1440, 'Plus cycle'),
     typeProbeHours: toRangeInt(value.typeProbeHours, 24, 1, 720, 'Type probe interval'),
+    catalogRefreshHours: toRangeInt(value.catalogRefreshHours, 24, 1, 720, 'Catalog refresh interval'),
     requestDelayMinSeconds: toRangeInt(value.requestDelayMinSeconds, 20, 1, 600, 'Minimum request delay'),
     requestDelayMaxSeconds: toRangeInt(value.requestDelayMaxSeconds, 60, 1, 900, 'Maximum request delay'),
-    riskThreshold: toRangeInt(value.riskThreshold, 2, 1, 10, 'Risk threshold'),
-    riskCooldownMinutes: toRangeInt(value.riskCooldownMinutes, 60, 5, 1440, 'Risk cooldown'),
+    riskThreshold: toRangeInt(value.riskThreshold, 3, 1, 10, 'Risk threshold'),
+    riskCooldownMinutes: toRangeInt(value.riskCooldownMinutes, 15, 5, 1440, 'Risk cooldown'),
     hourlyRequestLimit: toRangeInt(value.hourlyRequestLimit, 60, 1, 1000, 'Hourly request limit'),
     minMinutes: toMinutes(value.minMinutes ?? 60, '最小刷新间隔'),
     maxMinutes: toMinutes(value.maxMinutes ?? 360, '最大刷新间隔'),
@@ -76,6 +78,24 @@ function normalizeRefreshConfig(value) {
   }
   if (normalized.requestDelayMinSeconds > normalized.requestDelayMaxSeconds) throw new Error('Minimum request delay cannot exceed maximum request delay');
   return normalized;
+}
+
+function normalizeRefreshProxyConfig(value, currentUrl = '') {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('代理配置格式错误');
+  const enabled = value.enabled === true;
+  const supplied = String(value.proxyUrl || '').trim();
+  let proxyUrl = value.clear === true ? '' : (supplied || String(currentUrl || '').trim());
+  if (proxyUrl) {
+    if (proxyUrl.length > 2048 || /[\u0000-\u001f]/.test(proxyUrl)) throw new Error('代理地址格式错误');
+    let parsed;
+    try { parsed = new URL(proxyUrl); } catch (_) { throw new Error('代理地址格式错误'); }
+    if (!['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname || parsed.search || parsed.hash) {
+      throw new Error('代理地址必须是有效的 HTTP(S) 地址');
+    }
+    proxyUrl = parsed.toString();
+  }
+  if (enabled && !proxyUrl) throw new Error('启用代理前请填写代理地址');
+  return { enabled, proxyUrl };
 }
 
 function normalizeStoreOrder(value) {
@@ -92,6 +112,7 @@ function isLoopbackHost(host) {
 
 module.exports = {
   normalizeRefreshConfig,
+  normalizeRefreshProxyConfig,
   normalizeShopUrl,
   normalizeStoreOrder,
   validateCategory,

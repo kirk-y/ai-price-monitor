@@ -5,10 +5,19 @@ const os = require('os');
 const path = require('path');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const { scrapePlusProducts, scrapeCatalogProducts, classifyProducts } = require('./scraper');
+const { scrapeFocusProducts, scrapeCatalogProducts, classifyProducts } = require('./scraper');
+const { clearCollectorData, collectShop: collectShopWithBrowser, closeCollector } = require('./browser-collector');
 const { buildFeedbackSuggestions, classifyProduct, validateClassificationConfig } = require('./classification');
 const {
+  automaticFocusRefreshType,
+  buildPlusPriorityScores,
+  estimatedRefreshRequests,
+  focusRefreshIntervalMinutes,
+  pickDueCatalogStore,
+} = require('./refresh-priority');
+const {
   classifyHybridProduct,
+  guardClassificationSubject,
   isKnownGptClassification,
   preClassifyProduct,
 } = require('./hybrid-classification');
@@ -31,7 +40,9 @@ const MAX_IMPORT_FILE_BYTES = Number(process.env.MAX_IMPORT_FILE_BYTES || 150 * 
 const IMPORT_CHUNK_BYTES = 512 * 1024;
 const IMPORT_UPLOAD_TTL_MS = 30 * 60 * 1000;
 const VISITOR_REFRESH_COOLDOWN_MS = Number(process.env.VISITOR_REFRESH_COOLDOWN_MS || 60 * 1000);
-const REFRESH_LOG_PATH = path.join(__dirname, 'data', 'refresh-events.jsonl');
+const REFRESH_LOG_PATH = process.env.REFRESH_LOG_PATH
+  ? path.resolve(process.env.REFRESH_LOG_PATH)
+  : path.join(__dirname, 'data', 'refresh-events.jsonl');
 const recentRefreshEvents = [];
 
 function recordRefreshEvent(event, details = {}) {
@@ -89,6 +100,7 @@ app.use(helmet({
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
+  skip: req => req.method === 'GET' && ['/bootstrap', '/stores/summary', '/stores-batch'].includes(req.path),
   message: { error: '请求过于频繁，请稍后再试' },
 });
 
@@ -215,13 +227,14 @@ const visitorRefreshLimiter = rateLimit({
   message: { error: '单店铺更新操作过于频繁，请稍后再试' },
 });
 
-app.post('/api/system/clear-data', requireAdmin, requireStrictLimit, (req, res) => {
+app.post('/api/system/clear-data', requireAdmin, requireStrictLimit, async (req, res) => {
   if (req.body?.confirmation !== '清除所有数据') {
     return res.status(400).json({ error: '请输入“清除所有数据”以确认操作' });
   }
   invalidateRefreshQueue();
+  try { await clearCollectorData(); }
+  catch (error) { return res.status(500).json({ error: `清除浏览器会话失败: ${error.message}` }); }
   const deleted = store.clearSystemData();
-  autoRefreshAttempts.clear();
   nextRefreshAt = null;
   res.json({ success: true, deleted });
 });
@@ -398,7 +411,11 @@ function buildInitialStorePreviews(storeIds, productLimit = 8) {
       return { product, productKey, label: labelsByKey.get(productKey) };
     }).filter(entry => {
       const category = entry.label?.classification?.category || entry.label?.category || '';
-      return category === 'gpt_plus' && entry.product.stock > 0 && entry.product.price > 0;
+      return category === 'gpt_plus'
+        && !entry.product.refreshUnavailable
+        && !(Number(entry.product.plusMissingCount) > 0)
+        && entry.product.stock > 0
+        && entry.product.price > 0;
     }).sort((a, b) => a.product.price - b.product.price).slice(0, productLimit);
     for (const entry of products) selectedKeys.add(entry.productKey);
     return { ...item, products: products.map(entry => entry.product), partial: true };
@@ -428,6 +445,7 @@ app.get('/api/bootstrap', (req, res) => {
     preferences,
     classificationConfig: store.getClassificationConfig(),
     refreshConfig: { ...store.getRefreshConfig(), nextRefreshAt },
+    refreshProvider: refreshProviderStatus(),
     summaries,
     storeOrder: sharedOrder,
     stores: initialCatalog.stores,
@@ -446,6 +464,14 @@ app.get('/api/stores-batch', (req, res) => {
 });
 
 app.post('/api/stores/refresh-all', requireOperator, requireStrictLimit, (req, res) => {
+  const availability = refreshProviderStatus();
+  if (!availability.acceptingJobs) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil((availability.blockedUntil - Date.now()) / 1000))));
+    return res.status(503).json({ error: availability.message, provider: availability });
+  }
+  if (activeRefreshBatches.size) {
+    return res.status(409).json({ error: '已有全局刷新批次正在排队，请等待完成或先停止当前批次' });
+  }
   const requested = Array.isArray(req.body?.storeIds) ? req.body.storeIds : [];
   const byId = new Map(store.getAllStores().map(item => [item.id, item]));
   const storesToRefresh = requested
@@ -456,6 +482,7 @@ app.post('/api/stores/refresh-all', requireOperator, requireStrictLimit, (req, r
   const refreshType = ['plus', 'probe', 'full'].includes(req.body?.refreshType) ? req.body.refreshType : 'plus';
   if (refreshType !== 'plus' && req.role !== 'admin') return res.status(403).json({ error: '仅管理员可执行探测或完整扫描' });
   const batchId = `refresh_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  activeRefreshBatches.add(batchId);
   res.json({ status: 'pending', batchId, refreshType, storeIds: storesToRefresh.map(item => item.id) });
   recordRefreshEvent('batch.queued', { batchId, refreshType, stores: storesToRefresh.length, actor: req.user?.username || req.role || 'unknown' });
 
@@ -463,6 +490,7 @@ app.post('/api/stores/refresh-all', requireOperator, requireStrictLimit, (req, r
     for (const item of storesToRefresh) {
       enqueueStoreRefresh(item.id, item.url, 'global', batchId, refreshType);
     }
+    if (!refreshQueue.some(item => item.batchId === batchId)) activeRefreshBatches.delete(batchId);
   })().catch(error => console.error('全局刷新任务失败:', error.message));
 });
 
@@ -470,7 +498,18 @@ app.post('/api/stores/refresh-all/cancel', requireOperator, requireStrictLimit, 
   const batchId = String(req.body?.batchId || '');
   if (!batchId) return res.status(400).json({ error: '缺少刷新批次标识' });
   cancelledRefreshBatches.add(batchId);
-  res.json({ success: true, batchId });
+  activeRefreshBatches.delete(batchId);
+  let cancelled = 0;
+  for (let index = refreshQueue.length - 1; index >= 0; index--) {
+    const job = refreshQueue[index];
+    if (job.batchId !== batchId) continue;
+    refreshQueue.splice(index, 1);
+    queuedRefreshes.delete(job.storeId);
+    store.updateStoreRefreshMeta(job.storeId, { refreshState: 'cancelled', refreshError: '任务已取消' });
+    job.resolve();
+    cancelled++;
+  }
+  res.json({ success: true, batchId, cancelled });
 });
 
 app.get('/api/stores/:id/export', (req, res) => {
@@ -530,6 +569,12 @@ app.post('/api/stores/:id/refresh', visitorRefreshLimiter, async (req, res) => {
   const s = store.getStore(req.params.id);
   if (!s) return res.status(404).json({ error: '店铺不存在' });
 
+  const availability = refreshProviderStatus();
+  if (!availability.acceptingJobs) {
+    res.setHeader('Retry-After', String(Math.max(1, Math.ceil((availability.blockedUntil - Date.now()) / 1000))));
+    return res.status(503).json({ error: availability.message, provider: availability });
+  }
+
   const privileged = req.role === 'admin' || req.role === 'operator';
   if (!privileged) {
     const now = Date.now();
@@ -545,10 +590,9 @@ app.post('/api/stores/:id/refresh', visitorRefreshLimiter, async (req, res) => {
     if (s.status !== 'pending') visitorStoreRefreshes.set(s.id, now);
   }
 
-  store.updateStore(s.id, { status: 'pending', error: '' });
-  res.json({ status: 'pending', reused: s.status === 'pending' });
-
+  const reused = activeRefreshes.has(s.id) || queuedRefreshes.has(s.id);
   enqueueStoreRefresh(s.id, s.url, privileged ? 'manual' : 'visitor', '', 'plus');
+  res.json({ status: 'queued', reused });
 });
 
 app.get('/api/products/:storeId/:productId/history', (req, res) => {
@@ -710,7 +754,7 @@ function classifyCandidate(product, config) {
   const baseResult = classifyProduct(product.name, config);
   const knownProduct = isKnownGptClassification(product.currentCategory);
   const pre = preClassifyProduct(product.name);
-  if (!knownProduct && !pre.eligible) return baseResult;
+  if (!knownProduct && !pre.eligible) return guardClassificationSubject(baseResult, pre);
   return classifyHybridProduct(product.name, baseResult, { knownProduct });
 }
 
@@ -751,7 +795,7 @@ app.post('/api/classification/apply', requireOperator, requireStrictLimit, (req,
         needsReview++;
         continue;
       }
-      const source = result.hybrid?.accepted ? `hybrid-v1-${result.hybrid.source}` : 'rules-v2';
+      const source = result.hybrid?.accepted ? `hybrid-v2-${result.hybrid.source}` : 'rules-v3';
       const outcome = store.saveClassificationResult(product.productKey, product.name, result, source);
       if (outcome.skipped) skipped++; else saved++;
     }
@@ -792,16 +836,20 @@ app.get('/api/refresh-config', (req, res) => {
 });
 
 app.get('/api/refresh-status', (req, res) => {
+  pruneRecentRequests();
   const cfg = store.getRefreshConfig();
+  const provider = refreshProviderStatus();
   res.json({
     queueLength: refreshQueue.length,
     active: [...activeRefreshes.keys()],
+    activeBatchCount: activeRefreshBatches.size,
     nextRefreshAt,
-    riskCooldownUntil,
+    riskCooldownUntil: provider.blockedUntil,
     riskFailures,
     hourlyRequests: recentRequests.length,
     hourlyRequestLimit: cfg.hourlyRequestLimit,
     mode: cfg.mode,
+    provider,
     recentEvents: recentRefreshEvents.slice(-20).reverse(),
   });
 });
@@ -809,6 +857,7 @@ app.get('/api/refresh-status', (req, res) => {
 app.post('/api/refresh-budget/reset', requireAdmin, requireStrictLimit, (req, res) => {
   const cleared = recentRequests.length;
   recentRequests.splice(0, recentRequests.length);
+  store.updateRefreshRuntimeState({ requestTimestamps: [] });
   recordRefreshEvent('budget.reset', {
     cleared,
     actor: req.user?.username || 'admin',
@@ -824,6 +873,20 @@ app.put('/api/refresh-config', requireAdmin, (req, res) => {
     res.json({ ...config, nextRefreshAt });
   } catch (err) {
     res.status(400).json({ error: err.message });
+  }
+});
+
+app.get('/api/refresh-proxy-config', requireAdmin, (req, res) => {
+  const config = store.getRefreshProxyConfig();
+  res.json({ enabled: config.enabled, configured: Boolean(config.proxyUrl) });
+});
+
+app.put('/api/refresh-proxy-config', requireAdmin, (req, res) => {
+  try {
+    const config = store.updateRefreshProxyConfig(req.body);
+    res.json({ enabled: config.enabled, configured: Boolean(config.proxyUrl) });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
   }
 });
 
@@ -843,20 +906,74 @@ const activeRefreshes = new Map();
 const refreshQueue = [];
 const queuedRefreshes = new Map();
 const cancelledRefreshBatches = new Set();
+const activeRefreshBatches = new Set();
 let refreshQueueRunning = false;
 let refreshSequence = 0;
 let lastRefreshFinishedAt = 0;
+let wakeQueueWait = null;
 let dataGeneration = 0;
 let riskFailures = 0;
-let riskCooldownUntil = 0;
-const recentRequests = [];
+const recentRequests = store.getRefreshRuntimeState().requestTimestamps.filter(timestamp => timestamp > Date.now() - 3600000);
+
+function pruneRecentRequests() {
+  const cutoff = Date.now() - 3600000;
+  let changed = false;
+  while (recentRequests.length && recentRequests[0] <= cutoff) {
+    recentRequests.shift();
+    changed = true;
+  }
+  if (changed) store.updateRefreshRuntimeState({ requestTimestamps: recentRequests });
+}
+
+function refreshProviderStatus() {
+  const runtime = store.getRefreshRuntimeState();
+  const blocked = runtime.circuitState === 'open' && runtime.blockedUntil > Date.now();
+  return {
+    state: blocked ? 'blocked' : runtime.circuitState === 'open' ? 'probe-ready' : 'healthy',
+    acceptingJobs: !blocked,
+    blockedUntil: blocked ? runtime.blockedUntil : 0,
+    lastErrorCode: runtime.lastErrorCode,
+    lastError: runtime.lastError,
+    lastErrorAt: runtime.lastErrorAt,
+    preferredRoute: runtime.preferredRoute,
+    routeVerifiedAt: runtime.routeVerifiedAt,
+    message: blocked
+      ? `采集通道已熔断，请在 ${new Date(runtime.blockedUntil).toLocaleTimeString()} 后重试`
+      : runtime.circuitState === 'open' ? '采集通道等待一次恢复探测' : '采集通道正常',
+  };
+}
+
+function openRefreshCircuit(error) {
+  const cfg = store.getRefreshConfig();
+  riskFailures = Math.max(riskFailures, cfg.riskThreshold);
+  const blockedUntil = Date.now() + cfg.riskCooldownMinutes * 60000;
+  store.updateRefreshRuntimeState({
+    circuitState: 'open',
+    blockedUntil,
+    lastErrorCode: error.code || 'UPSTREAM_UNAVAILABLE',
+    lastError: error.message,
+    lastErrorAt: new Date().toISOString(),
+  });
+}
+
+function closeRefreshCircuit(preferredRoute = '') {
+  riskFailures = 0;
+  store.updateRefreshRuntimeState({
+    circuitState: 'closed',
+    blockedUntil: 0,
+    ...(preferredRoute ? { preferredRoute, routeVerifiedAt: new Date().toISOString() } : {}),
+  });
+}
 
 function invalidateRefreshQueue() {
   dataGeneration++;
   while (refreshQueue.length) refreshQueue.shift().resolve();
   queuedRefreshes.clear();
   cancelledRefreshBatches.clear();
+  activeRefreshBatches.clear();
+  wakeQueueWait?.();
   lastRefreshFinishedAt = 0;
+  riskFailures = 0;
 }
 
 function queueDelay(min, max) {
@@ -869,15 +986,44 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+function waitForQueueDelay(ms) {
+  if (ms <= 0) return Promise.resolve();
+  return new Promise(resolve => {
+    let finished = false;
+    const finish = () => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      if (wakeQueueWait === finish) wakeQueueWait = null;
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    wakeQueueWait = finish;
+  });
+}
+
+function refreshJobDelay(job, config) {
+  return queueDelay(config.requestDelayMinSeconds * 1000, config.requestDelayMaxSeconds * 1000);
+}
+
 function consumeRequestBudget() {
-  const cutoff = Date.now() - 3600000;
-  while (recentRequests.length && recentRequests[0] <= cutoff) recentRequests.shift();
+  pruneRecentRequests();
   if (recentRequests.length >= store.getRefreshConfig().hourlyRequestLimit) {
     const error = new Error('已达到每小时请求预算，请稍后重试');
     error.code = 'REQUEST_BUDGET_EXHAUSTED';
     throw error;
   }
   recentRequests.push(Date.now());
+  store.updateRefreshRuntimeState({ requestTimestamps: recentRequests });
+}
+
+function refreshBudgetWaitMs(requiredRequests, config = store.getRefreshConfig()) {
+  pruneRecentRequests();
+  const required = Math.max(1, requiredRequests);
+  if (required > config.hourlyRequestLimit) return -1;
+  const overflow = recentRequests.length + required - config.hourlyRequestLimit;
+  if (overflow <= 0) return 0;
+  return Math.max(1000, recentRequests[Math.min(overflow - 1, recentRequests.length - 1)] + 3600000 - Date.now());
 }
 
 function enqueueStoreRefresh(storeId, url, reason = 'manual', batchId = '', refreshType = 'plus') {
@@ -887,12 +1033,14 @@ function enqueueStoreRefresh(storeId, url, reason = 'manual', batchId = '', refr
       const queued = refreshQueue.find(job => job.storeId === storeId);
       const promotedPriority = reason === 'manual' ? 0 : 5;
       if (queued && queued.priority > promotedPriority) {
+        queued.sourceBatchId = queued.sourceBatchId || queued.batchId || '';
         queued.priority = promotedPriority;
         queued.reason = reason;
         queued.batchId = '';
         queued.refreshType = 'plus';
         queued.sequence = refreshSequence++;
         refreshQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+        wakeQueueWait?.();
       }
     }
     return queuedRefreshes.get(storeId);
@@ -900,12 +1048,46 @@ function enqueueStoreRefresh(storeId, url, reason = 'manual', batchId = '', refr
 
   const priority = reason === 'manual' ? 0 : reason === 'visitor' ? 5 : reason === 'global' ? 10 : 20;
   const task = new Promise((resolve) => {
-    refreshQueue.push({ storeId, url, reason, batchId, refreshType, priority, sequence: refreshSequence++, generation: dataGeneration, resolve });
+    refreshQueue.push({ storeId, url, reason, batchId, sourceBatchId: '', refreshType, priority, sequence: refreshSequence++, generation: dataGeneration, queuedAt: Date.now(), resolve });
     refreshQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
   });
   queuedRefreshes.set(storeId, task);
+  store.updateStoreRefreshMeta(storeId, {
+    refreshState: 'queued',
+    refreshError: '',
+    queuedAt: new Date().toISOString(),
+  });
+  if (reason === 'manual' || reason === 'visitor') wakeQueueWait?.();
   processRefreshQueue();
   return task;
+}
+
+function cancelQueuedRefreshesAfterChallenge(batchId) {
+  let cancelled = 0;
+  if (batchId) {
+    cancelledRefreshBatches.add(batchId);
+    activeRefreshBatches.delete(batchId);
+  }
+  for (let index = refreshQueue.length - 1; index >= 0; index--) {
+    const queued = refreshQueue[index];
+    if (queued.reason !== 'auto' && (!batchId || queued.batchId !== batchId)) continue;
+    refreshQueue.splice(index, 1);
+    queuedRefreshes.delete(queued.storeId);
+    store.updateStoreRefreshMeta(queued.storeId, {
+      refreshState: 'cancelled',
+      refreshError: '采集通道不可用，本次任务未执行',
+    });
+    queued.resolve();
+    cancelled++;
+  }
+  recordRefreshEvent('queue.cancelled-by-challenge', { batchId, cancelled });
+}
+
+function finishRefreshBatchIfDrained(job) {
+  const batchId = job.batchId || job.sourceBatchId;
+  if (batchId && !refreshQueue.some(item => item.batchId === batchId || item.sourceBatchId === batchId)) {
+    activeRefreshBatches.delete(batchId);
+  }
 }
 
 async function processRefreshQueue() {
@@ -914,40 +1096,69 @@ async function processRefreshQueue() {
   try {
     while (refreshQueue.length) {
       const job = refreshQueue.shift();
-      queuedRefreshes.delete(job.storeId);
       if (job.generation !== dataGeneration) {
+        queuedRefreshes.delete(job.storeId);
         job.resolve();
         continue;
       }
       if (job.batchId && cancelledRefreshBatches.has(job.batchId)) {
+        queuedRefreshes.delete(job.storeId);
+        store.updateStoreRefreshMeta(job.storeId, { refreshState: 'cancelled', refreshError: '任务已取消' });
         recordRefreshEvent('store.cancelled', { storeId: job.storeId, refreshType: job.refreshType, batchId: job.batchId });
         job.resolve();
         continue;
       }
       const config = store.getRefreshConfig();
-      if (riskCooldownUntil > Date.now()) {
-        const error = `风控冷却中，${new Date(riskCooldownUntil).toLocaleTimeString()} 后重试`;
-        if (!job.batchId) store.updateStore(job.storeId, { status: 'error', error });
-        recordRefreshEvent('store.skipped', { storeId: job.storeId, refreshType: job.refreshType, reason: error });
+      const availability = refreshProviderStatus();
+      if (!availability.acceptingJobs) {
+        queuedRefreshes.delete(job.storeId);
+        store.updateStoreRefreshMeta(job.storeId, { refreshState: 'cancelled', refreshError: availability.message });
+        recordRefreshEvent('store.skipped', { storeId: job.storeId, refreshType: job.refreshType, reason: availability.message });
         job.resolve();
+        cancelQueuedRefreshesAfterChallenge(job.batchId);
         continue;
       }
-      while (recentRequests.length && recentRequests[0] <= Date.now() - 3600000) recentRequests.shift();
+      pruneRecentRequests();
       if (recentRequests.length >= config.hourlyRequestLimit) {
+        queuedRefreshes.delete(job.storeId);
         const error = '已达到每小时请求预算，请稍后重试';
-        if (!job.batchId) store.updateStore(job.storeId, { status: 'error', error });
+        store.updateStoreRefreshMeta(job.storeId, { refreshState: 'cancelled', refreshError: error });
         recordRefreshEvent('store.skipped', { storeId: job.storeId, refreshType: job.refreshType, reason: error });
         job.resolve();
+        finishRefreshBatchIfDrained(job);
         continue;
       }
       const sinceLast = Date.now() - lastRefreshFinishedAt;
-      const minimumGap = queueDelay(config.requestDelayMinSeconds * 1000, config.requestDelayMaxSeconds * 1000);
-      if (lastRefreshFinishedAt && sinceLast < minimumGap) await sleep(minimumGap - sinceLast);
-      store.updateStore(job.storeId, { status: 'pending', error: '' });
-      recordRefreshEvent('store.started', { storeId: job.storeId, refreshType: job.refreshType, reason: job.reason });
-      await scrapeAndUpdate(job.storeId, job.url, job.generation, job.refreshType);
+      const minimumGap = job.reason === 'manual' || job.reason === 'visitor' ? 0 : refreshJobDelay(job, config);
+      if (lastRefreshFinishedAt && sinceLast < minimumGap) {
+        await waitForQueueDelay(minimumGap - sinceLast);
+        if (job.priority > 0 && refreshQueue.some(item => item.priority < job.priority)) {
+          refreshQueue.push(job);
+          refreshQueue.sort((a, b) => a.priority - b.priority || a.sequence - b.sequence);
+          continue;
+        }
+      }
+      queuedRefreshes.delete(job.storeId);
+      store.updateStoreRefreshMeta(job.storeId, {
+        refreshState: 'refreshing',
+        refreshError: '',
+        lastAttemptAt: new Date().toISOString(),
+        ...(job.refreshType === 'full' ? { lastCatalogAttemptAt: new Date().toISOString() } : {}),
+      });
+      recordRefreshEvent('store.started', {
+        storeId: job.storeId,
+        refreshType: job.refreshType,
+        reason: job.reason,
+        queueWaitMs: Date.now() - job.queuedAt,
+      });
+      const result = await scrapeAndUpdate(job.storeId, job.url, job.generation, job.refreshType);
       lastRefreshFinishedAt = Date.now();
       job.resolve();
+      if (['UPSTREAM_CHALLENGE', 'UPSTREAM_UNAVAILABLE', 'BROWSER_UNAVAILABLE'].includes(result?.code)) {
+        cancelQueuedRefreshesAfterChallenge(job.batchId || job.sourceBatchId);
+      } else {
+        finishRefreshBatchIfDrained(job);
+      }
     }
   } finally {
     refreshQueueRunning = false;
@@ -955,25 +1166,77 @@ async function processRefreshQueue() {
   }
 }
 
+async function collectStoreProducts(current, url, refreshType, preferredTypes, requestOptions) {
+  const config = store.getRefreshConfig();
+  const runtime = store.getRefreshRuntimeState();
+  const browserPreferred = config.collectorMode === 'browser'
+    || (config.collectorMode === 'auto' && (
+      current?.refreshMeta?.collectorRoute === 'browser' || runtime.preferredRoute === 'browser'
+    ));
+  const directCollect = () => refreshType === 'full'
+    ? scrapeCatalogProducts(url, consumeRequestBudget, requestOptions)
+    : scrapeFocusProducts(url, preferredTypes, consumeRequestBudget, requestOptions);
+  const browserCollect = () => collectShopWithBrowser(url, {
+    refreshType,
+    preferredTypes,
+    proxyUrl: requestOptions.proxyUrl,
+    beforeAttempt: consumeRequestBudget,
+    includeInfo: refreshType === 'full' || current?.status === 'pending',
+  });
+
+  if (config.collectorMode === 'browser') return browserCollect();
+  if (browserPreferred) {
+    try { return await browserCollect(); }
+    catch (error) {
+      if (error.code !== 'BROWSER_UNAVAILABLE') throw error;
+      return directCollect();
+    }
+  }
+  try {
+    return await directCollect();
+  } catch (directError) {
+    if (config.collectorMode !== 'auto' || directError.code !== 'UPSTREAM_CHALLENGE') throw directError;
+    try {
+      return await browserCollect();
+    } catch (browserError) {
+      if (browserError.code === 'UPSTREAM_CHALLENGE' || browserError.code === 'UPSTREAM_RATE_LIMIT') throw browserError;
+      const error = new Error(`直连触发验证，浏览器采集也不可用: ${browserError.message}`);
+      error.code = 'UPSTREAM_UNAVAILABLE';
+      throw error;
+    }
+  }
+}
+
 function scrapeAndUpdate(storeId, url, generation = dataGeneration, refreshType = 'plus') {
   if (activeRefreshes.has(storeId)) return activeRefreshes.get(storeId);
   const task = (async () => {
+    const scrapeStartedAt = Date.now();
     try {
       const current = store.getStore(storeId);
+      const proxyConfig = store.getRefreshProxyConfig();
+      const requestOptions = {
+        proxyMode: proxyConfig.enabled ? 'on_challenge' : 'never',
+        proxyUrl: proxyConfig.enabled ? proxyConfig.proxyUrl : '',
+      };
       const preferredTypes = refreshType === 'probe'
         ? []
-        : ((current?.refreshMeta?.plusGoodsTypes || []).length ? current.refreshMeta.plusGoodsTypes : ['card']);
-      const result = refreshType === 'full'
-        ? await scrapeCatalogProducts(url, consumeRequestBudget)
-        : await scrapePlusProducts(url, preferredTypes, consumeRequestBudget);
+        : ((current?.refreshMeta?.focusGoodsTypes || current?.refreshMeta?.plusGoodsTypes || []).length
+          ? (current.refreshMeta.focusGoodsTypes || current.refreshMeta.plusGoodsTypes)
+          : ['card']);
+      const result = await collectStoreProducts(current, url, refreshType, preferredTypes, requestOptions);
       if (generation !== dataGeneration || !store.getStore(storeId)) return;
       if (refreshType === 'full') {
-        store.updateStore(storeId, { status: 'pending', error: '', lastUpdated: new Date().toISOString(), products: result.products });
+        const refreshedAt = new Date().toISOString();
+        store.updateStore(storeId, {
+          status: 'pending', error: '', lastUpdated: refreshedAt, products: result.products,
+          refreshMeta: { ...(current?.refreshMeta || {}), lastCatalogRefreshAt: refreshedAt, lastTypeProbeAt: refreshedAt },
+        });
       } else {
-        store.mergePlusProducts(storeId, result.products, {
+        store.mergeFocusedProducts(storeId, result.products, {
+          focusGoodsTypes: result.goodsTypes,
           plusGoodsTypes: result.goodsTypes,
           lastTypeProbeAt: result.probed ? new Date().toISOString() : current?.refreshMeta?.lastTypeProbeAt,
-          plusStatus: 'ok', plusError: '',
+          plusStatus: 'ok', plusError: '', collectorRoute: result.requestRoute,
         });
       }
       store.recordPrices(storeId, result.products);
@@ -983,20 +1246,35 @@ function scrapeAndUpdate(storeId, url, generation = dataGeneration, refreshType 
         console.error(`店铺 ${storeId} 分类失败:`, err.message);
       }
       if (generation === dataGeneration && store.getStore(storeId)) {
-        store.updateStore(storeId, { status: 'ok', error: '' });
+        const successAt = new Date().toISOString();
+        store.updateStore(storeId, { status: 'ok', error: '', ...(result.shopName ? { name: result.shopName } : {}) });
+        store.updateStoreRefreshMeta(storeId, {
+          refreshState: 'succeeded',
+          refreshError: '',
+          lastSuccessAt: successAt,
+          collectorRoute: result.requestRoute,
+        });
       }
-      recordRefreshEvent('store.succeeded', { storeId, refreshType, products: result.products.length, requestsThisHour: recentRequests.length });
-      riskFailures = 0;
+      recordRefreshEvent('store.succeeded', { storeId, refreshType, products: result.products.length, requestRoute: result.requestRoute, durationMs: Date.now() - scrapeStartedAt, requestsThisHour: recentRequests.length });
+      closeRefreshCircuit(result.requestRoute);
+      return { ok: true };
     } catch (err) {
-      if (err.code === 'UPSTREAM_RISK_CONTROL') {
+      if (['UPSTREAM_CHALLENGE', 'UPSTREAM_UNAVAILABLE', 'BROWSER_UNAVAILABLE'].includes(err.code)) {
+        openRefreshCircuit(err);
+      } else if (err.code === 'UPSTREAM_RATE_LIMIT') {
         riskFailures++;
         const cfg = store.getRefreshConfig();
-        if (riskFailures >= cfg.riskThreshold) riskCooldownUntil = Date.now() + cfg.riskCooldownMinutes * 60000;
-      }
+        if (riskFailures >= cfg.riskThreshold) openRefreshCircuit(err);
+      } else riskFailures = 0;
       if (generation === dataGeneration && store.getStore(storeId)) {
         store.updateStore(storeId, { status: 'error', error: err.message });
+        store.updateStoreRefreshMeta(storeId, {
+          refreshState: 'failed',
+          refreshError: err.message,
+        });
       }
-      recordRefreshEvent('store.failed', { storeId, refreshType, code: err.code || '', error: err.message });
+      recordRefreshEvent('store.failed', { storeId, refreshType, code: err.code || '', error: err.message, durationMs: Date.now() - scrapeStartedAt });
+      return { ok: false, code: err.code || '', error: err.message };
     }
   })();
   activeRefreshes.set(storeId, task);
@@ -1006,10 +1284,19 @@ function scrapeAndUpdate(storeId, url, generation = dataGeneration, refreshType 
 
 function recoverInterruptedRefreshes() {
   for (const item of store.getAllStores()) {
-    if (item.status !== 'pending') continue;
-    store.updateStore(item.id, {
-      status: 'error',
-      error: '上次刷新未完成，已恢复，可重新尝试',
+    if (item.status === 'error' && /page\.evaluate:[\s\S]*Failed to fetch/i.test(item.error || item.refreshMeta?.refreshError || '')) {
+      store.updateStore(item.id, { status: 'ok', error: '' });
+      store.updateStoreRefreshMeta(item.id, {
+        refreshState: 'idle',
+        refreshError: '',
+        lastAttemptAt: null,
+      });
+      continue;
+    }
+    if (item.refreshMeta?.refreshState !== 'queued' && item.refreshMeta?.refreshState !== 'refreshing') continue;
+    store.updateStoreRefreshMeta(item.id, {
+      refreshState: 'cancelled',
+      refreshError: '服务重启，上次刷新任务已取消',
     });
   }
 }
@@ -1017,8 +1304,22 @@ function recoverInterruptedRefreshes() {
 const server = app.listen(PORT, HOST, () => {
   console.log(`AI价格监控服务已启动: http://${HOST}:${PORT}`);
   recoverInterruptedRefreshes();
-  resetAutoRefreshSchedule(store.getRefreshConfig());
+  resetAutoRefreshSchedule(store.getRefreshConfig(), { immediate: process.env.AUTO_REFRESH_IMMEDIATE === 'true' });
 });
+
+let shuttingDown = false;
+async function shutdown() {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearTimeout(autoRefreshTimer);
+  invalidateRefreshQueue();
+  await closeCollector().catch(() => {});
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.once('SIGINT', shutdown);
+process.once('SIGTERM', shutdown);
 
 server.on('error', (err) => {
   if (err.code === 'EADDRINUSE') {
@@ -1030,11 +1331,6 @@ server.on('error', (err) => {
 let nextRefreshAt = null;
 let autoRefreshTimer = null;
 let autoRefreshScheduleVersion = 0;
-const autoRefreshAttempts = new Map();
-
-function randomBetween(min, max) {
-  return Math.floor(Math.random() * (max - min + 1) + min) * 60 * 1000;
-}
 
 function cancelQueuedAutoRefreshes() {
   for (let index = refreshQueue.length - 1; index >= 0; index--) {
@@ -1046,10 +1342,10 @@ function cancelQueuedAutoRefreshes() {
   }
 }
 
-function autoRefreshDelay(config) {
-  return config.mode === 'fixed'
-    ? config.fixedMinutes * 60 * 1000
-    : randomBetween(config.minMinutes || 60, config.maxMinutes || 360);
+function autoRefreshSlotDelay(config, storeCount) {
+  const cycleMs = Math.max(5, Number(config.plusCycleMinutes) || 60) * 60000;
+  const slotMs = Math.max(30000, cycleMs / Math.max(1, storeCount));
+  return Math.round(slotMs * (0.85 + Math.random() * 0.3));
 }
 
 function resetAutoRefreshSchedule(config, { immediate = false } = {}) {
@@ -1063,7 +1359,7 @@ function resetAutoRefreshSchedule(config, { immediate = false } = {}) {
     return;
   }
   if (immediate) startAutoRefresh(autoRefreshScheduleVersion);
-  else scheduleNextRefresh(autoRefreshDelay(config), autoRefreshScheduleVersion);
+  else scheduleNextRefresh(autoRefreshSlotDelay(config, store.getStoreSummaries().length), autoRefreshScheduleVersion);
 }
 
 function scheduleNextRefresh(delay, version = autoRefreshScheduleVersion) {
@@ -1073,31 +1369,92 @@ function scheduleNextRefresh(delay, version = autoRefreshScheduleVersion) {
   autoRefreshTimer = setTimeout(() => startAutoRefresh(version), delay);
 }
 
-async function startAutoRefresh(version = autoRefreshScheduleVersion) {
+function isGptPlusProduct(item, product, labels) {
+  const label = labels.get(`${item.id}:${product.id}`);
+  const category = label?.classification?.category || label?.category || '';
+  if (label?.manual) return /^(?:gpt_plus|plus_)/i.test(category);
+  if (/^(?:gpt_plus|plus_)/i.test(category)) return true;
+  const name = String(product.name || '');
+  return /(?:chat\s*gpt|gpt)\s*plus\b|gptplus/i.test(name)
+    && !/\b(?:pro|team|business|k12|free)\b/i.test(name);
+}
+
+function isGptK12Product(item, product, labels) {
+  const label = labels.get(`${item.id}:${product.id}`);
+  const category = label?.classification?.category || label?.category || '';
+  if (/^(?:gpt_k12|gptk12)$/i.test(category)) return true;
+  return /(?:chat\s*gpt|gpt).*?(?:k12|edu)|\bk12\b/i.test(String(product.name || ''));
+}
+
+function buildFocusPriority(all) {
+  const labels = new Map(store.getAllProductLabels().map(label => [label.product_key, label]));
+  const snapshotsFor = predicate => all.map(item => {
+    const current = (item.products || [])
+      .filter(product => predicate(item, product, labels) && Number(product.price) > 0)
+      .sort((a, b) => Number(a.price) - Number(b.price))
+      .slice(0, 5)
+      .map(product => ({ key: `${item.id}:${product.id}`, price: Number(product.price), stock: Number(product.stock) }));
+    return { id: item.id, current, keys: current.map(product => product.key) };
+  });
+  const plusSnapshots = snapshotsFor(isGptPlusProduct);
+  const k12Snapshots = snapshotsFor(isGptK12Product);
+  const keys = [...new Set([...plusSnapshots, ...k12Snapshots].flatMap(item => item.keys))];
+  const history = store.getPriceHistoryForProducts(keys, Date.now() - 7 * 24 * 60 * 60 * 1000);
+  const plusPriority = buildPlusPriorityScores(plusSnapshots, history, 10);
+  const k12Priority = buildPlusPriorityScores(k12Snapshots, history, 10);
+  const tierRank = { A: 0, B: 1, C: 2 };
+  return new Map(all.map(item => {
+    const plus = plusPriority.get(item.id);
+    const k12 = k12Priority.get(item.id);
+    const tier = tierRank[plus.tier] <= tierRank[k12.tier] ? plus.tier : k12.tier;
+    return [item.id, { tier, score: Math.max(plus.score, k12.score), plus, k12 }];
+  }));
+}
+
+function startAutoRefresh(version = autoRefreshScheduleVersion) {
   if (version !== autoRefreshScheduleVersion) return;
   nextRefreshAt = null;
   const all = store.getAllStores();
   const cfg = store.getRefreshConfig();
   if (cfg.mode === 'disabled') return;
-  const thresholdMinutes = cfg.mode === 'fixed'
-    ? cfg.fixedMinutes
-    : Math.max(1, cfg.minMinutes || 60);
-  const thresholdMs = thresholdMinutes * 60 * 1000;
+  const availability = refreshProviderStatus();
+  if (!availability.acceptingJobs) {
+    const waitMs = Math.max(autoRefreshSlotDelay(cfg, all.length), availability.blockedUntil - Date.now());
+    recordRefreshEvent('auto.skipped', { reason: availability.message, waitMs });
+    scheduleNextRefresh(waitMs, version);
+    return;
+  }
+  const priority = buildFocusPriority(all);
   const now = Date.now();
-  const due = all.filter(item => {
-    if (!item.url || item.status === 'pending' || queuedRefreshes.has(item.id) || activeRefreshes.has(item.id)) return false;
-    const lastAttempt = autoRefreshAttempts.get(item.id) || 0;
-    if (lastAttempt && now - lastAttempt < thresholdMs) return false;
-    const lastUpdated = item.lastUpdated ? Date.parse(item.lastUpdated) : 0;
-    return !lastUpdated || now - lastUpdated >= thresholdMs;
-  });
+  const eligible = all.filter(item => item.url && item.status !== 'pending' && !queuedRefreshes.has(item.id) && !activeRefreshes.has(item.id));
+  const due = eligible.map((item, index) => {
+    const thresholdMs = focusRefreshIntervalMinutes(item, priority.get(item.id), cfg.plusCycleMinutes) * 60 * 1000;
+    const lastAttempt = Date.parse(item.refreshMeta?.lastAttemptAt || item.lastUpdated || 0) || 0;
+    const age = lastAttempt ? now - lastAttempt : Infinity;
+    return age >= thresholdMs ? { item, index, urgency: age / thresholdMs } : false;
+  }).filter(Boolean).sort((a, b) => (b.urgency - a.urgency) || (a.index - b.index));
 
-  for (const item of due) autoRefreshAttempts.set(item.id, now);
-  // 自动刷新批次仍使用统一队列，逐店执行；手动任务可优先插入。
-  await Promise.all(due.map(item => enqueueStoreRefresh(item.id, item.url, 'auto', '', 'plus')));
+  // 每个时间槽最多加入一家店铺，避免服务重启或到点后形成请求峰值。
+  if (!refreshQueue.length && !activeRefreshes.size) {
+    const urgentPlus = due.find(candidate => priority.get(candidate.item.id)?.tier === 'A' && candidate.urgency >= 1.25);
+    const catalogStore = pickDueCatalogStore(eligible.filter(item => item.status === 'ok'), cfg.catalogRefreshHours, now);
+    const selected = urgentPlus?.item || due[0]?.item || catalogStore;
+    if (selected) {
+      const refreshType = selected === catalogStore ? 'full' : automaticFocusRefreshType(selected);
+      const budgetWaitMs = refreshBudgetWaitMs(estimatedRefreshRequests(selected, refreshType), cfg);
+      if (budgetWaitMs !== 0) {
+        const waitMs = budgetWaitMs < 0 ? autoRefreshSlotDelay(cfg, all.length) : budgetWaitMs;
+        const reason = budgetWaitMs < 0 ? '小时请求上限低于单次任务所需预算' : '小时请求预算不足';
+        recordRefreshEvent('auto.skipped', { reason, waitMs });
+        scheduleNextRefresh(Math.max(autoRefreshSlotDelay(cfg, all.length), waitMs), version);
+        return;
+      }
+      enqueueStoreRefresh(selected.id, selected.url, 'auto', '', refreshType);
+    }
+  }
 
   if (version !== autoRefreshScheduleVersion) return;
   const latestConfig = store.getRefreshConfig();
   if (latestConfig.mode === 'disabled') return;
-  scheduleNextRefresh(autoRefreshDelay(latestConfig), version);
+  scheduleNextRefresh(autoRefreshSlotDelay(latestConfig, all.length), version);
 }
